@@ -1,6 +1,8 @@
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$IndexPath = Join-Path $PSScriptRoot "corpus.idx"
+$Output = Join-Path $ProjectRoot "target/basic-demo"
+$IndexPath = Join-Path $Output "corpus.idx"
+New-Item -ItemType Directory -Force -Path $Output | Out-Null
 
 Push-Location $ProjectRoot
 try {

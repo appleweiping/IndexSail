@@ -1,0 +1,20 @@
+<DOC>
+<DOCNO>DOC-001</DOCNO>
+<TITLE>Local search in Rust</TITLE>
+<TEXT>A compact BM25 engine ranks a local document collection.</TEXT>
+</DOC>
+<DOC>
+<DOCNO>DOC-002</DOCNO>
+<HEADLINE>Exact top-k retrieval</HEADLINE>
+<TEXT>WAND safely skips postings while preserving exhaustive ranking.</TEXT>
+</DOC>
+<DOC>
+<DOCNO>DOC-003</DOCNO>
+<TITLE>Power grid models</TITLE>
+<TEXT>Steady state solvers analyze distribution networks.</TEXT>
+</DOC>
+<DOC>
+<DOCNO>DOC-004</DOCNO>
+<TITLE>Retrieval evaluation</TITLE>
+<TEXT>Qrels support MAP MRR nDCG and recall metrics.</TEXT>
+</DOC>

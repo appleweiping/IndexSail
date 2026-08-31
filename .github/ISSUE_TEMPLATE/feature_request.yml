@@ -1,0 +1,93 @@
+name: Feature request
+description: "Propose a scoped improvement to IndexSail's indexing, retrieval, or evaluation workflow."
+title: "[Feature]: "
+labels: []
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem before prescribing an implementation. Reproducible examples and measurable acceptance criteria make proposals easier to evaluate.
+        Security vulnerabilities belong in GitHub private vulnerability reporting; follow https://github.com/appleweiping/IndexSail/blob/main/SECURITY.md.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched open and closed issues for related proposals.
+          required: true
+        - label: This request is not a security vulnerability report.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and users
+      description: "Who is blocked or underserved, and what concrete task cannot be completed well today?"
+      placeholder: "As a ..., I need ..., because ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: "Describe observable behavior, public interfaces, and defaults. Separate requirements from implementation ideas."
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example workflow
+      description: "Show a small input/output, API sketch, CLI invocation, or experiment that demonstrates the requested behavior."
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: "List testable correctness, determinism, compatibility, documentation, and performance conditions."
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: "Explain current workarounds and why they are insufficient."
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Expected scope
+      options:
+        - Focused change to existing behavior
+        - New public API or CLI behavior
+        - New algorithm or evaluation method
+        - File or data format change
+        - Documentation or example improvement
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Compatibility, data, and performance considerations
+      description: "Identify schema/format effects, migration needs, dataset licensing or provenance, and how performance claims would be measured."
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you contribute an implementation?
+      options:
+        - "Yes"
+        - "Maybe, with maintainer guidance"
+        - "No"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: "Add references, related issues, or sanitized artifacts needed to understand the request."

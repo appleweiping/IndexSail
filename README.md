@@ -4,128 +4,219 @@
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-dea584.svg)](https://www.rust-lang.org/)
 [![MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
-IndexSail is a compact local search and ranking engine written from scratch in safe Rust. It has no
-runtime or build dependencies beyond the Rust standard library. The project is intended for learning,
-small offline collections, reproducible retrieval experiments, and as a clear reference implementation
-of the path from text to ranked results.
+IndexSail is a dependency-free information-retrieval experiment toolkit in safe Rust. It builds a
+field-aware positional index, ranks with BM25, executes exact exhaustive or WAND top-k queries, and runs
+reproducible TREC-style experiments from collection ingestion through metrics and run files.
 
-It is an independent implementation. Its code, API, file format, documentation, and examples were not
-copied or adapted from an existing search project.
+The design favors observable algorithms, deterministic results, explicit format contracts, and strict
+input validation. It is useful for teaching, local research prototypes, regression oracles, and
+experiments small enough to fit in one process.
 
-## What is included
+## Capabilities
 
-- Named-field documents with stable external IDs.
-- Deterministic Unicode and ASCII analysis modes.
-- A positional inverted index with term frequency, document frequency, field length, and average field
-  length statistics.
-- BM25 ranking with configurable `k1` and `b`.
-- Boolean `AND` and `OR` semantics.
-- Field-restricted terms, adjacent phrase filters, and exact stored-field filters.
-- Stable top-k ordering: score descending, then insertion ID ascending.
-- An exhaustive executor and an exact WAND-style executor using safe per-term score upper bounds.
-- Per-result BM25 explanations.
-- A deterministic, versioned binary index format with structural validation and allocation limits.
-- `index`, `search`, `inspect`, and reproducible `benchmark` CLI commands.
-- More than 30 focused tests, a sample corpus, an end-to-end demo, CI, formatting, and lint policy.
+| Area | Included behavior |
+|---|---|
+| Collection | UTF-8 TSV and a documented streaming subset of TREC SGML |
+| Analysis | Deterministic Unicode or ASCII tokenization, stored with the index |
+| Index | Named fields, stable external IDs, positions, field lengths, DF and collection statistics |
+| Retrieval | BM25, `AND`/`OR`, fielded terms, phrases, exact field filters, explanations |
+| Execution | Exhaustive reference executor and exact WAND with stable score/doc-ID tie-breaking |
+| Experiments | TSV or classic TREC topics, qrels, six-column run files, JSON reports |
+| Metrics | MAP@k, MRR@k, nDCG@k, Recall@k, latency, candidates, advances and skips |
+| Verification | Optional per-query bit-exact WAND/exhaustive comparison |
+| Storage | Checksummed version 2 format with doc/position delta and variable-byte postings |
+| Operations | CLI, library API, Linux/Windows CI, strict Clippy, rustfmt and release tests |
+
+IndexSail has no runtime or build dependencies beyond the Rust standard library.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    A[TSV documents] --> B[Unicode or ASCII analyzer]
-    B --> C[Field-aware positional inverted index]
-    C --> D[Versioned binary persistence]
-    Q[Structured query] --> E[Term scorers and BM25 upper bounds]
-    D --> E
-    E --> F{Execution strategy}
-    F -->|Exhaustive| G[Candidate union or intersection]
-    F -->|WAND| H[Safe pivot and cursor skipping]
-    G --> I[Phrase and exact-field filters]
-    H --> I
-    I --> J[Stable top-k heap]
-    J --> K[Hits and score explanations]
+    A[TSV or TREC collection] --> B[Unicode or ASCII analyzer]
+    B --> C[Field-aware positional index]
+    C --> D[v2 checksum + delta/varbyte persistence]
+    T[TSV or classic TREC topics] --> Q[Typed batch queries]
+    D --> E{Exact executor}
+    Q --> E
+    E -->|Exhaustive| X[Reference candidate traversal]
+    E -->|WAND| W[Bounded cursor skipping]
+    X --> K[Stable top-k]
+    W --> K
+    K --> R[Six-column TREC run]
+    J[Four-column qrels] --> M[MAP MRR nDCG Recall]
+    K --> M
+    M --> O[Per-query and aggregate JSON]
 ```
 
-The boundaries, invariants, WAND safety argument, and binary layout are described in
-[docs/architecture.md](docs/architecture.md).
+The module boundaries, invariants, WAND safety argument, and binary layout are detailed in
+[docs/architecture.md](docs/architecture.md). Experiment formats and metric definitions are in
+[docs/evaluation.md](docs/evaluation.md).
 
-## Analyzer behavior
-
-The analyzer configuration is stored in the index and reused for queries.
-
-- `Unicode` is the default. It treats Rust `char::is_alphanumeric` characters as token characters and
-  applies the standard library Unicode lowercase mapping.
-- `ASCII` accepts only ASCII letters and digits and applies ASCII lowercase.
-
-Both modes split at all other characters and use token ordinals as positions. The dependency-free
-Unicode mode deliberately does **not** claim NFC, NFD, NFKC, language-aware word breaking, stemming,
-stop-word removal, or accent folding. Canonically equivalent strings must already use the same Unicode
-representation if they are expected to match.
-
-## Build and test
+## Build and quality gates
 
 Rust 1.85 or later is required.
 
 ```shell
 cargo build --release
-cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo test --release --all-targets
 ```
 
-On Windows, a complete MSVC Rust toolchain is recommended. The project itself contains no platform-
-specific code.
+CI runs formatting and strict Clippy on Ubuntu; release tests and builds run on Ubuntu and Windows. A
+deterministic executor benchmark and a complete TREC adapter/evaluation smoke test run on Ubuntu.
 
-## End-to-end example
+## Quick start: local TSV collection
 
-The input format is UTF-8 TSV. Its first column must be `id`; every remaining header is a searchable
-field. Tabs and embedded newlines are intentionally unsupported so parsing stays deterministic and
-dependency-free.
+The TSV header begins with `id`; every remaining column becomes a searchable stored field. Tabs and
+embedded newlines inside values are intentionally unsupported.
 
 ```text
 id<TAB>title<TAB>body<TAB>category
 doc-1<TAB>Local Search<TAB>BM25 ranks local documents<TAB>guide
 ```
 
-Build an index from the included corpus:
-
 ```shell
-cargo run --release -- index --input examples/corpus.tsv --output examples/corpus.idx
-```
+cargo run --release -- index \
+  --input examples/corpus.tsv \
+  --output target/corpus.idx
 
-Search all fields with safe WAND pruning and explanations:
-
-```shell
 cargo run --release -- search \
-  --index examples/corpus.idx \
+  --index target/corpus.idx \
   --query "search ranking" \
   --operator or \
   --top-k 5 \
   --explain
-```
 
-Require both terms in `body`, an adjacent phrase, and an exact category:
-
-```shell
-cargo run --release -- search \
-  --index examples/corpus.idx \
-  --query "local search" \
+cargo run --release -- inspect \
+  --index target/corpus.idx \
   --field body \
-  --operator and \
-  --phrase "local search" \
-  --phrase-field body \
-  --filter category=guide
+  --term search
 ```
 
-Inspect index statistics or a posting list:
+`inspect` reports collection statistics, persisted file size, and fixed-width versus encoded posting
+bytes. It can also display one normalized posting list.
+
+## Reproducible TREC-style experiment
+
+### 1. Index a collection
+
+The local TREC adapter reads one `<DOC>` block at a time. `<DOC>` and `</DOC>` must be on separate lines;
+each document requires exactly one `<DOCNO>`. `<TITLE>` and `<HEADLINE>` form `title`; repeated `<TEXT>`
+and `<BODY>` sections form `body`. Unknown nested markup is stripped. This is a deliberate, tested subset,
+not a general SGML parser.
 
 ```shell
-cargo run --release -- inspect --index examples/corpus.idx
-cargo run --release -- inspect --index examples/corpus.idx --field body --term search
+cargo run --release -- index \
+  --input examples/collection.trec \
+  --output target/collection.idx \
+  --format trec
 ```
 
-PowerShell and POSIX demo scripts are included as
-[`examples/demo.ps1`](examples/demo.ps1) and [`examples/demo.sh`](examples/demo.sh).
+### 2. Supply topics and judgments
+
+Topics may be compact TSV:
+
+```text
+101<TAB>local search ranking
+102<TAB>wand exhaustive retrieval
+```
+
+Classic `<top>` records containing `<num> Number: ...` and `<title> ...` lines are also accepted. Qrels
+use the conventional whitespace-separated layout:
+
+```text
+topic  iteration  document  relevance
+101    0          DOC-001   2
+```
+
+Duplicate topic IDs and duplicate topic/document judgments are rejected instead of being resolved
+silently. Positive relevance means relevant; graded values from 1 through 31 contribute to nDCG.
+
+### 3. Run, verify, and evaluate
+
+```shell
+cargo run --release -- batch \
+  --index target/collection.idx \
+  --topics examples/topics.tsv \
+  --qrels examples/qrels.txt \
+  --run target/indexsail.run \
+  --report target/report.json \
+  --field body \
+  --top-k 10 \
+  --strategy wand \
+  --verify
+```
+
+`--verify` executes the alternative strategy for every topic and rejects the batch unless document IDs,
+rank order, and floating-point score bits match. Verification time is reported separately from selected-
+strategy search time. The run file follows `topic Q0 docid rank score tag`; the JSON contains configuration,
+per-query results and metrics, aggregate metrics, timing, candidate evaluations, posting advances, and skips.
+
+Run the included workflow directly:
+
+```shell
+sh examples/trec_demo.sh
+```
+
+```powershell
+./examples/trec_demo.ps1
+```
+
+## Query semantics
+
+For a term in one field, IndexSail uses positive Robertson/Sparck Jones-style BM25 IDF:
+
+```text
+idf = ln(1 + (N - df + 0.5) / (df + 0.5))
+
+score = idf * tf * (k1 + 1)
+              / (tf + k1 * (1 - b + b * field_length / average_field_length))
+```
+
+An unfielded term is one logical clause whose score is the sum of its contributions across indexed fields.
+Duplicate logical terms combine boosts. Consequently `AND` means every unique logical term must match,
+not every field expansion. Phrase filters require adjacent normalized token positions within one field.
+Exact field filters compare stored strings without analysis.
+
+Top-k order is always score descending and then internal insertion ID ascending. The same heap rule is used
+by both executors, including at an equal-score WAND threshold.
+
+## Exact WAND
+
+Each logical term scorer materializes exact BM25 values and records a conservative upper bound rounded one
+representable floating-point value outward. WAND accumulates those bounds in current-document order,
+chooses a pivot only when the current threshold can still be met, and advances earlier cursors. It uses
+`>=` at the pivot boundary, so an equal-score result that wins the document-ID tie-break is not pruned.
+
+Phrase and exact-field constraints are evaluated before heap insertion. The heap threshold therefore comes
+only from valid hits. Unit tests, randomized deterministic benchmarks, CI smoke tests, and batch `--verify`
+all use exhaustive execution as a correctness oracle.
+
+This implementation uses one bound per logical term, not block-max indexes. It is meant to make the WAND
+algorithm inspectable; it does not claim state-of-the-art compressed-query throughput.
+
+## Persistence and compression
+
+New indexes use format version 2:
+
+- a magic value and explicit format version;
+- a payload length with allocation limits;
+- a deterministic 64-bit FNV-1a payload checksum;
+- stored documents, analyzer mode, field lengths, and sorted dictionary;
+- per-term compressed posting blocks;
+- positive document-ID and position gaps encoded as base-128 variable bytes;
+- term frequency encoded as a variable byte and used as the position count;
+- rejection of truncation, trailing bytes, checksum mismatch, integer overflow, non-UTF-8 data, duplicate
+  keys, invalid references, and non-monotonic IDs or positions.
+
+Version 1 indexes remain readable and are written as version 2 on the next save. The checksum detects
+accidental damage; it is not authentication and must not be treated as protection from maliciously crafted
+input. Exact layouts and trust boundaries are documented in [docs/architecture.md](docs/architecture.md).
+
+The posting codec compresses postings only. Stored field text and dictionary strings remain uncompressed,
+and search loads the entire index into memory.
 
 ## Library example
 
@@ -141,69 +232,75 @@ builder.add_document(Document::from_fields(
 let index = builder.finish();
 
 let query = SearchQuery::from_text(analyzer, "rust ranking", None)?;
-let results = index.search(&query, SearchOptions::default())?;
+let outcome = index.search(&query, SearchOptions::default())?;
+assert_eq!(outcome.hits[0].external_id, "doc-1");
 # Ok::<(), indexsail::Error>(())
 ```
 
-## Ranking and pruning
+The public batch API exposes `Topic`, `Qrels`, `BatchConfig`, `evaluate_batch`, `write_trec_run`, and
+`write_json_report`, so experiments do not have to invoke the CLI.
 
-For a term in a field, IndexSail uses Robertson/Sparck Jones-style positive BM25 IDF:
-
-```text
-idf = ln(1 + (N - df + 0.5) / (df + 0.5))
-
-score = idf * tf * (k1 + 1)
-              / (tf + k1 * (1 - b + b * field_length / average_field_length))
-```
-
-An unfielded query term becomes one logical scorer whose score is the sum of that term's matching field
-contributions. Its upper bound is the maximum exact score in its sorted posting list. The WAND executor
-adds those bounds in current-document order, chooses a pivot only when the retained top-k threshold can
-still be met, and advances earlier cursors to the pivot. Equality is not pruned, preserving deterministic
-tie-breaking. Phrase and exact-field filters are applied before a candidate enters the heap, so the
-threshold is derived only from valid hits.
-
-Use `--strategy full` to obtain the exhaustive reference result. Tests and the benchmark compare both
-executors exactly.
-
-## Persistence and trust boundary
-
-`InvertedIndex::save` writes the analyzer mode, documents, field lengths, dictionary, posting lists,
-term frequencies, and positions. `InvertedIndex::load` checks:
-
-- signature and format version;
-- UTF-8 and bounded string/collection sizes;
-- unique document IDs and dictionary keys;
-- strictly ordered document IDs and positions;
-- matching term frequencies and position counts;
-- valid document references and in-range positions;
-- absence of trailing data.
-
-The format is intentionally simple and currently version 1. It is not promised to be compatible with
-future major versions.
-
-## Reproducible benchmark
+## 100k-document reproducible benchmark
 
 ```shell
-cargo run --release -- benchmark --documents 10000 --queries 200 --top-k 10 --seed 42
+sh examples/benchmark_100k.sh
 ```
 
-The benchmark generates the same skewed synthetic corpus and queries for the same seed, runs both
-executors, verifies every returned document and score, and emits a deterministic checksum. Wall-clock
-times are machine-dependent; corpus statistics, candidate counts, and the checksum are reproducible.
-For comparisons, record the CPU, OS, Rust version, build profile, configuration line, and checksum.
-The first measured project baseline is recorded in [docs/benchmark.md](docs/benchmark.md).
+```powershell
+./examples/benchmark_100k.ps1
+```
 
-## Scope and non-goals
+For seed 42, the generator creates 100,000 documents, 500 three-term queries, and 5,592,575 posting-list
+entries. A measured WSL2 release run produced the following correctness-backed observation:
 
-IndexSail is an in-memory, single-process engine. It does not implement distributed indexing, incremental
-segment merging, compressed posting blocks, language-specific linguistic analysis, fuzzy matching, or
-concurrent writes. The binary index is persisted to disk, but search loads it into memory. These choices
-keep the core algorithms inspectable and the behavior deterministic.
+| Executor | Evaluated candidates | Time |
+|---|---:|---:|
+| Exhaustive | 12,927,028 | 21.72 s |
+| WAND | 1,136,956 | 13.61 s |
+
+Both returned bit-identical top-10 results for every query, checksum `70f92ad0827240fd`. The posting codec
+used 19,097,862 bytes versus 76,340,600 fixed-width value bytes (ratio 0.2502, excluding dictionary and
+stored documents). These numbers describe one machine and workload, not universal performance. The script
+writes configuration, timings, counters, compression statistics, and checksum as JSON. Full environment and
+measurement notes are in [docs/benchmark.md](docs/benchmark.md).
+
+## Reproducibility contract
+
+For identical input bytes, insertion order, analyzer, query order, BM25 parameters, cutoff, and Rust
+floating-point behavior, IndexSail provides:
+
+- deterministic internal IDs, dictionaries, binary output, ranking and run order;
+- stable seeded synthetic collections and queries;
+- an executor checksum independent of wall-clock timing;
+- explicit timing separation between selected search and verification;
+- machine-readable reports that preserve both workload counters and environment-dependent durations.
+
+Record the commit, Rust version, target, CPU, OS, build profile, command, checksum, and input dataset version
+when publishing results.
+
+## Scope and limitations
+
+IndexSail is currently an in-memory, single-process research toolkit. It does not implement incremental
+segments, deletion, distributed shards, memory mapping, dynamic pruning indexes such as block-max WAND,
+language-specific stemming, stopword lists, fuzzy matching, learning-to-rank, query expansion, or concurrent
+writes. Unicode analysis uses standard-library alphanumeric boundaries and lowercase conversion; it does
+not perform Unicode normalization or language-aware segmentation.
+
+The local TREC reader supports the exact subset documented above. Convert other collection formats to TSV
+or that subset before indexing. Large collections retain stored text and may use substantially more memory
+than production engines.
+
+## References
+
+- S. Robertson and H. Zaragoza, “The Probabilistic Relevance Framework: BM25 and Beyond,” 2009.
+- A. Broder et al., “Efficient Query Evaluation using a Two-Level Retrieval Process,” 2003.
+- K. Järvelin and J. Kekäläinen, “Cumulated Gain-Based Evaluation of IR Techniques,” 2002.
+
+These references define standard retrieval ideas and evaluation measures; IndexSail's behavior is specified
+by this repository's code, tests, and format documentation.
 
 ## License and contributions
 
 IndexSail is available under the [MIT License](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) for the
-quality and review contract.
-Security reporting and release history are documented in [SECURITY.md](SECURITY.md) and
-[CHANGELOG.md](CHANGELOG.md).
+quality and review contract, [SECURITY.md](SECURITY.md) for private vulnerability reporting, and
+[CHANGELOG.md](CHANGELOG.md) for release history.

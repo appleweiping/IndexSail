@@ -1,14 +1,15 @@
 [package]
 name = "indexsail"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A compact, dependency-free local search and ranking engine"
+description = "Dependency-free BM25, WAND, and TREC-style retrieval experiment toolkit"
+authors = ["Weiping Yan"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/appleweiping/IndexSail"
 homepage = "https://github.com/appleweiping/IndexSail"
-keywords = ["search", "information-retrieval", "bm25", "inverted-index"]
+keywords = ["search", "information-retrieval", "bm25", "inverted-index", "trec"]
 categories = ["command-line-utilities", "database-implementations"]
 
 [lib]

@@ -1,6 +1,8 @@
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use crate::analysis::Analyzer;
+use crate::codec::PostingCodecStats;
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::index::IndexBuilder;
@@ -37,6 +39,8 @@ pub struct BenchmarkReport {
     pub checksum: u64,
     pub index_terms: usize,
     pub index_postings: usize,
+    pub index_tokens: u64,
+    pub posting_codec: PostingCodecStats,
 }
 
 /// Run a deterministic synthetic benchmark and verify WAND against exhaustive search.
@@ -127,7 +131,7 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         add_stats(&mut wand_stats, outcome.stats);
         if outcome.hits.len() != exhaustive.len()
             || outcome.hits.iter().zip(exhaustive).any(|(left, right)| {
-                left.doc_id != right.doc_id || (left.score - right.score).abs() > 1e-10
+                left.doc_id != right.doc_id || left.score.to_bits() != right.score.to_bits()
             })
         {
             return Err(Error::CorruptIndex(
@@ -143,6 +147,7 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
     }
     let wand_time = wand_started.elapsed();
     let stats = index.stats();
+    let posting_codec = index.posting_codec_stats()?;
 
     Ok(BenchmarkReport {
         config,
@@ -154,7 +159,63 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         checksum,
         index_terms: stats.terms,
         index_postings: stats.postings,
+        index_tokens: stats.tokens,
+        posting_codec,
     })
+}
+
+/// Write a stable machine-readable benchmark report. Durations remain
+/// machine-dependent; workload counters and checksum are deterministic.
+pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()> {
+    writeln!(writer, "{{")?;
+    writeln!(writer, "  \"schema_version\": 1,")?;
+    writeln!(writer, "  \"verified_exact\": true,")?;
+    writeln!(writer, "  \"documents\": {},", report.config.documents)?;
+    writeln!(writer, "  \"queries\": {},", report.config.queries)?;
+    writeln!(writer, "  \"top_k\": {},", report.config.top_k)?;
+    writeln!(writer, "  \"seed\": {},", report.config.seed)?;
+    writeln!(writer, "  \"index_terms\": {},", report.index_terms)?;
+    writeln!(writer, "  \"index_postings\": {},", report.index_postings)?;
+    writeln!(writer, "  \"index_tokens\": {},", report.index_tokens)?;
+    writeln!(
+        writer,
+        "  \"posting_codec\": {{\"raw_bytes\": {}, \"encoded_bytes\": {}, \"ratio\": {:.12}}},",
+        report.posting_codec.uncompressed_bytes,
+        report.posting_codec.encoded_bytes,
+        report.posting_codec.ratio()
+    )?;
+    writeln!(
+        writer,
+        "  \"index_elapsed_micros\": {},",
+        report.index_time.as_micros()
+    )?;
+    writeln!(
+        writer,
+        "  \"exhaustive_elapsed_micros\": {},",
+        report.exhaustive_time.as_micros()
+    )?;
+    writeln!(
+        writer,
+        "  \"wand_elapsed_micros\": {},",
+        report.wand_time.as_micros()
+    )?;
+    writeln!(
+        writer,
+        "  \"exhaustive\": {{\"evaluated\": {}, \"advanced\": {}, \"skipped\": {}}},",
+        report.exhaustive_stats.evaluated_candidates,
+        report.exhaustive_stats.postings_advanced,
+        report.exhaustive_stats.postings_skipped
+    )?;
+    writeln!(
+        writer,
+        "  \"wand\": {{\"evaluated\": {}, \"advanced\": {}, \"skipped\": {}}},",
+        report.wand_stats.evaluated_candidates,
+        report.wand_stats.postings_advanced,
+        report.wand_stats.postings_skipped
+    )?;
+    writeln!(writer, "  \"checksum\": \"{:016x}\"", report.checksum)?;
+    writeln!(writer, "}}")?;
+    Ok(())
 }
 
 fn add_stats(total: &mut SearchStats, current: SearchStats) {

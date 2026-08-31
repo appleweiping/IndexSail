@@ -1,0 +1,90 @@
+name: Bug report
+description: "Report a reproducible problem in IndexSail's retrieval experiments workflow."
+title: "[Bug]: "
+labels: []
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve IndexSail. Please remove confidential data and reduce the report to the smallest reproducible case.
+        Do not disclose a security vulnerability here. Read https://github.com/appleweiping/IndexSail/blob/main/SECURITY.md and use GitHub private vulnerability reporting instead.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched open and closed issues for the same problem.
+          required: true
+        - label: I confirm this issue does not disclose a security vulnerability.
+          required: true
+        - label: I can share a minimal example without secrets or restricted data.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: IndexSail version or commit
+      description: "For example: 0.2.0 or a full commit SHA."
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Installation or packaging
+        - Library API
+        - Command-line interface
+        - Data validation or persistence
+        - Algorithm or numerical behavior
+        - Documentation or examples
+        - Continuous integration
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: "Include OS, runtime/compiler version, installation method, and relevant hardware."
+      placeholder: |
+        OS:
+        Runtime or compiler:
+        Installation:
+        Hardware (if relevant):
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: "Provide the smallest commands or code that reproduce the problem, including deterministic seeds and input shape when relevant."
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: "State the result or invariant you expected."
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: "State what happened, including complete error text and exit status."
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs, outputs, or artifacts
+      description: "Paste relevant sanitized output. Link a minimal public repository only when the issue cannot fit here."
+      render: text
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: "Add suspected regressions, related issues, dataset provenance, or other useful details."

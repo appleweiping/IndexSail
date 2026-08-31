@@ -16,9 +16,10 @@ Use Rust 1.85 or later and run:
 ```shell
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --release --all-targets
 cargo build --release
-cargo run --release -- benchmark --documents 1000 --queries 30 --top-k 10 --seed 42
+cargo run --release -- benchmark --documents 1000 --queries 30 --top-k 10 --seed 42 --json target/benchmark-smoke.json
+sh examples/trec_demo.sh
 ```
 
 The benchmark must end with `verified=true`. Performance claims must include the command, build profile,
@@ -31,6 +32,11 @@ hardware, OS, Rust version, checksum, and several runs; do not treat a single wa
 - Preserve deterministic serialization and ranking tie-breaking.
 - Any pruning optimization must be tested against exhaustive search, including ties and post-filters.
 - Binary reader changes require malformed/truncated/oversized-input tests.
+- Posting codec changes require independent round trips plus overflow, truncation, monotonicity, and size
+  tests; format changes must retain or explicitly reject older versions.
+- Metric changes require hand-computed fixtures covering cutoff, graded relevance, missing judgments, and
+  topics with no relevant documents.
+- Batch execution changes must exercise `--verify` and preserve valid six-column TREC output.
 - Public behavior needs focused tests and README or architecture updates.
 - Do not silently change analyzer or BM25 semantics in a patch release.
 - No unsafe Rust is accepted without a separately reviewed design justification; the crate currently forbids

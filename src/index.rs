@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::analysis::Analyzer;
+use crate::codec::{PostingCodecStats, encoded_posting_bytes};
 use crate::document::{Document, validate_field_name};
 use crate::error::{Error, Result};
 
@@ -97,6 +98,46 @@ impl InvertedIndex {
             postings: self.postings.values().map(Vec::len).sum(),
             tokens: self.field_totals.values().sum(),
         }
+    }
+
+    /// Report the size of fixed-width posting values versus the delta/varbyte
+    /// representation used by persistence format version 2.
+    pub fn posting_codec_stats(&self) -> Result<PostingCodecStats> {
+        let mut stats = PostingCodecStats::default();
+        for postings in self.postings.values() {
+            stats.posting_lists += 1;
+            stats.postings += postings.len();
+            let positions = postings
+                .iter()
+                .map(|posting| posting.positions.len())
+                .sum::<usize>();
+            stats.positions += positions;
+            let values = postings
+                .len()
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(positions))
+                .ok_or_else(|| Error::InvalidArgument("posting statistics overflow".into()))?;
+            stats.uncompressed_bytes = stats
+                .uncompressed_bytes
+                .checked_add(
+                    u64::try_from(values)
+                        .map_err(|_| Error::InvalidArgument("posting statistics overflow".into()))?
+                        .checked_mul(4)
+                        .ok_or_else(|| {
+                            Error::InvalidArgument("posting statistics overflow".into())
+                        })?,
+                )
+                .ok_or_else(|| Error::InvalidArgument("posting statistics overflow".into()))?;
+            stats.encoded_bytes = stats
+                .encoded_bytes
+                .checked_add(
+                    u64::try_from(encoded_posting_bytes(postings)?).map_err(|_| {
+                        Error::InvalidArgument("posting statistics overflow".into())
+                    })?,
+                )
+                .ok_or_else(|| Error::InvalidArgument("posting statistics overflow".into()))?;
+        }
+        Ok(stats)
     }
 
     pub(crate) fn from_parts(

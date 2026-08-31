@@ -11,6 +11,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Minimum supported Rust 1.85
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo test --all-targets
+
   test:
     name: Test (${{ matrix.os }})
     strategy:
@@ -29,10 +37,25 @@ jobs:
       - name: Clippy
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --all-targets -- -D warnings
+      - name: Documentation
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
       - name: Test
         run: cargo test --all-targets
       - name: Release build
         run: cargo build --release
+      - name: Package manifest
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo package --no-verify
       - name: Reproducible correctness benchmark
         if: matrix.os == 'ubuntu-latest'
-        run: cargo run --release -- benchmark --documents 1000 --queries 30 --top-k 10 --seed 42
+        run: cargo run --release -- benchmark --documents 1000 --queries 30 --top-k 10 --seed 42 --json target/ci-benchmark.json
+      - name: TREC adapter and evaluation smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo run --release -- index --input examples/collection.trec --output target/ci.idx --format trec
+          cargo run --release -- batch --index target/ci.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci.run --report target/ci-report.json --field body --top-k 10 --verify
+          test -s target/ci.run
+          test -s target/ci-report.json
