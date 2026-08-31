@@ -1,0 +1,5 @@
+/target/
+*.idx
+*.tmp
+.idea/
+.vscode/

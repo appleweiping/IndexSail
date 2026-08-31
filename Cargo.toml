@@ -1,0 +1,36 @@
+[package]
+name = "indexsail"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A compact, dependency-free local search and ranking engine"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/appleweiping/IndexSail"
+homepage = "https://github.com/appleweiping/IndexSail"
+keywords = ["search", "information-retrieval", "bm25", "inverted-index"]
+categories = ["command-line-utilities", "database-implementations"]
+
+[lib]
+name = "indexsail"
+path = "src/lib.rs"
+
+[[bin]]
+name = "indexsail"
+path = "src/main.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

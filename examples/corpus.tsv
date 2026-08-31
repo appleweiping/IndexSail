@@ -1,0 +1,9 @@
+id	title	body	category
+doc-001	Local Search in Rust	A compact local search engine ranks documents with BM25 and safe WAND pruning.	guide
+doc-002	Power Grid Models	Steady state power flow models calculate voltage current and loading across a grid.	reference
+doc-003	Recommendation Ranking	Recommendation systems combine candidate retrieval ranking evaluation and feedback.	guide
+doc-004	Unicode Analysis	Unicode text such as 电力系统 and système électrique remains searchable without ASCII folding.	reference
+doc-005	Boolean Retrieval	Boolean AND requires every query term while Boolean OR accepts any query term.	guide
+doc-006	Phrase Search	A positional index can require the exact phrase local search in one named field.	note
+doc-007	BM25 Explained	Term frequency document frequency and field length normalization determine BM25 scores.	reference
+doc-008	Deterministic Top K	Stable tie breaking makes repeated ranking runs reproducible and easy to test.	note
