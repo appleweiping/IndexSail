@@ -100,6 +100,21 @@ bytes. It can also display one normalized posting list.
 
 ## Reproducible TREC-style experiment
 
+The workflow is three steps: index a collection, supply topics and judgments, then run one `batch`
+command that writes a six-column run file and a JSON report.
+
+Everything those steps need is committed in `examples/`: a four-document synthetic collection
+(`collection.trec`), three topics (`topics.tsv`), and five judgments (`qrels.txt`). Nothing is
+downloaded and no network access is involved, so the commands below run as written on a checkout with
+Rust 1.85 or later installed.
+
+That bundled collection exists to demonstrate the formats, the executor verification, and the metric
+definitions. It is far too small to be a benchmark, and no TREC corpus is included here. Reproducing a
+published TREC result also requires that collection, its topics, and its qrels, which you must obtain
+separately from their distributor under whatever agreement covers them; IndexSail neither ships nor
+fetches such data. Convert what you obtain to TSV or to the `<DOC>` subset documented below, then run
+the same three steps against it.
+
 ### 1. Index a collection
 
 The local TREC adapter reads one `<DOC>` block at a time. `<DOC>` and `</DOC>` must be on separate lines;
@@ -153,6 +168,29 @@ cargo run --release -- batch \
 rank order, and floating-point score bits match. Verification time is reported separately from selected-
 strategy search time. The run file follows `topic Q0 docid rank score tag`; the JSON contains configuration,
 per-query results and metrics, aggregate metrics, timing, candidate evaluations, posting advances, and skips.
+
+Against the bundled example the two steps print:
+
+```text
+indexed documents=4 fields=2 terms=42 postings=43 tokens=44 output=target/collection.idx
+batch topics=3 hits=4 strategy=Wand verified=true elapsed_ms=0.117 evaluated=4 advanced=5 skipped=0 run=target/indexsail.run
+metrics map=1.000000 mrr=1.000000 ndcg=0.932236 recall=1.000000
+report=target/report.json
+```
+
+and `target/indexsail.run` contains:
+
+```text
+101 Q0 DOC-002 1 1.188291537699 indexsail
+101 Q0 DOC-001 2 1.129449040647 indexsail
+102 Q0 DOC-002 1 2.376583075399 indexsail
+103 Q0 DOC-004 1 1.188291537699 indexsail
+```
+
+Every value above is deterministic except `elapsed_ms`, which is wall-clock time and differs per machine
+and per run. The three topics each retrieve all of their relevant documents, so `map`, `mrr`, and
+`recall` are 1; `ndcg` is below 1 because topic 101 ranks its grade-1 judgment above its grade-2
+judgment.
 
 Run the included workflow directly:
 
