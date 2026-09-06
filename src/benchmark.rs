@@ -34,8 +34,10 @@ pub struct BenchmarkReport {
     pub index_time: Duration,
     pub exhaustive_time: Duration,
     pub wand_time: Duration,
+    pub block_max_time: Duration,
     pub exhaustive_stats: SearchStats,
     pub wand_stats: SearchStats,
+    pub block_max_stats: SearchStats,
     pub checksum: u64,
     pub index_terms: usize,
     pub index_postings: usize,
@@ -146,6 +148,34 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         }
     }
     let wand_time = wand_started.elapsed();
+
+    // Block-max is checked against the same exhaustive results, and against the
+    // same bit patterns rather than an epsilon: a pruning strategy that changed
+    // a score in the last place would still be wrong about what it skipped.
+    let block_max_started = Instant::now();
+    let mut block_max_stats = SearchStats::default();
+    for (query, exhaustive) in queries.iter().zip(&exhaustive_results) {
+        let outcome = index.search(
+            query,
+            SearchOptions {
+                top_k: config.top_k,
+                pruning: PruningStrategy::BlockMaxWand,
+                ..SearchOptions::default()
+            },
+        )?;
+        add_stats(&mut block_max_stats, outcome.stats);
+        if outcome.hits.len() != exhaustive.len()
+            || outcome.hits.iter().zip(exhaustive).any(|(left, right)| {
+                left.doc_id != right.doc_id || left.score.to_bits() != right.score.to_bits()
+            })
+        {
+            return Err(Error::CorruptIndex(
+                "block-max WAND benchmark results differ from exhaustive results".into(),
+            ));
+        }
+    }
+    let block_max_time = block_max_started.elapsed();
+
     let stats = index.stats();
     let posting_codec = index.posting_codec_stats()?;
 
@@ -154,8 +184,10 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         index_time,
         exhaustive_time,
         wand_time,
+        block_max_time,
         exhaustive_stats,
         wand_stats,
+        block_max_stats,
         checksum,
         index_terms: stats.terms,
         index_postings: stats.postings,
@@ -168,7 +200,7 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
 /// machine-dependent; workload counters and checksum are deterministic.
 pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()> {
     writeln!(writer, "{{")?;
-    writeln!(writer, "  \"schema_version\": 1,")?;
+    writeln!(writer, "  \"schema_version\": 2,")?;
     writeln!(writer, "  \"verified_exact\": true,")?;
     writeln!(writer, "  \"documents\": {},", report.config.documents)?;
     writeln!(writer, "  \"queries\": {},", report.config.queries)?;
@@ -201,6 +233,11 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
     )?;
     writeln!(
         writer,
+        "  \"block_max_elapsed_micros\": {},",
+        report.block_max_time.as_micros()
+    )?;
+    writeln!(
+        writer,
         "  \"exhaustive\": {{\"evaluated\": {}, \"advanced\": {}, \"skipped\": {}}},",
         report.exhaustive_stats.evaluated_candidates,
         report.exhaustive_stats.postings_advanced,
@@ -212,6 +249,13 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
         report.wand_stats.evaluated_candidates,
         report.wand_stats.postings_advanced,
         report.wand_stats.postings_skipped
+    )?;
+    writeln!(
+        writer,
+        "  \"block_max_wand\": {{\"evaluated\": {}, \"advanced\": {}, \"skipped\": {}}},",
+        report.block_max_stats.evaluated_candidates,
+        report.block_max_stats.postings_advanced,
+        report.block_max_stats.postings_skipped
     )?;
     writeln!(writer, "  \"checksum\": \"{:016x}\"", report.checksum)?;
     writeln!(writer, "}}")?;
@@ -276,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_exercises_both_execution_paths() {
+    fn benchmark_exercises_every_execution_path() {
         let report = run(BenchmarkConfig {
             documents: 100,
             queries: 8,
@@ -287,6 +331,14 @@ mod tests {
         assert!(report.exhaustive_stats.evaluated_candidates > 0);
         assert!(report.wand_stats.evaluated_candidates > 0);
         assert!(report.wand_stats.postings_advanced > 0);
+        assert!(report.block_max_stats.evaluated_candidates > 0);
+        assert!(report.block_max_stats.postings_advanced > 0);
+        // `run` returns an error if any strategy disagrees with exhaustive, so
+        // reaching here at all is the exactness check; this pins the direction.
+        assert!(
+            report.block_max_stats.evaluated_candidates
+                <= report.exhaustive_stats.evaluated_candidates
+        );
     }
 
     #[test]

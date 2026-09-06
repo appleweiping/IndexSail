@@ -232,8 +232,43 @@ Phrase and exact-field constraints are evaluated before heap insertion. The heap
 only from valid hits. Unit tests, randomized deterministic benchmarks, CI smoke tests, and batch `--verify`
 all use exhaustive execution as a correctness oracle.
 
-This implementation uses one bound per logical term, not block-max indexes. It is meant to make the WAND
-algorithm inspectable; it does not claim state-of-the-art compressed-query throughput.
+This implementation uses one bound per logical term. `--strategy block-max-wand` adds a second, tighter
+bound described below.
+
+## Block-max WAND
+
+One bound per term is set by the single highest-impact document that term touches, and stays that high for
+every other document in the list. Remembering a maximum for each run of 64 postings lets a long stretch of
+low-impact documents be skipped in one step instead of one document at a time.
+
+```bash
+indexsail search corpus.idx "local search ranking" --strategy block-max-wand
+```
+
+The ranking is unchanged. A block maximum is a true upper bound inside its block, the bound covers every
+cursor that could contribute at the pivot, and the same `>=` boundary is used, so a result that wins on the
+document-ID tie-break is still not pruned. Both strategies share one code path; the block bound only ever
+decides to skip documents the shared pivot logic has already shown cannot reach the threshold.
+
+### When it helps, and when it does not
+
+The gain comes entirely from how much impact varies inside a posting list, so it is worth measuring on your
+own collection rather than assuming it:
+
+| collection | query | k | scored by WAND | scored by block-max | change |
+|---|---|---|---|---|---|
+| skewed impacts, 20k docs | `common` | 10 | 20000 | 5568 | -72% |
+| skewed impacts, 20k docs | `common mid` | 10 | 6685 | 2834 | -58% |
+| skewed impacts, 20k docs | `common mid rare` | 10 | 331 | 327 | -1% |
+| benchmark corpus, 100k docs | 200 mixed | 10 | 415942 | 415543 | -0.1% |
+
+Block-max helps most where plain WAND helps least: a frequent term whose global bound prunes nothing. Where
+WAND already reaches a small candidate set, little is left to remove, and the extra bound arithmetic can make
+the run marginally slower -- the synthetic benchmark corpus generates near-uniform impacts, so it shows
+exactly that. Real text collections are skewed, which is the case the strategy is built for.
+
+Block maxima are computed in the same pass that scores a term's postings, so they cost no index-time work and
+no change to the on-disk format.
 
 ## Persistence and compression
 
@@ -319,9 +354,10 @@ when publishing results.
 ## Scope and limitations
 
 IndexSail is currently an in-memory, single-process research toolkit. It does not implement incremental
-segments, deletion, distributed shards, memory mapping, dynamic pruning indexes such as block-max WAND,
-language-specific stemming, stopword lists, fuzzy matching, learning-to-rank, query expansion, or concurrent
-writes. Unicode analysis uses standard-library alphanumeric boundaries and lowercase conversion; it does
+segments, deletion, distributed shards, memory mapping, language-specific stemming, stopword lists, fuzzy
+matching, learning-to-rank, query expansion, or concurrent writes. Block-max WAND is available as an opt-in
+strategy, computed per query rather than stored as a pruning index, so it needs no format of its own and
+also gains nothing at index time. It does not claim state-of-the-art compressed-query throughput. Unicode analysis uses standard-library alphanumeric boundaries and lowercase conversion; it does
 not perform Unicode normalization or language-aware segmentation.
 
 The local TREC reader supports the exact subset documented above. Convert other collection formats to TSV

@@ -167,10 +167,11 @@ fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let b = parse_optional(parsed.optional_one("--b")?, 0.75_f64, "b")?;
     let pruning = match parsed.optional_one("--strategy")?.unwrap_or("wand") {
         "wand" => PruningStrategy::Wand,
+        "block-max-wand" | "bmw" => PruningStrategy::BlockMaxWand,
         "full" | "exhaustive" => PruningStrategy::Exhaustive,
         value => {
             return Err(Error::InvalidArgument(format!(
-                "unknown strategy '{value}', expected wand or full"
+                "unknown strategy '{value}', expected wand, block-max-wand, or full"
             )));
         }
     };
@@ -289,10 +290,11 @@ fn command_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
     };
     let pruning = match parsed.optional_one("--strategy")?.unwrap_or("wand") {
         "wand" => PruningStrategy::Wand,
+        "block-max-wand" | "bmw" => PruningStrategy::BlockMaxWand,
         "full" | "exhaustive" => PruningStrategy::Exhaustive,
         value => {
             return Err(Error::InvalidArgument(format!(
-                "unknown strategy '{value}', expected wand or full"
+                "unknown strategy '{value}', expected wand, block-max-wand, or full"
             )));
         }
     };
@@ -495,6 +497,14 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
         report.wand_stats.evaluated_candidates,
         report.wand_stats.postings_advanced,
         report.wand_stats.postings_skipped
+    )?;
+    writeln!(
+        output,
+        "block-max-wand elapsed_ms={:.3} evaluated={} advanced={} skipped={}",
+        report.block_max_time.as_secs_f64() * 1000.0,
+        report.block_max_stats.evaluated_candidates,
+        report.block_max_stats.postings_advanced,
+        report.block_max_stats.postings_skipped
     )?;
     writeln!(output, "verified=true checksum={:016x}", report.checksum)?;
     writeln!(

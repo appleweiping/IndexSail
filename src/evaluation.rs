@@ -124,9 +124,14 @@ pub fn evaluate_batch(
 
         if config.verify_exact {
             let oracle_options = SearchOptions {
+                // A pruning run is checked against the exhaustive scan, which
+                // is the only strategy that cannot be wrong about what it
+                // skipped, and the exhaustive run is checked against `WAND`.
                 pruning: match config.pruning {
                     PruningStrategy::Exhaustive => PruningStrategy::Wand,
-                    PruningStrategy::Wand => PruningStrategy::Exhaustive,
+                    PruningStrategy::Wand | PruningStrategy::BlockMaxWand => {
+                        PruningStrategy::Exhaustive
+                    }
                 },
                 ..options
             };
@@ -184,6 +189,7 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
     let strategy = match report.config.pruning {
         PruningStrategy::Exhaustive => "exhaustive",
         PruningStrategy::Wand => "wand",
+        PruningStrategy::BlockMaxWand => "block-max-wand",
     };
     let operator = match report.config.operator {
         BooleanOperator::And => "and",

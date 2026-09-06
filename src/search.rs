@@ -5,6 +5,15 @@ use crate::error::{Error, Result};
 use crate::index::{InternalDocId, InvertedIndex, Posting};
 use crate::query::{BooleanOperator, PhraseFilter, SearchQuery};
 
+/// Postings summarized by one block maximum.
+///
+/// A block is the unit at which a maximum impact is remembered, so the size
+/// trades bookkeeping against how tightly the bound describes the documents it
+/// covers: one very high impact posting raises the bound for its whole block.
+/// 64 follows Ding and Suel and keeps the maxima a small fraction of the
+/// postings they summarize.
+const BLOCK_POSTINGS: usize = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bm25Params {
     pub k1: f64,
@@ -38,6 +47,15 @@ pub enum PruningStrategy {
     Exhaustive,
     #[default]
     Wand,
+    /// `WAND` refined by per-block maximum impacts.
+    ///
+    /// Plain `WAND` bounds a term by the largest impact anywhere in its
+    /// postings, so a single outlier document keeps that bound high for every
+    /// other document the term touches. Remembering a maximum per block lets a
+    /// run of low-impact postings be skipped whole rather than one document at
+    /// a time. The ranking is unchanged: a block maximum is a true upper bound
+    /// inside its block, so nothing that could enter the top-k is skipped.
+    BlockMaxWand,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -131,6 +149,11 @@ struct TermScorer {
     ordinal: usize,
     entries: Vec<ScoredPosting>,
     upper_bound: f64,
+    /// Largest impact within each `BLOCK_POSTINGS`-sized run of `entries`.
+    ///
+    /// Computed in the same pass that scores the postings, so block-max
+    /// pruning costs no extra work at index time and no extra format.
+    block_max: Vec<f64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +236,103 @@ impl TopK {
     }
 }
 
+/// One term's position in a `WAND`-style walk over its scored postings.
+#[derive(Debug)]
+struct Cursor {
+    scorer: TermScorer,
+    position: usize,
+}
+
+impl Cursor {
+    fn current_doc(&self) -> InternalDocId {
+        self.scorer.entries[self.position].doc_id
+    }
+
+    fn current_score(&self) -> f64 {
+        self.scorer.entries[self.position].score
+    }
+
+    fn advance_one(&mut self) -> usize {
+        self.position += 1;
+        1
+    }
+
+    fn advance_to(&mut self, target: InternalDocId) -> usize {
+        let old = self.position;
+        let offset =
+            self.scorer.entries[self.position..].partition_point(|entry| entry.doc_id < target);
+        self.position += offset;
+        self.position - old
+    }
+
+    fn exhausted(&self) -> bool {
+        self.position >= self.scorer.entries.len()
+    }
+
+    /// The largest impact this term can contribute anywhere inside the block
+    /// the cursor currently sits in.
+    fn block_max(&self) -> f64 {
+        self.scorer.block_max[self.position / BLOCK_POSTINGS]
+    }
+
+    /// The last document the current block covers, which is how far its bound
+    /// stays valid.
+    fn block_last_doc(&self) -> InternalDocId {
+        let block = self.position / BLOCK_POSTINGS;
+        let end = ((block + 1) * BLOCK_POSTINGS).min(self.scorer.entries.len()) - 1;
+        self.scorer.entries[end].doc_id
+    }
+}
+
+/// Skip a run of documents no block can lift above the threshold.
+///
+/// Returns whether the cursors moved. The bound covers every cursor that could
+/// contribute at the pivot, including one past the pivot position that happens
+/// to sit on the same document: leaving that one out would understate a score
+/// about to be computed, and could skip a document belonging in the top-k.
+fn block_skip(
+    cursors: &mut [Cursor],
+    pivot_position: usize,
+    pivot_doc: InternalDocId,
+    threshold: f64,
+    stats: &mut SearchStats,
+) -> bool {
+    let bound_end = cursors
+        .iter()
+        .position(|cursor| cursor.current_doc() > pivot_doc)
+        .unwrap_or(cursors.len())
+        .max(pivot_position + 1);
+    let mut bound = 0.0;
+    for cursor in &cursors[..bound_end] {
+        bound = conservative_next_up(bound + cursor.block_max());
+    }
+    if bound >= threshold {
+        return false;
+    }
+    // The bound holds until the earliest block ends, and no cursor beyond it
+    // reaches back before its own current document.
+    let mut next = cursors[..bound_end]
+        .iter()
+        .map(Cursor::block_last_doc)
+        .min()
+        .expect("a pivot always has at least one cursor")
+        .saturating_add(1);
+    if let Some(after) = cursors.get(bound_end) {
+        next = next.min(after.current_doc());
+    }
+    // The pivot cannot reach the threshold either, so stepping past it is both
+    // safe and what guarantees the loop advances.
+    next = next.max(pivot_doc.saturating_add(1));
+    for cursor in cursors.iter_mut() {
+        if cursor.current_doc() < next {
+            let advanced = cursor.advance_to(next);
+            stats.postings_advanced += advanced;
+            stats.postings_skipped += advanced.saturating_sub(1);
+        }
+    }
+    true
+}
+
 impl InvertedIndex {
     pub fn search(&self, query: &SearchQuery, options: SearchOptions) -> Result<SearchOutcome> {
         let options = options.validate()?;
@@ -241,7 +361,8 @@ impl InvertedIndex {
 
         let (top_k, stats) = match options.pruning {
             PruningStrategy::Exhaustive => self.search_exhaustive(query, &scorers, options.top_k),
-            PruningStrategy::Wand => self.search_wand(query, scorers, options.top_k),
+            PruningStrategy::Wand => self.search_wand(query, scorers, options.top_k, false),
+            PruningStrategy::BlockMaxWand => self.search_wand(query, scorers, options.top_k, true),
         };
 
         let hits = top_k
@@ -344,10 +465,17 @@ impl InvertedIndex {
             .collect::<Vec<_>>();
         let upper_bound =
             conservative_next_up(entries.iter().map(|entry| entry.score).fold(0.0, f64::max));
+        let block_max = entries
+            .chunks(BLOCK_POSTINGS)
+            .map(|block| {
+                conservative_next_up(block.iter().map(|entry| entry.score).fold(0.0, f64::max))
+            })
+            .collect::<Vec<_>>();
         Ok(TermScorer {
             ordinal,
             entries,
             upper_bound,
+            block_max,
         })
     }
 
@@ -392,45 +520,19 @@ impl InvertedIndex {
         (heap, stats)
     }
 
+    /// `WAND`, optionally refined by per-block maximum impacts.
+    ///
+    /// Both strategies share this body deliberately. The block bound only ever
+    /// decides to skip documents that the shared pivot logic has already shown
+    /// cannot reach the threshold, so the two cannot drift into ranking
+    /// differently -- which is the property the tests pin.
     fn search_wand(
         &self,
         query: &SearchQuery,
         scorers: Vec<TermScorer>,
         top_k: usize,
+        use_block_max: bool,
     ) -> (TopK, SearchStats) {
-        #[derive(Debug)]
-        struct Cursor {
-            scorer: TermScorer,
-            position: usize,
-        }
-
-        impl Cursor {
-            fn current_doc(&self) -> InternalDocId {
-                self.scorer.entries[self.position].doc_id
-            }
-
-            fn current_score(&self) -> f64 {
-                self.scorer.entries[self.position].score
-            }
-
-            fn advance_one(&mut self) -> usize {
-                self.position += 1;
-                1
-            }
-
-            fn advance_to(&mut self, target: InternalDocId) -> usize {
-                let old = self.position;
-                let offset = self.scorer.entries[self.position..]
-                    .partition_point(|entry| entry.doc_id < target);
-                self.position += offset;
-                self.position - old
-            }
-
-            fn exhausted(&self) -> bool {
-                self.position >= self.scorer.entries.len()
-            }
-        }
-
         let required_terms = scorers.len();
         let mut cursors = scorers
             .into_iter()
@@ -461,6 +563,12 @@ impl InvertedIndex {
                 break;
             };
             let pivot_doc = cursors[pivot_position].current_doc();
+
+            if let (true, Some(value)) = (use_block_max, threshold) {
+                if block_skip(&mut cursors, pivot_position, pivot_doc, value, &mut stats) {
+                    continue;
+                }
+            }
 
             if cursors[0].current_doc() == pivot_doc {
                 let matching_count = cursors
@@ -990,5 +1098,258 @@ mod tests {
         .unwrap();
         let outcome = search(&index, query, PruningStrategy::Wand);
         assert_eq!(outcome.hits[0].external_id, "b");
+    }
+
+    /// A corpus large enough that block maxima matter.
+    ///
+    /// Terms appear at very different rates and repeat at very different
+    /// frequencies, so impacts vary widely inside a single posting list. That
+    /// is the situation block-max pruning exists for: a plain `WAND` bound is
+    /// set by one outlier and stays high for every other document the term
+    /// touches.
+    fn block_index(document_count: usize) -> InvertedIndex {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for ordinal in 0..document_count {
+            let mut body = String::new();
+            // `common` is in almost every document, `mid` in about a third,
+            // `rare` in a few, and each carries a different repeat count.
+            let repeats = 1 + usize::try_from(next() % 9).unwrap();
+            for _ in 0..repeats {
+                body.push_str("common ");
+            }
+            if ordinal % 3 == 0 {
+                let repeats = 1 + usize::try_from(next() % 5).unwrap();
+                for _ in 0..repeats {
+                    body.push_str("mid ");
+                }
+            }
+            if ordinal % 37 == 0 {
+                let repeats = 1 + usize::try_from(next() % 11).unwrap();
+                for _ in 0..repeats {
+                    body.push_str("rare ");
+                }
+            }
+            if ordinal % 7 == 0 {
+                body.push_str("filler ");
+            }
+            // Varying length changes the BM25 normalization, so two documents
+            // with the same term frequency still score differently.
+            for _ in 0..(next() % 13) {
+                body.push_str("padding ");
+            }
+            let category = if ordinal % 2 == 0 { "even" } else { "odd" };
+            builder
+                .add_document(
+                    Document::from_fields(
+                        format!("d{ordinal}"),
+                        [
+                            ("title", format!("document {ordinal}")),
+                            ("body", body),
+                            ("category", category.to_owned()),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        builder.finish()
+    }
+
+    fn search_with(
+        index: &InvertedIndex,
+        query: &SearchQuery,
+        strategy: PruningStrategy,
+        top_k: usize,
+    ) -> SearchOutcome {
+        index
+            .search(
+                query,
+                SearchOptions {
+                    top_k,
+                    pruning: strategy,
+                    explain: false,
+                    bm25: Bm25Params::default(),
+                },
+            )
+            .unwrap()
+    }
+
+    fn assert_same_ranking(left: &SearchOutcome, right: &SearchOutcome, context: &str) {
+        assert_eq!(
+            left.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            right.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            "document order differs for {context}"
+        );
+        for (a, b) in left.hits.iter().zip(&right.hits) {
+            assert!(
+                (a.score - b.score).abs() < 1e-12,
+                "score differs for {context}: {} vs {}",
+                a.score,
+                b.score
+            );
+        }
+    }
+
+    #[test]
+    fn block_max_wand_matches_exhaustive_across_queries_and_cutoffs() {
+        let index = block_index(600);
+        for text in [
+            "common",
+            "rare",
+            "common mid",
+            "common rare",
+            "mid rare filler",
+            "common mid rare filler padding",
+            "absent",
+            "common absent",
+        ] {
+            for operator in [BooleanOperator::Or, BooleanOperator::And] {
+                for top_k in [1, 3, 10, 50] {
+                    let query = SearchQuery::from_text(index.analyzer(), text, None)
+                        .unwrap()
+                        .with_operator(operator);
+                    let context = format!("{text:?} {operator:?} top_k={top_k}");
+                    let exhaustive =
+                        search_with(&index, &query, PruningStrategy::Exhaustive, top_k);
+                    let wand = search_with(&index, &query, PruningStrategy::Wand, top_k);
+                    let block = search_with(&index, &query, PruningStrategy::BlockMaxWand, top_k);
+                    assert_same_ranking(&exhaustive, &wand, &context);
+                    assert_same_ranking(&exhaustive, &block, &context);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_max_wand_stays_exact_with_filters_and_phrases() {
+        let index = block_index(400);
+        let base = SearchQuery::from_text(index.analyzer(), "common mid rare", None).unwrap();
+        let filtered = base
+            .clone()
+            .with_filter(FieldFilter::exact("category", "even").unwrap());
+        let phrased = base
+            .clone()
+            .with_phrase(PhraseFilter::from_text(index.analyzer(), "common common", None).unwrap());
+        for (query, context) in [(base, "plain"), (filtered, "filtered"), (phrased, "phrase")] {
+            let exhaustive = search_with(&index, &query, PruningStrategy::Exhaustive, 10);
+            let block = search_with(&index, &query, PruningStrategy::BlockMaxWand, 10);
+            assert_same_ranking(&exhaustive, &block, context);
+        }
+    }
+
+    #[test]
+    fn block_max_wand_skips_more_than_plain_wand() {
+        // The point of the strategy. A term whose impacts vary widely has long
+        // runs that a global bound cannot skip but a block bound can.
+        let index = block_index(1_500);
+        let query = SearchQuery::from_text(index.analyzer(), "common mid rare", None).unwrap();
+        let wand = search_with(&index, &query, PruningStrategy::Wand, 10);
+        let block = search_with(&index, &query, PruningStrategy::BlockMaxWand, 10);
+
+        assert_same_ranking(&wand, &block, "pruning comparison");
+        assert!(
+            block.stats.evaluated_candidates <= wand.stats.evaluated_candidates,
+            "block-max scored more candidates than plain WAND: {} vs {}",
+            block.stats.evaluated_candidates,
+            wand.stats.evaluated_candidates
+        );
+        assert!(
+            block.stats.postings_skipped >= wand.stats.postings_skipped,
+            "block-max skipped fewer postings than plain WAND: {} vs {}",
+            block.stats.postings_skipped,
+            wand.stats.postings_skipped
+        );
+    }
+
+    #[test]
+    fn block_max_wand_terminates_when_every_document_matches() {
+        // Every document carries `common`, so the pivot repeatedly lands on the
+        // first cursor. A skip rule that failed to step past the pivot would
+        // spin here rather than fail.
+        let index = block_index(300);
+        let query = SearchQuery::from_text(index.analyzer(), "common", None).unwrap();
+        let block = search_with(&index, &query, PruningStrategy::BlockMaxWand, 5);
+        assert_eq!(block.hits.len(), 5);
+    }
+
+    #[test]
+    fn block_max_wand_handles_a_cutoff_larger_than_the_corpus() {
+        let index = block_index(20);
+        let query = SearchQuery::from_text(index.analyzer(), "common rare", None).unwrap();
+        let exhaustive = search_with(&index, &query, PruningStrategy::Exhaustive, 500);
+        let block = search_with(&index, &query, PruningStrategy::BlockMaxWand, 500);
+        assert_same_ranking(&exhaustive, &block, "cutoff beyond corpus");
+    }
+
+    #[test]
+    fn block_maxima_bound_every_posting_in_their_block() {
+        // The invariant the whole strategy rests on. If a block maximum were
+        // ever below a score inside its block, pruning could drop a document
+        // that belonged in the top-k, and the ranking tests above would only
+        // notice when a query happened to hit it.
+        let index = block_index(500);
+        let term = PreparedTerm {
+            normalized: "common".to_owned(),
+            field: None,
+            boost: 1.0,
+        };
+        let scorer = index
+            .build_term_scorer(0, &term, Bm25Params::default())
+            .unwrap();
+        assert!(scorer.entries.len() > BLOCK_POSTINGS, "corpus too small");
+        assert_eq!(
+            scorer.block_max.len(),
+            scorer.entries.len().div_ceil(BLOCK_POSTINGS)
+        );
+        for (block, chunk) in scorer.entries.chunks(BLOCK_POSTINGS).enumerate() {
+            for entry in chunk {
+                assert!(
+                    scorer.block_max[block] >= entry.score,
+                    "block {block} maximum {} is below a posting score {}",
+                    scorer.block_max[block],
+                    entry.score
+                );
+            }
+        }
+        for bound in &scorer.block_max {
+            assert!(
+                *bound <= scorer.upper_bound,
+                "a block maximum exceeds the global bound"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement, not an assertion"]
+    #[allow(clippy::cast_precision_loss)]
+    fn report_block_max_pruning_effect() {
+        for documents in [1_000, 5_000, 20_000] {
+            let index = block_index(documents);
+            for text in ["common mid rare", "common mid", "common"] {
+                for top_k in [10, 100] {
+                    let query = SearchQuery::from_text(index.analyzer(), text, None).unwrap();
+                    let w = search_with(&index, &query, PruningStrategy::Wand, top_k);
+                    let b = search_with(&index, &query, PruningStrategy::BlockMaxWand, top_k);
+                    let e = search_with(&index, &query, PruningStrategy::Exhaustive, top_k);
+                    assert_same_ranking(&e, &b, "measurement");
+                    let reduction = 100.0
+                        - 100.0 * b.stats.evaluated_candidates as f64
+                            / w.stats.evaluated_candidates.max(1) as f64;
+                    println!(
+                        "docs={documents:>6} q={text:<16} k={top_k:>3}  scored: exhaustive={:>6} wand={:>6} bmw={:>6}  ({reduction:>5.1}% fewer than wand)",
+                        e.stats.evaluated_candidates,
+                        w.stats.evaluated_candidates,
+                        b.stats.evaluated_candidates
+                    );
+                }
+            }
+        }
     }
 }
