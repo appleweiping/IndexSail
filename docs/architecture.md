@@ -8,7 +8,7 @@
 | `document` | External identifiers and validated, deterministically ordered named fields |
 | `index` | Builder, immutable document table, field lengths, dictionary, positional postings |
 | `query` | Typed terms, `AND`/`OR`, phrase constraints, and exact-field filters |
-| `search` | BM25 scorers, exhaustive/WAND execution, stable heap, explanations and counters |
+| `search` | BM25 scorers, exhaustive/WAND/block-max WAND/MaxScore execution, stable heap, explanations and counters |
 | `codec` | Posting gaps, base-128 variable bytes, codec statistics, payload checksum |
 | `persistence` | v3 writer, v3/v2/v1 readers, checksums, bounds and structural validation |
 | `trec` | Collection, topic and qrels adapters |
@@ -44,7 +44,7 @@ sequenceDiagram
 sequenceDiagram
     participant T as Topic adapter
     participant Q as SearchQuery
-    participant S as Selected executor
+    participant S as Selected executor (Exhaustive/WAND/BMW/MaxScore)
     participant O as Other executor
     participant K as Stable top-k
     participant E as Evaluator
@@ -115,6 +115,17 @@ uses a threshold contributed by an invalid result.
 Plain WAND uses this one bound per logical term. Block-max WAND adds a per-block refinement without changing
 the pivot, exact-scoring, heap, constraint, or tie-breaking code. Default parameters consume the persisted
 table below; custom parameters derive conservative bounds from their materialized scores.
+
+## MaxScore safety argument
+
+MaxScore sorts logical term scorers by ascending exact upper bound. After the heap is full, it sums the bounds
+of the low-impact prefix. A prefix is non-essential only when that sum is strictly below the retained
+threshold; strictness preserves a candidate that could tie on score and win by lower internal document ID.
+Only the remaining essential suffix generates candidate document IDs. Before each candidate is scored, all
+terms are consulted in original ordinal order, so floating-point addition is bit-stable and non-essential
+terms still contribute to the final score. Prefix postings are advanced past candidates, and the executor
+terminates when their total bound is strictly below the threshold. Conjunctive queries use the exhaustive
+intersection traversal, because the essential-list proof is for disjunctions.
 
 ## Persisted block-max invariants
 

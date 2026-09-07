@@ -36,9 +36,11 @@ pub struct BenchmarkReport {
     pub exhaustive_time: Duration,
     pub wand_time: Duration,
     pub block_max_time: Duration,
+    pub maxscore_time: Duration,
     pub exhaustive_stats: SearchStats,
     pub wand_stats: SearchStats,
     pub block_max_stats: SearchStats,
+    pub maxscore_stats: SearchStats,
     pub checksum: u64,
     pub index_terms: usize,
     pub index_postings: usize,
@@ -50,7 +52,7 @@ pub struct BenchmarkReport {
     pub block_max_blocks: usize,
 }
 
-/// Run a deterministic synthetic benchmark and verify WAND against exhaustive search.
+/// Run a deterministic synthetic benchmark and verify every executor against exhaustive search.
 #[allow(clippy::too_many_lines)]
 pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
     if config.documents == 0 || config.queries == 0 || config.top_k == 0 {
@@ -181,6 +183,30 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
     }
     let block_max_time = block_max_started.elapsed();
 
+    let maxscore_started = Instant::now();
+    let mut maxscore_stats = SearchStats::default();
+    for (query, exhaustive) in queries.iter().zip(&exhaustive_results) {
+        let outcome = index.search(
+            query,
+            SearchOptions {
+                top_k: config.top_k,
+                pruning: PruningStrategy::MaxScore,
+                ..SearchOptions::default()
+            },
+        )?;
+        add_stats(&mut maxscore_stats, outcome.stats);
+        if outcome.hits.len() != exhaustive.len()
+            || outcome.hits.iter().zip(exhaustive).any(|(left, right)| {
+                left.doc_id != right.doc_id || left.score.to_bits() != right.score.to_bits()
+            })
+        {
+            return Err(Error::CorruptIndex(
+                "MaxScore benchmark results differ from exhaustive results".into(),
+            ));
+        }
+    }
+    let maxscore_time = maxscore_started.elapsed();
+
     let stats = index.stats();
     let posting_codec = index.posting_codec_stats()?;
     let mut persisted = Vec::new();
@@ -201,9 +227,11 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         exhaustive_time,
         wand_time,
         block_max_time,
+        maxscore_time,
         exhaustive_stats,
         wand_stats,
         block_max_stats,
+        maxscore_stats,
         checksum,
         index_terms: stats.terms,
         index_postings: stats.postings,
@@ -220,7 +248,7 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
 /// machine-dependent; workload counters and checksum are deterministic.
 pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()> {
     writeln!(writer, "{{")?;
-    writeln!(writer, "  \"schema_version\": 3,")?;
+    writeln!(writer, "  \"schema_version\": 4,")?;
     writeln!(writer, "  \"verified_exact\": true,")?;
     writeln!(writer, "  \"documents\": {},", report.config.documents)?;
     writeln!(writer, "  \"queries\": {},", report.config.queries)?;
@@ -269,6 +297,11 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
     )?;
     writeln!(
         writer,
+        "  \"maxscore_elapsed_micros\": {},",
+        report.maxscore_time.as_micros()
+    )?;
+    writeln!(
+        writer,
         "  \"exhaustive\": {{\"evaluated\": {}, \"advanced\": {}, \"skipped\": {}}},",
         report.exhaustive_stats.evaluated_candidates,
         report.exhaustive_stats.postings_advanced,
@@ -290,6 +323,13 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
         report.block_max_stats.block_max_bounds_loaded,
         report.block_max_stats.block_max_postings_covered,
         report.block_max_stats.block_max_postings_scanned
+    )?;
+    writeln!(
+        writer,
+        "  \"maxscore\": {{\"evaluated\": {}, \"advanced\": {}, \"skipped\": {}}},",
+        report.maxscore_stats.evaluated_candidates,
+        report.maxscore_stats.postings_advanced,
+        report.maxscore_stats.postings_skipped
     )?;
     writeln!(writer, "  \"checksum\": \"{:016x}\"", report.checksum)?;
     writeln!(writer, "}}")?;
@@ -385,6 +425,12 @@ mod tests {
             report.block_max_stats.evaluated_candidates
                 <= report.exhaustive_stats.evaluated_candidates
         );
+        assert!(report.maxscore_stats.evaluated_candidates > 0);
+        assert!(report.maxscore_stats.postings_advanced > 0);
+        assert!(
+            report.maxscore_stats.evaluated_candidates
+                <= report.exhaustive_stats.evaluated_candidates
+        );
     }
 
     #[test]
@@ -399,10 +445,11 @@ mod tests {
         let mut json = Vec::new();
         write_json(&report, &mut json).unwrap();
         let json = String::from_utf8(json).unwrap();
-        assert!(json.contains("\"schema_version\": 3"));
+        assert!(json.contains("\"schema_version\": 4"));
         assert!(json.contains("\"block_max_metadata_bytes\""));
         assert!(json.contains("\"precomputed_bounds_loaded\""));
         assert!(json.contains("\"postings_scanned_for_bounds\": 0"));
+        assert!(json.contains("\"maxscore\""));
     }
 
     #[test]

@@ -4,7 +4,15 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
-_No changes yet._
+- Added an exact `MaxScore` term-at-a-time executor for disjunctive queries.
+  It uses essential-list upper-bound pruning, preserves complete-term scoring,
+  post-filter and phrase semantics, deterministic ties, and bit-exact
+  exhaustive-oracle verification. The CLI and benchmark report expose the
+  strategy as `maxscore`; conjunctive queries retain the exact intersection
+  path.
+- Bumped the benchmark JSON schema to version 4 with MaxScore timing and
+  counters, and added deterministic regression coverage across cutoffs,
+  filters, phrases, ties, and a 600-document synthetic corpus.
 
 ## [0.3.0] - 2026-09-07
 

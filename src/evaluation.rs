@@ -129,9 +129,9 @@ pub fn evaluate_batch(
                 // skipped, and the exhaustive run is checked against `WAND`.
                 pruning: match config.pruning {
                     PruningStrategy::Exhaustive => PruningStrategy::Wand,
-                    PruningStrategy::Wand | PruningStrategy::BlockMaxWand => {
-                        PruningStrategy::Exhaustive
-                    }
+                    PruningStrategy::Wand
+                    | PruningStrategy::BlockMaxWand
+                    | PruningStrategy::MaxScore => PruningStrategy::Exhaustive,
                 },
                 ..options
             };
@@ -190,6 +190,7 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
         PruningStrategy::Exhaustive => "exhaustive",
         PruningStrategy::Wand => "wand",
         PruningStrategy::BlockMaxWand => "block-max-wand",
+        PruningStrategy::MaxScore => "maxscore",
     };
     let operator = match report.config.operator {
         BooleanOperator::And => "and",

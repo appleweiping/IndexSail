@@ -5,7 +5,7 @@
 [![MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
 IndexSail is an information-retrieval experiment toolkit in safe Rust. It builds a
-field-aware positional index, ranks with BM25, executes exact exhaustive, WAND, or block-max WAND top-k
+field-aware positional index, ranks with BM25, executes exact exhaustive, WAND, block-max WAND, or MaxScore top-k
 queries, and runs
 reproducible TREC-style experiments from collection ingestion through metrics and run files.
 
@@ -21,10 +21,10 @@ experiments small enough to fit in one process.
 | Analysis | Deterministic Unicode or ASCII tokenization, stored with the index |
 | Index | Named fields, stable external IDs, positions, field lengths, DF and collection statistics |
 | Retrieval | BM25, `AND`/`OR`, fielded terms, phrases, exact field filters, explanations |
-| Execution | Exhaustive oracle, exact WAND and block-max WAND with stable tie-breaking |
+| Execution | Exhaustive oracle, exact WAND, block-max WAND, and MaxScore with stable tie-breaking |
 | Experiments | TSV or classic TREC topics, qrels, six-column run files, JSON reports |
 | Metrics | MAP@k, MRR@k, nDCG@k, Recall@k, latency, candidates, advances and skips |
-| Verification | Optional per-query bit-exact WAND/exhaustive comparison |
+| Verification | Optional per-query bit-exact executor/exhaustive comparison |
 | Storage | Checksummed v3 format with compressed postings and persisted block-max bounds; v1/v2 reads |
 | Operations | CLI, library API, Linux/Windows CI, strict Clippy, rustfmt and release tests |
 
@@ -44,6 +44,7 @@ flowchart LR
     E -->|Exhaustive| X[Reference candidate traversal]
     E -->|WAND| W[Bounded cursor skipping]
     E -->|Block-max WAND| BW[Block-bound skipping]
+    E -->|MaxScore| MS[Essential-list skipping]
     X --> K[Stable top-k]
     W --> K
     BW --> K
@@ -238,6 +239,22 @@ all use exhaustive execution as a correctness oracle.
 
 This implementation uses one bound per logical term. `--strategy block-max-wand` adds a second, tighter
 bound described below.
+
+## Exact MaxScore
+
+MaxScore orders term scorers by their maximum possible contribution and maintains an essential suffix once
+the top-k threshold is known. Documents occurring only in the low-impact prefix cannot reach that threshold,
+so their postings are advanced without scoring. Every candidate from the essential terms is still scored with
+the complete term set, and the same exhaustive oracle, post-filters, phrase checks, and tie-breaking rules
+apply. `AND` queries use the exact intersection walk because MaxScore's essential-list optimization is
+defined for disjunctive retrieval.
+
+```bash
+indexsail search corpus.idx "local search ranking" --strategy maxscore
+```
+
+The executor reports the same `evaluated`, `advanced`, and `skipped` counters as WAND. Batch `--verify`
+compares MaxScore's document IDs, order, and score bits against exhaustive retrieval for every topic.
 
 ## Block-max WAND
 

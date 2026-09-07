@@ -49,6 +49,15 @@ pub enum PruningStrategy {
     /// a time. The ranking is unchanged: a block maximum is a true upper bound
     /// inside its block, so nothing that could enter the top-k is skipped.
     BlockMaxWand,
+    /// `MaxScore` term-at-a-time pruning using exact per-term upper bounds.
+    ///
+    /// Terms are ordered by their maximum possible contribution.  Once the
+    /// top-k heap has a threshold, documents occurring only in the low-impact
+    /// prefix can be skipped safely; candidates from the remaining essential
+    /// terms are scored against the full term set.  This is the same family
+    /// of algorithm as PISA's `MaxScore` executor, while retaining `IndexSail`'s
+    /// deterministic tie-breaking and post-filter semantics.
+    MaxScore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -464,6 +473,7 @@ impl InvertedIndex {
             PruningStrategy::Exhaustive => self.search_exhaustive(query, &scorers, options.top_k),
             PruningStrategy::Wand => self.search_wand(query, scorers, options.top_k, false),
             PruningStrategy::BlockMaxWand => self.search_wand(query, scorers, options.top_k, true),
+            PruningStrategy::MaxScore => self.search_max_score(query, scorers, options.top_k),
         };
         stats.block_max_bounds_loaded = preparation_stats.block_max_bounds_loaded;
         stats.block_max_postings_covered = preparation_stats.block_max_postings_covered;
@@ -745,6 +755,121 @@ impl InvertedIndex {
                     let advanced = cursor.advance_to(pivot_doc);
                     stats.postings_advanced += advanced;
                     stats.postings_skipped += advanced.saturating_sub(1);
+                }
+            }
+        }
+        (heap, stats)
+    }
+
+    /// `MaxScore`'s essential-list traversal for disjunctive queries.
+    ///
+    /// The low-bound terms are deliberately excluded only from candidate
+    /// generation.  Every candidate is still scored with every term, so the
+    /// returned ranking is bit-identical to the exhaustive oracle.  For
+    /// conjunctive queries the intersection walk in `search_exhaustive` is
+    /// already the most direct exact executor; delegating there preserves the
+    /// Boolean semantics instead of applying an OR-oriented optimization.
+    fn search_max_score(
+        &self,
+        query: &SearchQuery,
+        scorers: Vec<TermScorer>,
+        top_k: usize,
+    ) -> (TopK, SearchStats) {
+        if query.operator() == BooleanOperator::And {
+            return self.search_exhaustive(query, &scorers, top_k);
+        }
+
+        let mut cursors = scorers
+            .into_iter()
+            .map(|scorer| Cursor {
+                scorer,
+                position: 0,
+            })
+            .collect::<Vec<_>>();
+        cursors.sort_by(|left, right| {
+            left.scorer
+                .upper_bound
+                .total_cmp(&right.scorer.upper_bound)
+                .then_with(|| left.scorer.ordinal.cmp(&right.scorer.ordinal))
+        });
+
+        let mut heap = TopK::new(top_k);
+        let mut stats = SearchStats::default();
+
+        loop {
+            cursors.retain(|cursor| !cursor.exhausted());
+            if cursors.is_empty() {
+                break;
+            }
+
+            // The ascending prefix is non-essential when its *whole* upper
+            // bound is strictly below the current threshold.  Strictness is
+            // required: equal scores can still win the deterministic
+            // lower-doc-id tie-break.
+            let essential_start = if let Some(threshold) = heap.threshold() {
+                let mut prefix_bound = 0.0;
+                let mut cut = 0;
+                while cut < cursors.len() {
+                    let next = conservative_next_up(prefix_bound + cursors[cut].scorer.upper_bound);
+                    if next < threshold {
+                        prefix_bound = next;
+                        cut += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if cut == cursors.len() {
+                    // No unseen document can improve the heap.  If the total
+                    // bound is exactly the threshold, retain all terms for
+                    // tie correctness; otherwise the search is complete.
+                    if prefix_bound < threshold {
+                        break;
+                    }
+                    0
+                } else {
+                    cut
+                }
+            } else {
+                0
+            };
+
+            let candidate_doc = cursors[essential_start..]
+                .iter()
+                .map(Cursor::current_doc)
+                .min()
+                .expect("essential list is non-empty");
+
+            // Bring lower-bound cursors up to the candidate.  Documents that
+            // occur only in the non-essential prefix are skipped here; their
+            // total possible score is below the threshold by construction.
+            for cursor in &mut cursors[..essential_start] {
+                if cursor.current_doc() < candidate_doc {
+                    let advanced = cursor.advance_to(candidate_doc);
+                    stats.postings_advanced += advanced;
+                    stats.postings_skipped += advanced.saturating_sub(1);
+                }
+            }
+
+            stats.evaluated_candidates += 1;
+            let mut pieces = cursors
+                .iter()
+                .filter_map(|cursor| {
+                    score_at(&cursor.scorer.entries, candidate_doc)
+                        .map(|score| (cursor.scorer.ordinal, score))
+                })
+                .collect::<Vec<_>>();
+            pieces.sort_by_key(|(ordinal, _)| *ordinal);
+            let score = pieces.into_iter().map(|(_, score)| score).sum();
+            if self.matches_constraints(candidate_doc, query) {
+                heap.consider(HeapEntry {
+                    doc_id: candidate_doc,
+                    score,
+                });
+            }
+
+            for cursor in &mut cursors {
+                if !cursor.exhausted() && cursor.current_doc() == candidate_doc {
+                    stats.postings_advanced += cursor.advance_one();
                 }
             }
         }
@@ -1168,6 +1293,74 @@ mod tests {
         let exhaustive = search(&index, query.clone(), PruningStrategy::Exhaustive);
         let wand = search(&index, query, PruningStrategy::Wand);
         assert_eq!(exhaustive.hits, wand.hits);
+    }
+
+    #[test]
+    fn maxscore_matches_exhaustive_across_queries_and_cutoffs() {
+        let index = block_index(600);
+        for text in [
+            "common",
+            "rare",
+            "common mid",
+            "common rare",
+            "mid rare filler",
+            "common mid rare filler padding",
+            "absent",
+            "common absent",
+        ] {
+            for top_k in [1, 3, 10, 50, 1_000] {
+                let query = SearchQuery::from_text(index.analyzer(), text, None).unwrap();
+                let context = format!("{text:?} top_k={top_k}");
+                let exhaustive = search_with(&index, &query, PruningStrategy::Exhaustive, top_k);
+                let maxscore = search_with(&index, &query, PruningStrategy::MaxScore, top_k);
+                assert_same_ranking(&exhaustive, &maxscore, &context);
+            }
+        }
+    }
+
+    #[test]
+    fn maxscore_keeps_filters_phrases_and_ties_exact() {
+        let index = block_index(400);
+        let base = SearchQuery::from_text(index.analyzer(), "common mid rare", None).unwrap();
+        let filtered = base
+            .clone()
+            .with_filter(FieldFilter::exact("category", "even").unwrap());
+        let phrased = base
+            .clone()
+            .with_phrase(PhraseFilter::from_text(index.analyzer(), "common common", None).unwrap());
+        for (query, context) in [(base, "plain"), (filtered, "filtered"), (phrased, "phrase")] {
+            let exhaustive = search_with(&index, &query, PruningStrategy::Exhaustive, 10);
+            let maxscore = search_with(&index, &query, PruningStrategy::MaxScore, 10);
+            assert_same_ranking(&exhaustive, &maxscore, context);
+        }
+
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for id in ["first", "second", "third"] {
+            builder
+                .add_document(Document::from_fields(id, [("body", "same")]).unwrap())
+                .unwrap();
+        }
+        let ties = builder.finish();
+        let query = SearchQuery::from_text(ties.analyzer(), "same", Some("body")).unwrap();
+        let exhaustive = search_with(&ties, &query, PruningStrategy::Exhaustive, 2);
+        let maxscore = search_with(&ties, &query, PruningStrategy::MaxScore, 2);
+        assert_same_ranking(&exhaustive, &maxscore, "ties");
+    }
+
+    #[test]
+    fn maxscore_skips_documents_only_in_low_bound_terms() {
+        let index = block_index(1_500);
+        let query = SearchQuery::from_text(index.analyzer(), "common mid rare", None).unwrap();
+        let exhaustive = search_with(&index, &query, PruningStrategy::Exhaustive, 10);
+        let maxscore = search_with(&index, &query, PruningStrategy::MaxScore, 10);
+        assert_same_ranking(&exhaustive, &maxscore, "maxscore pruning");
+        assert!(
+            maxscore.stats.evaluated_candidates <= exhaustive.stats.evaluated_candidates,
+            "MaxScore evaluated more candidates than exhaustive: {} vs {}",
+            maxscore.stats.evaluated_candidates,
+            exhaustive.stats.evaluated_candidates
+        );
+        assert!(maxscore.stats.postings_skipped > 0);
     }
 
     #[test]

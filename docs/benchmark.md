@@ -1,8 +1,8 @@
 # Reproducible benchmark baselines
 
 These are correctness-backed observations for deterministic synthetic workloads, not general throughput
-claims. The benchmark constructs one in-memory index, runs exhaustive retrieval, runs WAND, runs block-max
-WAND, compares every ranked document and score against the exhaustive results, and only then emits
+claims. The benchmark constructs one in-memory index, runs exhaustive retrieval, runs WAND, block-max WAND,
+and MaxScore, compares every ranked document and score against the exhaustive results, and only then emits
 `verified=true` and a checksum.
 
 ## Version 3 storage/query-work measurement

@@ -32,8 +32,8 @@ SEARCH OPTIONS:\n\
   --phrase-field NAME      Restrict the phrase to one field\n\
   --filter NAME=VALUE      Require an exact stored field value; repeatable\n\
   --top-k N                Number of hits (default: 10)\n\
-  --strategy wand|block-max-wand|full\n\
-                            Exact WAND, block-max WAND, or exhaustive evaluation\n\
+  --strategy wand|block-max-wand|maxscore|full\n\
+                            Exact WAND, block-max WAND, MaxScore, or exhaustive evaluation\n\
   --k1 NUMBER --b NUMBER   BM25 parameters\n\
   --explain                Print per-term BM25 contributions\n\
 \n\
@@ -43,7 +43,7 @@ BATCH OPTIONS:\n\
   --run FILE               Required six-column TREC run output\n\
   --report FILE            Optional machine-readable JSON report\n\
   --tag NAME               Run tag (default: indexsail)\n\
-  --verify                 Compare every WAND/exhaustive result exactly\n\
+  --verify                 Compare the selected strategy against exhaustive exactly\n\
   --field/--operator/...   Same ranking controls as search\n";
 
 pub fn execute<I, S>(arguments: I, mut output: impl Write) -> Result<()>
@@ -169,10 +169,11 @@ fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let pruning = match parsed.optional_one("--strategy")?.unwrap_or("wand") {
         "wand" => PruningStrategy::Wand,
         "block-max-wand" | "bmw" => PruningStrategy::BlockMaxWand,
+        "maxscore" | "max-score" => PruningStrategy::MaxScore,
         "full" | "exhaustive" => PruningStrategy::Exhaustive,
         value => {
             return Err(Error::InvalidArgument(format!(
-                "unknown strategy '{value}', expected wand, block-max-wand, or full"
+                "unknown strategy '{value}', expected wand, block-max-wand, maxscore, or full"
             )));
         }
     };
@@ -295,10 +296,11 @@ fn command_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let pruning = match parsed.optional_one("--strategy")?.unwrap_or("wand") {
         "wand" => PruningStrategy::Wand,
         "block-max-wand" | "bmw" => PruningStrategy::BlockMaxWand,
+        "maxscore" | "max-score" => PruningStrategy::MaxScore,
         "full" | "exhaustive" => PruningStrategy::Exhaustive,
         value => {
             return Err(Error::InvalidArgument(format!(
-                "unknown strategy '{value}', expected wand, block-max-wand, or full"
+                "unknown strategy '{value}', expected wand, block-max-wand, maxscore, or full"
             )));
         }
     };
@@ -457,6 +459,7 @@ fn command_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let parsed = ParsedOptions::parse(
         arguments,
@@ -528,6 +531,14 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
         report.block_max_stats.block_max_bounds_loaded,
         report.block_max_stats.block_max_postings_covered,
         report.block_max_stats.block_max_postings_scanned
+    )?;
+    writeln!(
+        output,
+        "maxscore elapsed_ms={:.3} evaluated={} advanced={} skipped={}",
+        report.maxscore_time.as_secs_f64() * 1000.0,
+        report.maxscore_stats.evaluated_candidates,
+        report.maxscore_stats.postings_advanced,
+        report.maxscore_stats.postings_skipped
     )?;
     writeln!(output, "verified=true checksum={:016x}", report.checksum)?;
     writeln!(
@@ -736,7 +747,7 @@ mod tests {
         execute(Vec::<String>::new(), &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("indexsail search"));
-        assert!(output.contains("wand|block-max-wand|full"));
+        assert!(output.contains("wand|block-max-wand|maxscore|full"));
     }
 
     #[test]
