@@ -182,7 +182,7 @@ pub fn write_trec_run(report: &BatchReport, tag: &str, mut writer: impl Write) -
     Ok(())
 }
 
-/// Write a dependency-free, stable JSON report suitable for regression jobs.
+/// Write a hand-encoded, stable JSON report suitable for regression jobs.
 #[allow(clippy::too_many_lines)]
 pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result<()> {
     validate_finite_report(report)?;
@@ -234,6 +234,21 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
         "  \"postings_skipped\": {},",
         report.total_stats.postings_skipped
     )?;
+    writeln!(
+        writer,
+        "  \"block_max_bounds_loaded\": {},",
+        report.total_stats.block_max_bounds_loaded
+    )?;
+    writeln!(
+        writer,
+        "  \"block_max_postings_covered\": {},",
+        report.total_stats.block_max_postings_covered
+    )?;
+    writeln!(
+        writer,
+        "  \"block_max_postings_scanned\": {},",
+        report.total_stats.block_max_postings_scanned
+    )?;
     write!(writer, "  \"aggregate\": ")?;
     if let Some(metrics) = report.aggregate {
         writeln!(
@@ -272,6 +287,21 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
             writer,
             "      \"postings_skipped\": {},",
             query.stats.postings_skipped
+        )?;
+        writeln!(
+            writer,
+            "      \"block_max_bounds_loaded\": {},",
+            query.stats.block_max_bounds_loaded
+        )?;
+        writeln!(
+            writer,
+            "      \"block_max_postings_covered\": {},",
+            query.stats.block_max_postings_covered
+        )?;
+        writeln!(
+            writer,
+            "      \"block_max_postings_scanned\": {},",
+            query.stats.block_max_postings_scanned
         )?;
         write!(writer, "      \"metrics\": ")?;
         if let Some(metrics) = query.metrics {
@@ -519,6 +549,18 @@ fn add_stats(total: &mut SearchStats, current: SearchStats) -> Result<()> {
         .postings_skipped
         .checked_add(current.postings_skipped)
         .ok_or_else(|| Error::InvalidArgument("batch posting count overflow".into()))?;
+    total.block_max_bounds_loaded = total
+        .block_max_bounds_loaded
+        .checked_add(current.block_max_bounds_loaded)
+        .ok_or_else(|| Error::InvalidArgument("batch block-bound count overflow".into()))?;
+    total.block_max_postings_covered = total
+        .block_max_postings_covered
+        .checked_add(current.block_max_postings_covered)
+        .ok_or_else(|| Error::InvalidArgument("batch block-posting count overflow".into()))?;
+    total.block_max_postings_scanned = total
+        .block_max_postings_scanned
+        .checked_add(current.block_max_postings_scanned)
+        .ok_or_else(|| Error::InvalidArgument("batch block-posting scan count overflow".into()))?;
     Ok(())
 }
 
@@ -605,6 +647,40 @@ mod tests {
     }
 
     #[test]
+    fn custom_bm25_batch_totals_block_bound_scans() {
+        let (index, topics, _) = fixture();
+        let report = evaluate_batch(
+            &index,
+            &topics,
+            None,
+            BatchConfig {
+                top_k: 3,
+                pruning: PruningStrategy::BlockMaxWand,
+                field: Some("body".into()),
+                bm25: Bm25Params { k1: 2.0, b: 0.5 },
+                ..BatchConfig::default()
+            },
+        )
+        .unwrap();
+        let query_total = report
+            .queries
+            .iter()
+            .map(|query| query.stats.block_max_postings_scanned)
+            .sum::<usize>();
+
+        assert!(query_total > 0);
+        assert_eq!(report.total_stats.block_max_postings_scanned, query_total);
+        let mut json = Vec::new();
+        write_json_report(&report, &mut json).unwrap();
+        let json = String::from_utf8(json).unwrap();
+        assert!(json.contains(&format!("\"block_max_postings_scanned\": {query_total},")));
+        assert_eq!(
+            json.matches("\"block_max_postings_scanned\"").count(),
+            report.queries.len() + 1
+        );
+    }
+
+    #[test]
     fn average_precision_uses_total_relevant_denominator_at_cutoff() {
         let (index, topics, qrels) = fixture();
         let report = evaluate_batch(
@@ -652,6 +728,13 @@ mod tests {
         let json = String::from_utf8(json).unwrap();
         assert!(json.contains("rust \\\"search\\\""));
         assert!(json.contains("\"verified_exact\": true"));
+        for counter in [
+            "block_max_bounds_loaded",
+            "block_max_postings_covered",
+            "block_max_postings_scanned",
+        ] {
+            assert_eq!(json.matches(&format!("\"{counter}\"")).count(), 2);
+        }
         assert!(json.ends_with("}\n"));
     }
 

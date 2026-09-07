@@ -9,7 +9,7 @@ use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::evaluation::{BatchConfig, evaluate_batch, write_json_report, write_trec_run};
 use crate::index::{IndexBuilder, InvertedIndex};
-use crate::persistence::persisted_format_version;
+use crate::persistence::{block_max_metadata_encoded_bytes, persisted_format_version};
 use crate::query::{BooleanOperator, FieldFilter, PhraseFilter, SearchQuery};
 use crate::search::{Bm25Params, PruningStrategy, SearchOptions};
 use crate::trec::{index_trec_collection, load_qrels, load_topics};
@@ -32,7 +32,8 @@ SEARCH OPTIONS:\n\
   --phrase-field NAME      Restrict the phrase to one field\n\
   --filter NAME=VALUE      Require an exact stored field value; repeatable\n\
   --top-k N                Number of hits (default: 10)\n\
-  --strategy wand|full     Safe WAND pruning or exhaustive evaluation\n\
+  --strategy wand|block-max-wand|full\n\
+                            Exact WAND, block-max WAND, or exhaustive evaluation\n\
   --k1 NUMBER --b NUMBER   BM25 parameters\n\
   --explain                Print per-term BM25 contributions\n\
 \n\
@@ -220,10 +221,13 @@ fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
     }
     writeln!(
         output,
-        "strategy={pruning:?} evaluated={} advanced={} skipped={}",
+        "strategy={pruning:?} evaluated={} advanced={} skipped={} block_max_bounds_loaded={} block_max_postings_covered={} block_max_postings_scanned={}",
         outcome.stats.evaluated_candidates,
         outcome.stats.postings_advanced,
-        outcome.stats.postings_skipped
+        outcome.stats.postings_skipped,
+        outcome.stats.block_max_bounds_loaded,
+        outcome.stats.block_max_postings_covered,
+        outcome.stats.block_max_postings_scanned
     )?;
     Ok(())
 }
@@ -334,7 +338,7 @@ fn command_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
         .sum::<usize>();
     writeln!(
         output,
-        "batch topics={} hits={} strategy={:?} verified={} elapsed_ms={:.3} evaluated={} advanced={} skipped={} run={}",
+        "batch topics={} hits={} strategy={:?} verified={} elapsed_ms={:.3} evaluated={} advanced={} skipped={} block_max_bounds_loaded={} block_max_postings_covered={} block_max_postings_scanned={} run={}",
         report.queries.len(),
         hit_count,
         report.config.pruning,
@@ -343,6 +347,9 @@ fn command_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
         report.total_stats.evaluated_candidates,
         report.total_stats.postings_advanced,
         report.total_stats.postings_skipped,
+        report.total_stats.block_max_bounds_loaded,
+        report.total_stats.block_max_postings_covered,
+        report.total_stats.block_max_postings_scanned,
         run_path
     )?;
     if let Some(metrics) = report.aggregate {
@@ -366,6 +373,12 @@ fn command_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> 
     let stats = index.stats();
     let codec = index.posting_codec_stats()?;
     let file_bytes = std::fs::metadata(path)?.len();
+    let block_max_bytes = block_max_metadata_encoded_bytes(&index)?;
+    let block_max_blocks = index
+        .block_max
+        .values()
+        .map(|metadata| metadata.default_bounds.len())
+        .sum::<usize>();
     writeln!(
         output,
         "format=IndexSail-v{} analyzer={:?} file_bytes={}",
@@ -385,6 +398,13 @@ fn command_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> 
         codec.uncompressed_bytes,
         codec.encoded_bytes,
         codec.ratio()
+    )?;
+    writeln!(
+        output,
+        "block_max_metadata streams={} blocks={} v3_serialized_bytes={}",
+        index.block_max.len(),
+        block_max_blocks,
+        block_max_bytes
     )?;
     for field in index.fields() {
         writeln!(
@@ -500,11 +520,14 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
     )?;
     writeln!(
         output,
-        "block-max-wand elapsed_ms={:.3} evaluated={} advanced={} skipped={}",
+        "block-max-wand elapsed_ms={:.3} evaluated={} advanced={} skipped={} precomputed_bounds_loaded={} postings_covered_by_bounds={} postings_scanned_for_bounds={}",
         report.block_max_time.as_secs_f64() * 1000.0,
         report.block_max_stats.evaluated_candidates,
         report.block_max_stats.postings_advanced,
-        report.block_max_stats.postings_skipped
+        report.block_max_stats.postings_skipped,
+        report.block_max_stats.block_max_bounds_loaded,
+        report.block_max_stats.block_max_postings_covered,
+        report.block_max_stats.block_max_postings_scanned
     )?;
     writeln!(output, "verified=true checksum={:016x}", report.checksum)?;
     writeln!(
@@ -513,6 +536,17 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
         report.posting_codec.uncompressed_bytes,
         report.posting_codec.encoded_bytes,
         report.posting_codec.ratio()
+    )?;
+    writeln!(
+        output,
+        "persistence format=3 serialized_bytes={} base_index_bytes={} block_max_metadata_bytes={} streams={} blocks={}",
+        report.persisted_index_bytes,
+        report
+            .persisted_index_bytes
+            .saturating_sub(report.block_max_metadata_bytes),
+        report.block_max_metadata_bytes,
+        report.block_max_streams,
+        report.block_max_blocks
     )?;
     if let Some(path) = parsed.optional_one("--json")? {
         writeln!(output, "report={path}")?;
@@ -700,11 +734,9 @@ mod tests {
     fn no_command_prints_help() {
         let mut output = Vec::new();
         execute(Vec::<String>::new(), &mut output).unwrap();
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("indexsail search")
-        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("indexsail search"));
+        assert!(output.contains("wand|block-max-wand|full"));
     }
 
     #[test]
@@ -767,6 +799,9 @@ mod tests {
         assert!(search_output.contains("1\t"));
         assert!(search_output.contains("Rust Search"));
         assert!(search_output.contains("term=local"));
+        assert!(search_output.contains("block_max_bounds_loaded=0"));
+        assert!(search_output.contains("block_max_postings_covered=0"));
+        assert!(search_output.contains("block_max_postings_scanned=0"));
 
         let mut inspect_output = Vec::new();
         execute(
@@ -891,6 +926,9 @@ mod tests {
         assert!(output.contains("topics=2"));
         assert!(output.contains("verified=true"));
         assert!(output.contains("map=1.000000"));
+        assert!(output.contains("block_max_bounds_loaded=0"));
+        assert!(output.contains("block_max_postings_covered=0"));
+        assert!(output.contains("block_max_postings_scanned=0"));
         assert!(std::fs::read_to_string(&run).unwrap().contains("1 Q0 D1 1"));
         let report_text = std::fs::read_to_string(&report).unwrap();
         assert!(report_text.contains("\"mean_ndcg\": 1.000000000000"));

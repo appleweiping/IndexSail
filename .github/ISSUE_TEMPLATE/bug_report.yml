@@ -24,8 +24,8 @@ body:
     id: version
     attributes:
       label: IndexSail version or commit
-      description: "For example: 0.2.0 or a full commit SHA."
-      placeholder: "0.2.0"
+      description: "For example: 0.3.0 or a full commit SHA."
+      placeholder: "0.3.0"
     validations:
       required: true
   - type: dropdown

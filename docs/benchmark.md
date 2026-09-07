@@ -5,10 +5,73 @@ claims. The benchmark constructs one in-memory index, runs exhaustive retrieval,
 WAND, compares every ranked document and score against the exhaustive results, and only then emits
 `verified=true` and a checksum.
 
-The run recorded below predates the block-max pass, so its output has no `block-max-wand` line and its JSON
-is `schema_version` 1. It is left as it was measured rather than re-run here, because the environment it
-records is not this one. Block-max measurements, and the conditions under which the strategy helps or does
-not, are in the README.
+## Version 3 storage/query-work measurement
+
+Two consecutive runs measure the current persisted-bound implementation. They are observations from a
+non-isolated workstation, not a cross-engine benchmark or a latency claim.
+
+- Date: 2026-09-07
+- CPU: Intel Core i5-1240P, 12 cores / 16 logical processors
+- Runtime: native Windows 10.0.26200, x86-64 MSVC
+- Rust: rustc 1.85.0
+- Build: `release`, thin LTO, one codegen unit
+- Source: the working tree that became [`v0.3.0`](https://github.com/appleweiping/IndexSail/tree/v0.3.0),
+  based on commit `32cdd2c4c7a9bbc30fe0c34ff628d458ddc742d6`
+
+Both passes used:
+
+```shell
+cargo run --locked --release -- benchmark \
+  --documents 100000 \
+  --queries 500 \
+  --top-k 10 \
+  --seed 42 \
+  --json target/benchmark-100k/report.json
+```
+
+The retrieval phase queries the just-built resident index. The
+`precomputed_bounds_loaded` counter therefore counts values copied from the same default-BM25 table that
+format v3 persists; it does not imply that this benchmark reloaded the file before searching. Persistence
+sizes are measured by serializing that table after the retrieval passes.
+
+| Pass | Repetition 1 | Repetition 2 |
+|---|---:|---:|
+| Index build | 10.89 s | 16.70 s |
+| Exhaustive | 10.42 s | 9.65 s |
+| WAND | 8.26 s | 6.56 s |
+| Block-max WAND | 17.35 s | 8.16 s |
+
+The deterministic part matched in both repetitions:
+
+```text
+index terms=776 postings=5592575
+exhaustive evaluated=12927028
+wand evaluated=1136956 advanced=14273218 skipped=8725466
+block-max-wand evaluated=1136119 advanced=14273218 skipped=8727041 \
+  precomputed_bounds_loaded=223772 postings_covered_by_bounds=14275721 postings_scanned_for_bounds=0
+verified=true checksum=1310686fefd0b451
+posting_codec raw_bytes=76340600 encoded_bytes=19097862 ratio=0.2502
+persistence format=3 serialized_bytes=70139763 base_index_bytes=68716795 \
+  block_max_metadata_bytes=1422968 streams=1296 blocks=174308
+```
+
+The block section adds 1,422,968 bytes to a 68,716,795-byte base layout: 2.07%. The reported base is the
+same serialized documents/postings/header byte count with the v3 block section removed, not an estimate from
+a different run. For the block-max query pass, 223,772 bound values summarize 14,275,721 scored postings.
+Before v3, deriving bounds visited those scored postings; v3 performs zero postings visits specifically for
+that derivation. “98.43% fewer values consumed for bound preparation” describes this implementation counter,
+not CPU instructions or end-to-end speed.
+
+The near-uniform generator is unfavorable to block-max pruning: it removed only 837 candidates beyond WAND
+(0.074%). The wide, overlapping timing ranges even reverse the WAND/block-max order, so they establish no
+latency win. The result is retained because storage and preparation savings must not be converted into a
+speed claim. Both generated schema-version-3 JSON reports were parsed after their runs.
+
+## Historical WSL2 baseline
+
+The run below predates the persisted block-max pass, so its output has no `block-max-wand` line and its JSON
+is `schema_version` 1. It is left as originally measured because timings from its WSL2 environment are not
+comparable with the native-Windows v3 run above.
 
 ## Environment
 

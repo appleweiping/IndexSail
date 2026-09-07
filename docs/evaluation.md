@@ -88,6 +88,12 @@ known relevant documents contributes zero.
 - `evaluated_candidates`: documents whose exact aggregate query score was computed.
 - `postings_advanced`: cursor steps performed by the executor.
 - `postings_skipped`: steps beyond the first during an `advance_to` operation.
+- `block_max_bounds_loaded`: precomputed default-BM25 block-bound values loaded into block-max query
+  scorers. Format v3 persists this resident table; a newly built in-memory index can consume it before save.
+- `block_max_postings_covered`: scored postings summarized by those precomputed bounds.
+- `block_max_postings_scanned`: scored postings inspected to derive conservative bounds from exact scores
+  for custom BM25 parameters or non-unit boosts. Default BM25 with unit boosts loads the precomputed table
+  and keeps this at zero.
 
 Counters characterize this implementation's work and are deterministic for an identical index/query
 configuration. They should not be interpreted as CPU instructions or compared directly across unrelated

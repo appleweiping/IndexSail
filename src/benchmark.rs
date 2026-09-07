@@ -6,6 +6,7 @@ use crate::codec::PostingCodecStats;
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::index::IndexBuilder;
+use crate::persistence::block_max_metadata_encoded_bytes;
 use crate::query::{BooleanOperator, SearchQuery};
 use crate::search::{PruningStrategy, SearchOptions, SearchStats};
 
@@ -43,6 +44,10 @@ pub struct BenchmarkReport {
     pub index_postings: usize,
     pub index_tokens: u64,
     pub posting_codec: PostingCodecStats,
+    pub persisted_index_bytes: u64,
+    pub block_max_metadata_bytes: u64,
+    pub block_max_streams: usize,
+    pub block_max_blocks: usize,
 }
 
 /// Run a deterministic synthetic benchmark and verify WAND against exhaustive search.
@@ -178,6 +183,17 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
 
     let stats = index.stats();
     let posting_codec = index.posting_codec_stats()?;
+    let mut persisted = Vec::new();
+    index.write_to(&mut persisted)?;
+    let persisted_index_bytes = u64::try_from(persisted.len())
+        .map_err(|_| Error::InvalidArgument("persisted index size does not fit u64".into()))?;
+    let block_max_metadata_bytes = block_max_metadata_encoded_bytes(&index)?;
+    let block_max_streams = index.block_max.len();
+    let block_max_blocks = index
+        .block_max
+        .values()
+        .map(|metadata| metadata.default_bounds.len())
+        .sum();
 
     Ok(BenchmarkReport {
         config,
@@ -193,6 +209,10 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         index_postings: stats.postings,
         index_tokens: stats.tokens,
         posting_codec,
+        persisted_index_bytes,
+        block_max_metadata_bytes,
+        block_max_streams,
+        block_max_blocks,
     })
 }
 
@@ -200,7 +220,7 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
 /// machine-dependent; workload counters and checksum are deterministic.
 pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()> {
     writeln!(writer, "{{")?;
-    writeln!(writer, "  \"schema_version\": 2,")?;
+    writeln!(writer, "  \"schema_version\": 3,")?;
     writeln!(writer, "  \"verified_exact\": true,")?;
     writeln!(writer, "  \"documents\": {},", report.config.documents)?;
     writeln!(writer, "  \"queries\": {},", report.config.queries)?;
@@ -215,6 +235,17 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
         report.posting_codec.uncompressed_bytes,
         report.posting_codec.encoded_bytes,
         report.posting_codec.ratio()
+    )?;
+    writeln!(
+        writer,
+        "  \"persistence\": {{\"format_version\": 3, \"serialized_bytes\": {}, \"base_index_bytes\": {}, \"block_max_metadata_bytes\": {}, \"block_max_streams\": {}, \"block_max_blocks\": {}}},",
+        report.persisted_index_bytes,
+        report
+            .persisted_index_bytes
+            .saturating_sub(report.block_max_metadata_bytes),
+        report.block_max_metadata_bytes,
+        report.block_max_streams,
+        report.block_max_blocks
     )?;
     writeln!(
         writer,
@@ -252,10 +283,13 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
     )?;
     writeln!(
         writer,
-        "  \"block_max_wand\": {{\"evaluated\": {}, \"advanced\": {}, \"skipped\": {}}},",
+        "  \"block_max_wand\": {{\"evaluated\": {}, \"advanced\": {}, \"skipped\": {}, \"precomputed_bounds_loaded\": {}, \"postings_covered_by_bounds\": {}, \"postings_scanned_for_bounds\": {}}},",
         report.block_max_stats.evaluated_candidates,
         report.block_max_stats.postings_advanced,
-        report.block_max_stats.postings_skipped
+        report.block_max_stats.postings_skipped,
+        report.block_max_stats.block_max_bounds_loaded,
+        report.block_max_stats.block_max_postings_covered,
+        report.block_max_stats.block_max_postings_scanned
     )?;
     writeln!(writer, "  \"checksum\": \"{:016x}\"", report.checksum)?;
     writeln!(writer, "}}")?;
@@ -266,6 +300,9 @@ fn add_stats(total: &mut SearchStats, current: SearchStats) {
     total.evaluated_candidates += current.evaluated_candidates;
     total.postings_advanced += current.postings_advanced;
     total.postings_skipped += current.postings_skipped;
+    total.block_max_bounds_loaded += current.block_max_bounds_loaded;
+    total.block_max_postings_covered += current.block_max_postings_covered;
+    total.block_max_postings_scanned += current.block_max_postings_scanned;
 }
 
 fn push_word(output: &mut String, word: &str) {
@@ -333,12 +370,39 @@ mod tests {
         assert!(report.wand_stats.postings_advanced > 0);
         assert!(report.block_max_stats.evaluated_candidates > 0);
         assert!(report.block_max_stats.postings_advanced > 0);
+        assert!(report.block_max_stats.block_max_bounds_loaded > 0);
+        assert!(
+            report.block_max_stats.block_max_postings_covered
+                > report.block_max_stats.block_max_bounds_loaded
+        );
+        assert!(report.persisted_index_bytes > report.block_max_metadata_bytes);
+        assert!(report.block_max_metadata_bytes > 8);
+        assert!(report.block_max_streams > 0);
+        assert!(report.block_max_blocks > 0);
         // `run` returns an error if any strategy disagrees with exhaustive, so
         // reaching here at all is the exactness check; this pins the direction.
         assert!(
             report.block_max_stats.evaluated_candidates
                 <= report.exhaustive_stats.evaluated_candidates
         );
+    }
+
+    #[test]
+    fn benchmark_json_records_storage_and_bound_loading_tradeoffs() {
+        let report = run(BenchmarkConfig {
+            documents: 100,
+            queries: 8,
+            seed: 23,
+            top_k: 3,
+        })
+        .unwrap();
+        let mut json = Vec::new();
+        write_json(&report, &mut json).unwrap();
+        let json = String::from_utf8(json).unwrap();
+        assert!(json.contains("\"schema_version\": 3"));
+        assert!(json.contains("\"block_max_metadata_bytes\""));
+        assert!(json.contains("\"precomputed_bounds_loaded\""));
+        assert!(json.contains("\"postings_scanned_for_bounds\": 0"));
     }
 
     #[test]

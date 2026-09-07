@@ -6,11 +6,11 @@ authors:
   - family-names: "Yan"
     given-names: "Weiping"
     alias: "appleweiping"
-version: 0.2.0
-date-released: 2026-08-31
+version: 0.3.0
+date-released: 2026-09-07
 license: MIT
 repository-code: "https://github.com/appleweiping/IndexSail"
 url: "https://github.com/appleweiping/IndexSail"
 abstract: >-
-  A dependency-free Rust toolkit for positional indexing, BM25 ranking, exact
+  A deterministic safe-Rust toolkit for positional indexing, BM25 ranking, exact
   WAND execution, TREC-style batch evaluation, and reproducible retrieval reports.

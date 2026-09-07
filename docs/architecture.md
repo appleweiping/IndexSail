@@ -10,11 +10,11 @@
 | `query` | Typed terms, `AND`/`OR`, phrase constraints, and exact-field filters |
 | `search` | BM25 scorers, exhaustive/WAND execution, stable heap, explanations and counters |
 | `codec` | Posting gaps, base-128 variable bytes, codec statistics, payload checksum |
-| `persistence` | v2 writer, v2/v1 readers, bounds and structural validation |
+| `persistence` | v3 writer, v3/v2/v1 readers, checksums, bounds and structural validation |
 | `trec` | Collection, topic and qrels adapters |
 | `evaluation` | Batch execution, executor oracle, metrics, run and JSON writers |
 | `benchmark` | Seeded workload, exhaustive/WAND oracle, checksum and JSON report |
-| `cli` | Dependency-free command parsing and end-to-end workflows |
+| `cli` | Hand-written standard-library command parsing and end-to-end workflows |
 
 ## Build data flow
 
@@ -31,10 +31,11 @@ sequenceDiagram
     A->>N: named UTF-8 field values
     N-->>B: normalized tokens + ordinal positions
     B->>I: documents + lengths + sorted postings
+    I->>I: fielded + all-field block bounds
     I->>P: deterministic logical snapshot
     P->>P: delta/varbyte posting blocks
-    P->>P: checksum complete payload
-    P-->>U: version 2 index file
+    P->>P: persist block bounds + checksum payload
+    P-->>U: version 3 index file
 ```
 
 ## Retrieval and evaluation flow
@@ -73,8 +74,10 @@ sequenceDiagram
 7. `term_frequency == positions.len()` and is nonzero.
 8. Stored field lengths equal re-analysis of stored field text.
 9. Field totals use all documents in the average denominator, including documents missing that field.
+10. Block-max streams exactly cover every fielded and all-field term stream, use 64-posting blocks, and
+    contain finite bounds that bit-match recomputation from the postings.
 
-The builder establishes these invariants. Both persistence readers distrust and validate stored data again.
+The builder establishes these invariants. All persistence readers distrust and validate stored data again.
 
 ## Query preparation
 
@@ -109,15 +112,35 @@ not `>`, so an equal-score candidate that wins the ID tie-break remains eligible
 Post-filters can only remove documents. Because filtered candidates do not enter the heap, pruning never
 uses a threshold contributed by an invalid result.
 
-This is document-at-a-time WAND with one bound per logical term. It is not block-max WAND.
+Plain WAND uses this one bound per logical term. Block-max WAND adds a per-block refinement without changing
+the pivot, exact-scoring, heap, constraint, or tie-breaking code. Default parameters consume the persisted
+table below; custom parameters derive conservative bounds from their materialized scores.
 
-## Persistence format version 2
+## Persisted block-max invariants
+
+Each logical posting stream is partitioned into consecutive runs of 64 scored postings. The index stores
+streams for every `(field, normalized term)` and for the deterministic merge of that term across all fields.
+This mirrors the two query shapes exactly; an unfielded query never has to approximate block boundaries from
+independent field lists.
+
+One non-negative finite `default_bound` is stored for each block: the outward-rounded maximum score at
+default BM25 (`k1=1.2`, `b=0.75`) and unit boost. The exactly pinned pure-Rust logarithm gives IDF the same
+bits on the Linux and Windows CI targets. Version 3 loading recomputes the table from validated postings and
+requires bit-for-bit equality before making the index searchable; version 1 and 2 loading computes it once.
+
+The public API accepts every finite positive `k1` and boost. Fixed ULP padding cannot prove a
+parameter-independent floating-point bound over that entire range, so custom requests derive block maxima
+directly from their already materialized exact scores. This is conservative by construction and is counted
+in `block_max_postings_scanned`. Default requests copy the persisted tight bounds and keep that counter at
+zero.
+
+## Persistence format version 3
 
 All fixed-width integers are little-endian. A string is a `u32` byte length followed by UTF-8 bytes.
 
 ```text
-8 bytes  magic: IDXSAL02
-u32      version: 2
+8 bytes  magic: IDXSAL03
+u32      version: 3
 u64      payload byte length
 u64      FNV-1a checksum of payload bytes
 payload:
@@ -134,6 +157,16 @@ payload:
     u32 posting count
     u32 compressed block byte length
     bytes compressed posting block
+  u32 block size: 64
+  u32 block-max stream count
+  repeat block-max stream count:
+    u8 field scope: 0 = all fields, 1 = one field
+    if scope == 1: string field
+    string normalized term
+    u32 scored posting count
+    u32 block count; must equal ceil(posting count / 64)
+    repeat block count:
+      u64 IEEE-754 bits of default bound
 EOF required
 ```
 
@@ -148,18 +181,23 @@ another byte follows. A `u32` may consume at most five bytes, and unused high bi
 Zero gaps, overflow, truncation, trailing block bytes, and count mismatches are rejected.
 
 The file reader first validates signature, version, bounded payload size, exact EOF, and checksum. It then
-parses bounded strings and collections, decodes blocks, rejects duplicate keys, and invokes all index
-invariant checks. The checksum detects accidental changes but is deliberately non-cryptographic.
+parses bounded strings and collections, decodes blocks, rejects duplicate keys, invokes all index
+invariant checks, and verifies the complete block-bound table. The checksum detects accidental changes but
+is deliberately non-cryptographic.
 
 The writer buffers the logical payload to compute its checksum. This temporarily requires memory in
 addition to the already in-memory index. The payload safety limit is 4 GiB, while individual strings and
-posting blocks have smaller limits.
+posting blocks have smaller limits. Reads remain buffered and materialize owned structures: safe Rust's
+standard library has no cross-platform mmap facility, and adding an mmap dependency would not make this
+owned representation zero-copy.
 
-## Legacy version 1 reads
+## Legacy version 1 and 2 reads
 
 The reader recognizes `IDXSAL01` plus version `1`. Its document layout is the same logical data, but each
 posting contains fixed-width absolute `doc_id`, `term_frequency`, explicit position count, and absolute
-positions. Version 1 is read-only compatibility: every new save uses version 2.
+positions. The reader also recognizes checksummed `IDXSAL02` version 2 files with the same compressed posting
+layout as version 3 but no block-max section. Both legacy formats are read-only compatibility: their bounds
+are built once during load and every new save uses version 3.
 
 ## TREC adapter trust boundary
 

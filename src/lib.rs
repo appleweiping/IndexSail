@@ -1,9 +1,10 @@
-//! `IndexSail` is a compact, dependency-free local search engine.
+//! `IndexSail` is a compact, deterministic local search engine.
 //!
 //! It provides a deterministic analyzer, a positional inverted index, BM25
 //! ranking, Boolean queries, phrase and exact-field filters, exhaustive and
 //! exact WAND top-k execution, explanations, TREC-style batch evaluation, and
-//! a checksummed delta/variable-byte binary format.
+//! a checksummed, delta/variable-byte version 3 format with persisted block
+//! bounds and version 1/2 read compatibility.
 
 pub mod analysis;
 pub mod benchmark;

@@ -2,17 +2,10 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use crate::error::{Error, Result};
-use crate::index::{InternalDocId, InvertedIndex, Posting};
+use crate::index::{
+    BLOCK_POSTINGS, BlockMaxKey, BlockMaxMetadata, InternalDocId, InvertedIndex, Posting,
+};
 use crate::query::{BooleanOperator, PhraseFilter, SearchQuery};
-
-/// Postings summarized by one block maximum.
-///
-/// A block is the unit at which a maximum impact is remembered, so the size
-/// trades bookkeeping against how tightly the bound describes the documents it
-/// covers: one very high impact posting raises the bound for its whole block.
-/// 64 follows Ding and Suel and keeps the maxima a small fraction of the
-/// postings they summarize.
-const BLOCK_POSTINGS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bm25Params {
@@ -123,6 +116,17 @@ pub struct SearchStats {
     pub evaluated_candidates: usize,
     pub postings_advanced: usize,
     pub postings_skipped: usize,
+    /// Precomputed default-BM25 block bounds loaded into query scorers.
+    ///
+    /// Format v3 persists this resident table; a just-built index can consume
+    /// it before it has been saved.
+    pub block_max_bounds_loaded: usize,
+    /// Scored postings summarized by those precomputed bounds.
+    pub block_max_postings_covered: usize,
+    /// Scored postings inspected to derive conservative bounds from exact
+    /// scores for custom BM25 or non-unit boosts. Default BM25 with unit boost
+    /// keeps this at zero.
+    pub block_max_postings_scanned: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,9 +155,11 @@ struct TermScorer {
     upper_bound: f64,
     /// Largest impact within each `BLOCK_POSTINGS`-sized run of `entries`.
     ///
-    /// Computed in the same pass that scores the postings, so block-max
-    /// pruning costs no extra work at index time and no extra format.
+    /// Loaded from index metadata for default BM25, or derived from the exact
+    /// materialized scores for custom parameters.
     block_max: Vec<f64>,
+    precomputed_block_bounds_loaded: usize,
+    postings_scanned_for_block_bounds: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -334,36 +340,134 @@ fn block_skip(
 }
 
 impl InvertedIndex {
+    /// Build the complete field-qualified and all-field block-bound table.
+    ///
+    /// New indexes run this once when the builder is finalized. Legacy indexes
+    /// run it once while loading; format version 3 reads and validates the
+    /// persisted table instead. Default-BM25 requests use these bounds without
+    /// rescanning scores; custom parameters derive conservative bounds from
+    /// exact scores at query time.
+    pub(crate) fn compute_block_max_metadata(&self) -> BTreeMap<BlockMaxKey, BlockMaxMetadata> {
+        let mut metadata = BTreeMap::new();
+        let mut fields_by_term = BTreeMap::<&str, Vec<(&str, &[Posting])>>::new();
+
+        for (key, postings) in &self.postings {
+            let scores = self.bound_scores(key.field.as_str(), postings);
+            metadata.insert(
+                BlockMaxKey {
+                    field: Some(key.field.clone()),
+                    term: key.term.clone(),
+                },
+                block_metadata(&scores),
+            );
+            fields_by_term
+                .entry(key.term.as_str())
+                .or_default()
+                .push((key.field.as_str(), postings.as_slice()));
+        }
+
+        for (term, fields) in fields_by_term {
+            let mut merged = BTreeMap::<InternalDocId, f64>::new();
+            for (field, postings) in fields {
+                for (doc_id, default_score) in self.bound_scores(field, postings) {
+                    let total = merged.entry(doc_id).or_default();
+                    // This is the same deterministic field order and addition
+                    // used by query scoring for a boost of one.
+                    *total += default_score;
+                }
+            }
+            let scores = merged.into_iter().collect::<Vec<_>>();
+            metadata.insert(
+                BlockMaxKey {
+                    field: None,
+                    term: term.to_owned(),
+                },
+                block_metadata(&scores),
+            );
+        }
+        metadata
+    }
+
+    fn bound_scores(&self, field: &str, postings: &[Posting]) -> Vec<(InternalDocId, f64)> {
+        let document_frequency = postings.len();
+        let document_count = self.documents().len();
+        let average_length = self.average_field_length(field);
+        postings
+            .iter()
+            .map(|posting| {
+                let document_length = self.field_length(posting.doc_id, field);
+                let default_score = bm25_score(
+                    posting.term_frequency,
+                    document_frequency,
+                    document_count,
+                    document_length,
+                    average_length,
+                    Bm25Params::default(),
+                );
+                (posting.doc_id, default_score)
+            })
+            .collect()
+    }
+
     pub fn search(&self, query: &SearchQuery, options: SearchOptions) -> Result<SearchOutcome> {
         let options = options.validate()?;
         let prepared_terms = self.prepare_terms(query)?;
         let mut scorers = prepared_terms
             .iter()
             .enumerate()
-            .map(|(ordinal, term)| self.build_term_scorer(ordinal, term, options.bm25))
+            .map(|(ordinal, term)| {
+                self.build_term_scorer(
+                    ordinal,
+                    term,
+                    options.bm25,
+                    options.pruning == PruningStrategy::BlockMaxWand,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
+        let block_max_bounds_loaded = scorers
+            .iter()
+            .map(|scorer| scorer.precomputed_block_bounds_loaded)
+            .sum();
+        let block_max_postings_covered = scorers
+            .iter()
+            .filter(|scorer| scorer.precomputed_block_bounds_loaded > 0)
+            .map(|scorer| scorer.entries.len())
+            .sum();
+        let block_max_postings_scanned = scorers
+            .iter()
+            .map(|scorer| scorer.postings_scanned_for_block_bounds)
+            .sum();
+        let preparation_stats = SearchStats {
+            block_max_bounds_loaded,
+            block_max_postings_covered,
+            block_max_postings_scanned,
+            ..SearchStats::default()
+        };
 
         if query.operator() == BooleanOperator::And
             && scorers.iter().any(|scorer| scorer.entries.is_empty())
         {
             return Ok(SearchOutcome {
                 hits: Vec::new(),
-                stats: SearchStats::default(),
+                stats: preparation_stats,
             });
         }
         scorers.retain(|scorer| !scorer.entries.is_empty());
         if scorers.is_empty() {
             return Ok(SearchOutcome {
                 hits: Vec::new(),
-                stats: SearchStats::default(),
+                stats: preparation_stats,
             });
         }
 
-        let (top_k, stats) = match options.pruning {
+        let (top_k, mut stats) = match options.pruning {
             PruningStrategy::Exhaustive => self.search_exhaustive(query, &scorers, options.top_k),
             PruningStrategy::Wand => self.search_wand(query, scorers, options.top_k, false),
             PruningStrategy::BlockMaxWand => self.search_wand(query, scorers, options.top_k, true),
         };
+        stats.block_max_bounds_loaded = preparation_stats.block_max_bounds_loaded;
+        stats.block_max_postings_covered = preparation_stats.block_max_postings_covered;
+        stats.block_max_postings_scanned = preparation_stats.block_max_postings_scanned;
 
         let hits = top_k
             .into_sorted()
@@ -422,6 +526,7 @@ impl InvertedIndex {
         ordinal: usize,
         term: &PreparedTerm,
         params: Bm25Params,
+        load_block_max: bool,
     ) -> Result<TermScorer> {
         let fields: Vec<&str> = match term.field.as_deref() {
             Some(field) => vec![field],
@@ -465,17 +570,59 @@ impl InvertedIndex {
             .collect::<Vec<_>>();
         let upper_bound =
             conservative_next_up(entries.iter().map(|entry| entry.score).fold(0.0, f64::max));
-        let block_max = entries
-            .chunks(BLOCK_POSTINGS)
-            .map(|block| {
-                conservative_next_up(block.iter().map(|entry| entry.score).fold(0.0, f64::max))
-            })
-            .collect::<Vec<_>>();
+        let (block_max, precomputed_block_bounds_loaded, postings_scanned_for_block_bounds) =
+            if entries.is_empty() || !load_block_max {
+                (Vec::new(), 0, 0)
+            } else {
+                let key = BlockMaxKey {
+                    field: term.field.clone(),
+                    term: term.normalized.clone(),
+                };
+                let stored = self.block_max.get(&key).ok_or_else(|| {
+                    Error::CorruptIndex(format!(
+                        "missing block-max metadata for term '{}'",
+                        term.normalized
+                    ))
+                })?;
+                if stored.posting_count != entries.len() {
+                    return Err(Error::CorruptIndex(format!(
+                        "block-max posting count differs for term '{}'",
+                        term.normalized
+                    )));
+                }
+                // Default, unit-boost queries use tight persisted bounds. All other
+                // valid options derive conservative bounds from their exact scores.
+                let defaults = Bm25Params::default();
+                let use_tight_bounds = params.k1.to_bits() == defaults.k1.to_bits()
+                    && params.b.to_bits() == defaults.b.to_bits()
+                    && term.boost.to_bits() == 1.0_f64.to_bits();
+                if use_tight_bounds {
+                    (
+                        stored
+                            .default_bounds
+                            .iter()
+                            .map(|bits| f64::from_bits(*bits))
+                            .collect(),
+                        stored.default_bounds.len(),
+                        0,
+                    )
+                } else {
+                    // The public API accepts every finite positive k1 and boost.
+                    // No fixed ULP allowance can turn a parameter-independent
+                    // floating-point formula into a proof over that full range.
+                    // The exact scores are already materialized, so custom
+                    // requests derive outward-rounded bounds directly and report
+                    // the work instead of risking an unsafe pruning bound.
+                    (conservative_block_bounds(&entries), 0, entries.len())
+                }
+            };
         Ok(TermScorer {
             ordinal,
             entries,
             upper_bound,
             block_max,
+            precomputed_block_bounds_loaded,
+            postings_scanned_for_block_bounds,
         })
     }
 
@@ -706,6 +853,30 @@ impl InvertedIndex {
     }
 }
 
+fn block_metadata(scores: &[(InternalDocId, f64)]) -> BlockMaxMetadata {
+    let default_bounds = scores
+        .chunks(BLOCK_POSTINGS)
+        .map(|block| {
+            conservative_next_up(block.iter().map(|(_, score)| *score).fold(0.0, f64::max))
+                .to_bits()
+        })
+        .collect();
+
+    BlockMaxMetadata {
+        posting_count: scores.len(),
+        default_bounds,
+    }
+}
+
+fn conservative_block_bounds(entries: &[ScoredPosting]) -> Vec<f64> {
+    entries
+        .chunks(BLOCK_POSTINGS)
+        .map(|block| {
+            conservative_next_up(block.iter().map(|entry| entry.score).fold(0.0, f64::max))
+        })
+        .collect()
+}
+
 fn score_at(entries: &[ScoredPosting], doc_id: InternalDocId) -> Option<f64> {
     entries
         .binary_search_by_key(&doc_id, |entry| entry.doc_id)
@@ -741,7 +912,7 @@ pub fn bm25_idf(document_count: usize, document_frequency: usize) -> f64 {
     }
     let documents = document_count as f64;
     let frequency = document_frequency as f64;
-    (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln()
+    libm::log(1.0 + (documents - frequency + 0.5) / (frequency + 0.5))
 }
 
 fn bm25_score(
@@ -815,6 +986,10 @@ mod tests {
     fn idf_is_higher_for_rare_terms() {
         assert!(bm25_idf(100, 2) > bm25_idf(100, 50));
         assert!(bm25_idf(0, 0).abs() < f64::EPSILON);
+        // The pure-Rust logarithm makes persisted default-score bounds
+        // bit-stable across the Linux/Windows CI matrix.
+        assert_eq!(bm25_idf(5, 5).to_bits(), 0x3fb6_4660_aa8c_e621);
+        assert_eq!(bm25_idf(747, 183).to_bits(), 0x3ff6_7ba6_bce3_b827);
     }
 
     #[test]
@@ -1188,9 +1363,10 @@ mod tests {
             "document order differs for {context}"
         );
         for (a, b) in left.hits.iter().zip(&right.hits) {
-            assert!(
-                (a.score - b.score).abs() < 1e-12,
-                "score differs for {context}: {} vs {}",
+            assert_eq!(
+                a.score.to_bits(),
+                b.score.to_bits(),
+                "score bits differ for {context}: {} vs {}",
                 a.score,
                 b.score
             );
@@ -1254,6 +1430,7 @@ mod tests {
         let block = search_with(&index, &query, PruningStrategy::BlockMaxWand, 10);
 
         assert_same_ranking(&wand, &block, "pruning comparison");
+        assert!(block.stats.block_max_bounds_loaded > 0);
         assert!(
             block.stats.evaluated_candidates <= wand.stats.evaluated_candidates,
             "block-max scored more candidates than plain WAND: {} vs {}",
@@ -1301,12 +1478,27 @@ mod tests {
             boost: 1.0,
         };
         let scorer = index
-            .build_term_scorer(0, &term, Bm25Params::default())
+            .build_term_scorer(0, &term, Bm25Params::default(), true)
             .unwrap();
         assert!(scorer.entries.len() > BLOCK_POSTINGS, "corpus too small");
         assert_eq!(
             scorer.block_max.len(),
             scorer.entries.len().div_ceil(BLOCK_POSTINGS)
+        );
+        let stored = index
+            .block_max
+            .get(&BlockMaxKey {
+                field: None,
+                term: "common".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(
+            scorer
+                .block_max
+                .iter()
+                .map(|bound| bound.to_bits())
+                .collect::<Vec<_>>(),
+            stored.default_bounds
         );
         for (block, chunk) in scorer.entries.chunks(BLOCK_POSTINGS).enumerate() {
             for entry in chunk {
@@ -1324,6 +1516,133 @@ mod tests {
                 "a block maximum exceeds the global bound"
             );
         }
+    }
+
+    #[test]
+    fn exact_custom_block_bounds_cover_extreme_bm25_and_boosts() {
+        let index = block_index(500);
+        for params in [
+            Bm25Params {
+                k1: f64::MIN_POSITIVE,
+                b: f64::from_bits(1),
+            },
+            Bm25Params { k1: 0.01, b: 0.0 },
+            Bm25Params { k1: 0.5, b: 1.0 },
+            Bm25Params { k1: 20.0, b: 0.4 },
+            Bm25Params { k1: 1.2, b: 0.75 },
+            Bm25Params {
+                k1: 3.408_216_882_372_321e265,
+                b: f64::from_bits(1.0_f64.to_bits() - 1),
+            },
+        ] {
+            for boost in [f64::MIN_POSITIVE, 2.863_342_160_935_730_6e-69, 1.5, 10.0] {
+                let term = PreparedTerm {
+                    normalized: "common".to_owned(),
+                    field: None,
+                    boost,
+                };
+                let scorer = index.build_term_scorer(0, &term, params, true).unwrap();
+                assert_eq!(scorer.precomputed_block_bounds_loaded, 0);
+                assert_eq!(
+                    scorer.postings_scanned_for_block_bounds,
+                    scorer.entries.len()
+                );
+                for (block, chunk) in scorer.entries.chunks(BLOCK_POSTINGS).enumerate() {
+                    for entry in chunk {
+                        assert!(
+                            scorer.block_max[block] >= entry.score,
+                            "custom bound {} is below {} for {params:?}, boost={boost}",
+                            scorer.block_max[block],
+                            entry.score
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_custom_parameters_remain_bit_exact_against_exhaustive() {
+        let index = block_index(500);
+        let query = SearchQuery::from_terms(vec![
+            QueryTerm::new("common", None, 2.863_342_160_935_730_6e-69).unwrap(),
+            QueryTerm::new("mid", None, 1.603_021_237_095_590_6e-70).unwrap(),
+        ])
+        .unwrap();
+        let params = Bm25Params {
+            k1: 3.408_216_882_372_321e265,
+            b: f64::from_bits(1.0_f64.to_bits() - 1),
+        };
+        let options = |pruning| SearchOptions {
+            top_k: 10,
+            pruning,
+            explain: false,
+            bm25: params,
+        };
+
+        let exhaustive = index
+            .search(&query, options(PruningStrategy::Exhaustive))
+            .unwrap();
+        let block = index
+            .search(&query, options(PruningStrategy::BlockMaxWand))
+            .unwrap();
+
+        assert_same_ranking(
+            &exhaustive,
+            &block,
+            "extreme custom floating-point parameters",
+        );
+        assert_eq!(block.stats.block_max_bounds_loaded, 0);
+        assert!(block.stats.block_max_postings_scanned > 0);
+    }
+
+    #[test]
+    fn default_block_bounds_are_loaded_without_scanning_scores() {
+        let index = block_index(200);
+        let scorer = index
+            .build_term_scorer(
+                0,
+                &PreparedTerm {
+                    normalized: "common".to_owned(),
+                    field: None,
+                    boost: 1.0,
+                },
+                Bm25Params::default(),
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            scorer.precomputed_block_bounds_loaded,
+            scorer.block_max.len()
+        );
+        assert_eq!(scorer.postings_scanned_for_block_bounds, 0);
+    }
+
+    #[test]
+    fn scorer_reads_the_resident_block_table_instead_of_recomputing_it() {
+        let mut index = block_index(200);
+        let key = BlockMaxKey {
+            field: None,
+            term: "common".to_owned(),
+        };
+        let metadata = index.block_max.get_mut(&key).unwrap();
+        let altered = conservative_next_up(f64::from_bits(metadata.default_bounds[0]) + 1.0);
+        metadata.default_bounds[0] = altered.to_bits();
+
+        let scorer = index
+            .build_term_scorer(
+                0,
+                &PreparedTerm {
+                    normalized: "common".to_owned(),
+                    field: None,
+                    boost: 1.0,
+                },
+                Bm25Params::default(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(scorer.block_max[0].to_bits(), altered.to_bits());
     }
 
     #[test]

@@ -7,6 +7,8 @@ use crate::error::{Error, Result};
 
 pub type InternalDocId = u32;
 
+pub(crate) const BLOCK_POSTINGS: usize = 64;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Posting {
     pub doc_id: InternalDocId,
@@ -18,6 +20,28 @@ pub struct Posting {
 pub(crate) struct TermKey {
     pub field: String,
     pub term: String,
+}
+
+/// Identifies the scored posting stream for one normalized query term.
+///
+/// `field == None` is the deterministic merge across every indexed field;
+/// `Some` identifies the field-qualified stream. Both forms are persisted so
+/// default-BM25 query construction never has to derive block bounds from
+/// scored postings.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct BlockMaxKey {
+    pub field: Option<String>,
+    pub term: String,
+}
+
+/// Wire-stable upper bounds for one scored posting stream.
+///
+/// Bounds are stored as IEEE-754 bits so format validation can require exact,
+/// deterministic equality rather than an epsilon comparison.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BlockMaxMetadata {
+    pub posting_count: usize,
+    pub default_bounds: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +61,7 @@ pub struct InvertedIndex {
     pub(crate) field_lengths: Vec<BTreeMap<String, u32>>,
     pub(crate) field_totals: BTreeMap<String, u64>,
     pub(crate) postings: BTreeMap<TermKey, Vec<Posting>>,
+    pub(crate) block_max: BTreeMap<BlockMaxKey, BlockMaxMetadata>,
 }
 
 impl InvertedIndex {
@@ -101,7 +126,7 @@ impl InvertedIndex {
     }
 
     /// Report the size of fixed-width posting values versus the delta/varbyte
-    /// representation used by persistence format version 2.
+    /// representation used by persistence formats version 2 and 3.
     pub fn posting_codec_stats(&self) -> Result<PostingCodecStats> {
         let mut stats = PostingCodecStats::default();
         for postings in self.postings.values() {
@@ -158,13 +183,33 @@ impl InvertedIndex {
         let field_totals = validate_documents_and_lengths(analyzer, &documents, &field_lengths)?;
         validate_posting_lists(analyzer, documents.len(), &field_lengths, &postings)?;
 
-        Ok(Self {
+        let mut index = Self {
             analyzer,
             documents,
             field_lengths,
             field_totals,
             postings,
-        })
+            block_max: BTreeMap::new(),
+        };
+        index.block_max = index.compute_block_max_metadata();
+        Ok(index)
+    }
+
+    pub(crate) fn from_parts_with_block_max(
+        analyzer: Analyzer,
+        documents: Vec<Document>,
+        field_lengths: Vec<BTreeMap<String, u32>>,
+        postings: BTreeMap<TermKey, Vec<Posting>>,
+        block_max: BTreeMap<BlockMaxKey, BlockMaxMetadata>,
+    ) -> Result<Self> {
+        let mut index = Self::from_parts(analyzer, documents, field_lengths, postings)?;
+        if index.block_max != block_max {
+            return Err(Error::CorruptIndex(
+                "persisted block-max metadata does not match the postings".into(),
+            ));
+        }
+        index.block_max = block_max;
+        Ok(index)
     }
 }
 
@@ -352,13 +397,16 @@ impl IndexBuilder {
     }
 
     pub fn finish(self) -> InvertedIndex {
-        InvertedIndex {
+        let mut index = InvertedIndex {
             analyzer: self.analyzer,
             documents: self.documents,
             field_lengths: self.field_lengths,
             field_totals: self.field_totals,
             postings: self.postings,
-        }
+            block_max: BTreeMap::new(),
+        };
+        index.block_max = index.compute_block_max_metadata();
+        index
     }
 }
 

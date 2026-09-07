@@ -1,0 +1,224 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-source:
+    if: github.repository == 'appleweiping/IndexSail'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Verify documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          test "v${version}" = "${GITHUB_REF_NAME}"
+      - name: Test the release profile
+        run: cargo test --locked --release --all-targets
+      - name: Build the source crate
+        run: cargo package --locked
+      - name: Stage source and deterministic dependency SBOM
+        shell: bash
+        run: |
+          mkdir dist
+          cp "target/package/indexsail-${GITHUB_REF_NAME#v}.crate" dist/
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          metadata = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--locked", "--format-version", "1"],
+                  text=True,
+              )
+          )
+          lock = tomllib.loads(Path("Cargo.lock").read_text(encoding="utf-8"))
+          checksums = {
+              (item["name"], item["version"]): item.get("checksum")
+              for item in lock["package"]
+          }
+          root = next(
+              package
+              for package in metadata["packages"]
+              if package["name"] == "indexsail" and package["version"] == version
+          )
+
+          def bom_ref(package):
+              return f"pkg:cargo/{package['name']}@{package['version']}"
+
+          packages = {package["id"]: package for package in metadata["packages"]}
+          dependencies = [package for package in packages.values() if package["id"] != root["id"]]
+          components = []
+          for package in sorted(dependencies, key=lambda item: (item["name"], item["version"])):
+              component = {
+                  "type": "library",
+                  "bom-ref": bom_ref(package),
+                  "name": package["name"],
+                  "version": package["version"],
+                  "purl": bom_ref(package),
+              }
+              if package.get("license"):
+                  component["licenses"] = [{"expression": package["license"]}]
+              checksum = checksums.get((package["name"], package["version"]))
+              if checksum:
+                  component["hashes"] = [{"alg": "SHA-256", "content": checksum}]
+              components.append(component)
+
+          dependency_graph = []
+          for node in metadata["resolve"]["nodes"]:
+              package = packages[node["id"]]
+              dependency_graph.append(
+                  {
+                      "ref": bom_ref(package),
+                      "dependsOn": sorted(bom_ref(packages[item]) for item in node["dependencies"]),
+                  }
+              )
+          bom = {
+              "bomFormat": "CycloneDX",
+              "specVersion": "1.5",
+              "version": 1,
+              "metadata": {
+                  "component": {
+                      "type": "application",
+                      "bom-ref": bom_ref(root),
+                      "name": "indexsail",
+                      "version": version,
+                      "purl": bom_ref(root),
+                      "licenses": [{"license": {"id": "MIT"}}],
+                  }
+              },
+              "components": components,
+              "dependencies": sorted(dependency_graph, key=lambda item: item["ref"]),
+          }
+          target = Path("dist") / f"indexsail-{version}.cdx.json"
+          target.write_text(json.dumps(bom, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: indexsail-source-${{ github.ref_name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  advisories:
+    if: github.repository == 'appleweiping/IndexSail'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit the dependency tree
+        run: cargo audit --deny warnings
+
+  binaries:
+    if: github.repository == 'appleweiping/IndexSail'
+    needs: [verify-source, advisories]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            artifact: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.85.0
+      - run: cargo build --locked --release
+      - name: Package Linux binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir dist
+          tar -czf "dist/indexsail-${GITHUB_REF_NAME}-${{ matrix.artifact }}.tar.gz" \
+            -C target/release indexsail \
+            -C ../.. README.md LICENSE
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item target/release/indexsail.exe,README.md,LICENSE -Destination package
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Compress-Archive -Path package/* -DestinationPath "dist/indexsail-$env:GITHUB_REF_NAME-${{ matrix.artifact }}.zip"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: indexsail-${{ matrix.artifact }}-${{ github.ref_name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  attest-release:
+    if: github.repository == 'appleweiping/IndexSail'
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: indexsail-*-${{ github.ref_name }}
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        shell: bash
+        run: sha256sum $(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort) > SHA256SUMS
+      - name: Attest release artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Create GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" dist/*
+          --verify-tag --generate-notes
+          --title "IndexSail ${GITHUB_REF_NAME}"

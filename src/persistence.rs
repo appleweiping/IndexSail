@@ -9,18 +9,42 @@ use crate::analysis::{AnalysisMode, Analyzer};
 use crate::codec::{checksum, decode_postings, encode_postings};
 use crate::document::Document;
 use crate::error::{Error, Result};
-use crate::index::{InvertedIndex, Posting, TermKey};
+use crate::index::{
+    BLOCK_POSTINGS, BlockMaxKey, BlockMaxMetadata, InvertedIndex, Posting, TermKey,
+};
 
 const MAGIC_V1: &[u8; 8] = b"IDXSAL01";
 const MAGIC_V2: &[u8; 8] = b"IDXSAL02";
+const MAGIC_V3: &[u8; 8] = b"IDXSAL03";
 const LEGACY_VERSION: u32 = 1;
-pub const PERSISTENCE_FORMAT_VERSION: u32 = 2;
+const CHECKSUMMED_POSTINGS_VERSION: u32 = 2;
+pub const PERSISTENCE_FORMAT_VERSION: u32 = 3;
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 const MAX_COLLECTION_ITEMS: usize = 20_000_000;
+const MAX_BLOCK_MAX_STREAMS: usize = 40_000_000;
 const MAX_POSTING_BLOCK_BYTES: usize = 512 * 1024 * 1024;
 const MAX_INDEX_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const INITIAL_COLLECTION_CAPACITY: usize = 1_024;
+
+#[derive(Debug, Default)]
+struct ByteCounter {
+    bytes: u64,
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(u64::try_from(buffer.len()).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("serialized byte count overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Read and validate only the persisted signature/version header.
 pub fn persisted_format_version(path: impl AsRef<Path>) -> Result<u32> {
@@ -30,8 +54,11 @@ pub fn persisted_format_version(path: impl AsRef<Path>) -> Result<u32> {
     let version = read_u32(&mut reader)?;
     match &magic {
         value if value == MAGIC_V1 && version == LEGACY_VERSION => Ok(version),
-        value if value == MAGIC_V2 && version == PERSISTENCE_FORMAT_VERSION => Ok(version),
-        value if value == MAGIC_V1 || value == MAGIC_V2 => Err(Error::UnsupportedVersion(version)),
+        value if value == MAGIC_V2 && version == CHECKSUMMED_POSTINGS_VERSION => Ok(version),
+        value if value == MAGIC_V3 && version == PERSISTENCE_FORMAT_VERSION => Ok(version),
+        value if value == MAGIC_V1 || value == MAGIC_V2 || value == MAGIC_V3 => {
+            Err(Error::UnsupportedVersion(version))
+        }
         _ => Err(Error::CorruptIndex("invalid file signature".into())),
     }
 }
@@ -39,8 +66,9 @@ pub fn persisted_format_version(path: impl AsRef<Path>) -> Result<u32> {
 impl InvertedIndex {
     /// Persist a snapshot to a new or truncated file.
     ///
-    /// Format version 2 checksums the complete payload and delta/varbyte
-    /// encodes document IDs, term frequencies, and term positions.
+    /// Format version 3 checksums the complete payload, delta/varbyte encodes
+    /// postings, and persists the default-BM25 block bounds consumed by
+    /// block-max WAND.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -59,20 +87,8 @@ impl InvertedIndex {
     pub fn write_to(&self, mut writer: impl Write) -> Result<()> {
         let mut payload = Vec::new();
         write_documents(self, &mut payload)?;
-        write_collection_len(&mut payload, self.postings.len(), "dictionary terms")?;
-        for (key, postings) in &self.postings {
-            write_string(&mut payload, &key.field)?;
-            write_string(&mut payload, &key.term)?;
-            write_collection_len(&mut payload, postings.len(), "postings")?;
-            let block = encode_postings(postings)?;
-            if block.len() > MAX_POSTING_BLOCK_BYTES {
-                return Err(Error::InvalidArgument(format!(
-                    "compressed posting block exceeds {MAX_POSTING_BLOCK_BYTES} byte safety limit"
-                )));
-            }
-            write_len(&mut payload, block.len(), "compressed posting bytes")?;
-            payload.write_all(&block)?;
-        }
+        write_compressed_postings(self, &mut payload)?;
+        write_block_max_metadata(self, &mut payload)?;
 
         let payload_length = u64::try_from(payload.len())
             .map_err(|_| Error::InvalidArgument("index payload does not fit u64".into()))?;
@@ -81,7 +97,7 @@ impl InvertedIndex {
                 "index payload exceeds {MAX_INDEX_PAYLOAD_BYTES} byte safety limit"
             )));
         }
-        writer.write_all(MAGIC_V2)?;
+        writer.write_all(MAGIC_V3)?;
         write_u32(&mut writer, PERSISTENCE_FORMAT_VERSION)?;
         write_u64(&mut writer, payload_length)?;
         write_u64(&mut writer, checksum(&payload))?;
@@ -89,11 +105,12 @@ impl InvertedIndex {
         Ok(())
     }
 
-    /// Load current version 2 indexes and legacy version 1 indexes.
+    /// Load current version 3 indexes and legacy version 1 or 2 indexes.
     pub fn read_from(mut reader: impl Read) -> Result<Self> {
         let mut magic = [0_u8; 8];
         read_exact_corrupt(&mut reader, &mut magic, "file signature")?;
         match &magic {
+            value if value == MAGIC_V3 => read_v3(&mut reader),
             value if value == MAGIC_V2 => read_v2(&mut reader),
             value if value == MAGIC_V1 => read_v1(&mut reader),
             _ => Err(Error::CorruptIndex("invalid file signature".into())),
@@ -120,9 +137,95 @@ fn write_documents(index: &InvertedIndex, writer: &mut impl Write) -> Result<()>
     Ok(())
 }
 
+fn write_compressed_postings(index: &InvertedIndex, writer: &mut impl Write) -> Result<()> {
+    write_collection_len(writer, index.postings.len(), "dictionary terms")?;
+    for (key, postings) in &index.postings {
+        write_string(writer, &key.field)?;
+        write_string(writer, &key.term)?;
+        write_collection_len(writer, postings.len(), "postings")?;
+        let block = encode_postings(postings)?;
+        if block.len() > MAX_POSTING_BLOCK_BYTES {
+            return Err(Error::InvalidArgument(format!(
+                "compressed posting block exceeds {MAX_POSTING_BLOCK_BYTES} byte safety limit"
+            )));
+        }
+        write_len(writer, block.len(), "compressed posting bytes")?;
+        writer.write_all(&block)?;
+    }
+    Ok(())
+}
+
+fn write_block_max_metadata(index: &InvertedIndex, writer: &mut impl Write) -> Result<()> {
+    write_u32(
+        writer,
+        u32::try_from(BLOCK_POSTINGS)
+            .map_err(|_| Error::InvalidArgument("block size does not fit u32".into()))?,
+    )?;
+    if index.block_max.len() > MAX_BLOCK_MAX_STREAMS {
+        return Err(Error::InvalidArgument(format!(
+            "block-max stream count exceeds {MAX_BLOCK_MAX_STREAMS} item safety limit"
+        )));
+    }
+    write_len(writer, index.block_max.len(), "block-max streams")?;
+    for (key, metadata) in &index.block_max {
+        match &key.field {
+            None => write_u8(writer, 0)?,
+            Some(field) => {
+                write_u8(writer, 1)?;
+                write_string(writer, field)?;
+            }
+        }
+        write_string(writer, &key.term)?;
+        write_collection_len(writer, metadata.posting_count, "block-max postings")?;
+        let expected_blocks = metadata.posting_count.div_ceil(BLOCK_POSTINGS);
+        if metadata.default_bounds.len() != expected_blocks {
+            return Err(Error::CorruptIndex(format!(
+                "block-max bound count differs for term '{}'",
+                key.term
+            )));
+        }
+        write_collection_len(writer, expected_blocks, "block-max blocks")?;
+        for &default_bound in &metadata.default_bounds {
+            write_u64(writer, default_bound)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn block_max_metadata_encoded_bytes(index: &InvertedIndex) -> Result<u64> {
+    let mut counter = ByteCounter::default();
+    write_block_max_metadata(index, &mut counter)?;
+    Ok(counter.bytes)
+}
+
+fn read_v3(reader: &mut impl Read) -> Result<InvertedIndex> {
+    let payload = read_checksummed_payload(reader, PERSISTENCE_FORMAT_VERSION)?;
+    let mut payload_reader = Cursor::new(payload.as_slice());
+    let (analyzer, documents, all_lengths, postings_by_term) =
+        read_compressed_index(&mut payload_reader)?;
+    let block_max = read_block_max_metadata(&mut payload_reader)?;
+    reject_trailing(&mut payload_reader)?;
+    InvertedIndex::from_parts_with_block_max(
+        analyzer,
+        documents,
+        all_lengths,
+        postings_by_term,
+        block_max,
+    )
+}
+
 fn read_v2(reader: &mut impl Read) -> Result<InvertedIndex> {
+    let payload = read_checksummed_payload(reader, CHECKSUMMED_POSTINGS_VERSION)?;
+    let mut payload_reader = Cursor::new(payload.as_slice());
+    let (analyzer, documents, all_lengths, postings_by_term) =
+        read_compressed_index(&mut payload_reader)?;
+    reject_trailing(&mut payload_reader)?;
+    InvertedIndex::from_parts(analyzer, documents, all_lengths, postings_by_term)
+}
+
+fn read_checksummed_payload(reader: &mut impl Read, expected_version: u32) -> Result<Vec<u8>> {
     let version = read_u32(reader)?;
-    if version != PERSISTENCE_FORMAT_VERSION {
+    if version != expected_version {
         return Err(Error::UnsupportedVersion(version));
     }
     let payload_length = read_u64(reader)?;
@@ -143,32 +246,39 @@ fn read_v2(reader: &mut impl Read) -> Result<InvertedIndex> {
         )));
     }
 
-    let mut payload_reader = Cursor::new(payload.as_slice());
-    let (analyzer, documents, all_lengths) = read_documents(&mut payload_reader)?;
-    let term_count = read_len(&mut payload_reader, "dictionary terms")?;
+    Ok(payload)
+}
+
+type StoredCompressedIndex = (
+    Analyzer,
+    Vec<Document>,
+    Vec<BTreeMap<String, u32>>,
+    BTreeMap<TermKey, Vec<Posting>>,
+);
+
+fn read_compressed_index(reader: &mut Cursor<&[u8]>) -> Result<StoredCompressedIndex> {
+    let (analyzer, documents, all_lengths) = read_documents(reader)?;
+    let term_count = read_len(reader, "dictionary terms")?;
     let mut postings_by_term = BTreeMap::new();
     for _ in 0..term_count {
         let key = TermKey {
-            field: read_string(&mut payload_reader)?,
-            term: read_string(&mut payload_reader)?,
+            field: read_string(reader)?,
+            term: read_string(reader)?,
         };
-        let posting_count = read_len(&mut payload_reader, "postings")?;
-        let block_length = read_bounded_len(
-            &mut payload_reader,
-            "compressed posting bytes",
-            MAX_POSTING_BLOCK_BYTES,
-        )?;
-        let block_start = usize::try_from(payload_reader.position())
+        let posting_count = read_len(reader, "postings")?;
+        let block_length =
+            read_bounded_len(reader, "compressed posting bytes", MAX_POSTING_BLOCK_BYTES)?;
+        let block_start = usize::try_from(reader.position())
             .map_err(|_| Error::CorruptIndex("posting block offset does not fit usize".into()))?;
         let block_end = block_start
             .checked_add(block_length)
             .ok_or_else(|| Error::CorruptIndex("posting block offset overflow".into()))?;
-        let block = payload_reader
+        let block = reader
             .get_ref()
             .get(block_start..block_end)
             .ok_or_else(|| Error::CorruptIndex("truncated compressed posting block".into()))?;
         let postings = decode_postings(block, posting_count)?;
-        payload_reader
+        reader
             .set_position(u64::try_from(block_end).map_err(|_| {
                 Error::CorruptIndex("posting block offset does not fit u64".into())
             })?);
@@ -179,8 +289,75 @@ fn read_v2(reader: &mut impl Read) -> Result<InvertedIndex> {
             )));
         }
     }
-    reject_trailing(&mut payload_reader)?;
-    InvertedIndex::from_parts(analyzer, documents, all_lengths, postings_by_term)
+    Ok((analyzer, documents, all_lengths, postings_by_term))
+}
+
+fn read_block_max_metadata(
+    reader: &mut Cursor<&[u8]>,
+) -> Result<BTreeMap<BlockMaxKey, BlockMaxMetadata>> {
+    let block_size = read_u32(reader)? as usize;
+    if block_size != BLOCK_POSTINGS {
+        return Err(Error::CorruptIndex(format!(
+            "unsupported block-max block size {block_size}"
+        )));
+    }
+    let stream_count = read_bounded_len(reader, "block-max streams", MAX_BLOCK_MAX_STREAMS)?;
+    let mut all_metadata = BTreeMap::new();
+    for _ in 0..stream_count {
+        let field = match read_u8(reader)? {
+            0 => None,
+            1 => Some(read_string(reader)?),
+            value => {
+                return Err(Error::CorruptIndex(format!(
+                    "unknown block-max field scope {value}"
+                )));
+            }
+        };
+        let key = BlockMaxKey {
+            field,
+            term: read_string(reader)?,
+        };
+        let posting_count = read_len(reader, "block-max postings")?;
+        let block_count = read_len(reader, "block-max blocks")?;
+        let expected_blocks = posting_count.div_ceil(BLOCK_POSTINGS);
+        if block_count != expected_blocks {
+            return Err(Error::CorruptIndex(format!(
+                "block-max block count {block_count} does not match {posting_count} postings"
+            )));
+        }
+        let mut default_bounds = fallible_vec(block_count, "default block-max bounds")?;
+        for _ in 0..block_count {
+            let default_bound = read_u64(reader)?;
+            let value = f64::from_bits(default_bound);
+            if !value.is_finite() || value < 0.0 {
+                return Err(Error::CorruptIndex(
+                    "default block-max bound must be finite and non-negative".into(),
+                ));
+            }
+            push_fallible(
+                &mut default_bounds,
+                default_bound,
+                "default block-max bounds",
+            )?;
+        }
+        if all_metadata
+            .insert(
+                key.clone(),
+                BlockMaxMetadata {
+                    posting_count,
+                    default_bounds,
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::CorruptIndex(format!(
+                "duplicate block-max key '{}:{}'",
+                key.field.as_deref().unwrap_or("*"),
+                key.term
+            )));
+        }
+    }
+    Ok(all_metadata)
 }
 
 fn read_v1(reader: &mut impl Read) -> Result<InvertedIndex> {
@@ -401,6 +578,8 @@ mod tests {
     use super::*;
     use crate::analysis::AnalysisMode;
     use crate::index::IndexBuilder;
+    use crate::query::{QueryTerm, SearchQuery};
+    use crate::search::{Bm25Params, PruningStrategy, SearchOptions};
 
     fn sample_index(mode: AnalysisMode) -> InvertedIndex {
         let mut builder = IndexBuilder::new(Analyzer::new(mode));
@@ -413,6 +592,31 @@ mod tests {
         builder
             .add_document(Document::from_fields("two", [("body", "blue green")]).unwrap())
             .unwrap();
+        builder.finish()
+    }
+
+    fn block_search_index() -> InvertedIndex {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for ordinal in 0..192 {
+            let common = "common ".repeat(1 + ordinal % 7);
+            let rare = if ordinal % 23 == 0 {
+                "rare rare"
+            } else {
+                "filler"
+            };
+            builder
+                .add_document(
+                    Document::from_fields(
+                        format!("doc-{ordinal}"),
+                        [
+                            ("title", format!("common title {ordinal}")),
+                            ("body", format!("{common}{rare}")),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
         builder.finish()
     }
 
@@ -444,6 +648,20 @@ mod tests {
         output
     }
 
+    fn version_two_bytes(index: &InvertedIndex) -> Vec<u8> {
+        let mut payload = Vec::new();
+        write_documents(index, &mut payload).unwrap();
+        write_compressed_postings(index, &mut payload).unwrap();
+
+        let mut output = Vec::new();
+        output.extend_from_slice(MAGIC_V2);
+        write_u32(&mut output, CHECKSUMMED_POSTINGS_VERSION).unwrap();
+        write_u64(&mut output, u64::try_from(payload.len()).unwrap()).unwrap();
+        write_u64(&mut output, checksum(&payload)).unwrap();
+        output.extend_from_slice(&payload);
+        output
+    }
+
     #[test]
     fn binary_round_trip_preserves_documents_postings_and_stats() {
         let original = sample_index(AnalysisMode::Unicode);
@@ -454,16 +672,28 @@ mod tests {
             restored.postings("body", "red"),
             original.postings("body", "red")
         );
+        assert_eq!(restored.block_max, original.block_max);
     }
 
     #[test]
-    fn writer_uses_version_two_magic_and_is_deterministic() {
+    fn writer_uses_version_three_magic_and_is_deterministic() {
         let index = sample_index(AnalysisMode::Unicode);
         let first = bytes(&index);
-        assert_eq!(&first[..8], MAGIC_V2);
-        assert_eq!(u32::from_le_bytes(first[8..12].try_into().unwrap()), 2);
+        assert_eq!(&first[..8], MAGIC_V3);
+        assert_eq!(u32::from_le_bytes(first[8..12].try_into().unwrap()), 3);
         assert_eq!(first, bytes(&index));
         assert_eq!(first, bytes(&sample_index(AnalysisMode::Unicode)));
+    }
+
+    #[test]
+    fn version_three_size_delta_is_exactly_the_block_section() {
+        let index = sample_index(AnalysisMode::Unicode);
+        let version_three = bytes(&index);
+        let version_two = version_two_bytes(&index);
+        assert_eq!(
+            u64::try_from(version_three.len() - version_two.len()).unwrap(),
+            block_max_metadata_encoded_bytes(&index).unwrap()
+        );
     }
 
     #[test]
@@ -476,6 +706,130 @@ mod tests {
             original.postings("body", "red")
         );
         assert_eq!(restored.analyzer().mode(), AnalysisMode::Ascii);
+        assert_eq!(restored.block_max, original.block_max);
+    }
+
+    #[test]
+    fn reads_version_two_indexes_and_rebuilds_block_metadata_once() {
+        let original = sample_index(AnalysisMode::Unicode);
+        let restored = InvertedIndex::read_from(Cursor::new(version_two_bytes(&original))).unwrap();
+        assert_eq!(restored.documents(), original.documents());
+        assert_eq!(
+            restored.postings("body", "blue"),
+            original.postings("body", "blue")
+        );
+        assert_eq!(restored.block_max, original.block_max);
+    }
+
+    #[test]
+    fn legacy_fixture_encodings_are_frozen() {
+        let index = sample_index(AnalysisMode::Ascii);
+        let version_one = legacy_bytes(&index);
+        let version_two = version_two_bytes(&index);
+        assert_eq!(version_one.len(), 362);
+        assert_eq!(checksum(&version_one), 0x6d15_0b5a_1261_496e);
+        assert_eq!(version_two.len(), 317);
+        assert_eq!(checksum(&version_two), 0xc2f3_16b7_0cd5_25b7);
+    }
+
+    #[test]
+    fn custom_parameter_search_remains_bit_exact_after_v3_round_trip() {
+        let original = block_search_index();
+        let restored = InvertedIndex::read_from(Cursor::new(bytes(&original))).unwrap();
+        let query = SearchQuery::from_terms(vec![
+            QueryTerm::new("common", None, 2.0).unwrap(),
+            QueryTerm::new("rare", None, 0.75).unwrap(),
+        ])
+        .unwrap();
+        let options = SearchOptions {
+            top_k: 17,
+            bm25: Bm25Params { k1: 4.0, b: 1.0 },
+            ..SearchOptions::default()
+        };
+        let expected = original
+            .search(
+                &query,
+                SearchOptions {
+                    pruning: PruningStrategy::Exhaustive,
+                    ..options
+                },
+            )
+            .unwrap();
+
+        for (index, label) in [(&original, "built"), (&restored, "restored")] {
+            for strategy in [
+                PruningStrategy::Exhaustive,
+                PruningStrategy::Wand,
+                PruningStrategy::BlockMaxWand,
+            ] {
+                let actual = index
+                    .search(
+                        &query,
+                        SearchOptions {
+                            pruning: strategy,
+                            ..options
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    actual.hits.len(),
+                    expected.hits.len(),
+                    "{label} {strategy:?}"
+                );
+                for (actual, expected) in actual.hits.iter().zip(&expected.hits) {
+                    assert_eq!(actual.doc_id, expected.doc_id, "{label} {strategy:?}");
+                    assert_eq!(
+                        actual.score.to_bits(),
+                        expected.score.to_bits(),
+                        "{label} {strategy:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn restored_v3_default_bounds_load_without_scanning_and_match_exhaustive() {
+        let original = block_search_index();
+        let encoded = bytes(&original);
+        assert_eq!(&encoded[..8], MAGIC_V3);
+        let restored = InvertedIndex::read_from(Cursor::new(encoded)).unwrap();
+        let query = SearchQuery::from_terms(vec![
+            QueryTerm::new("common", None, 1.0).unwrap(),
+            QueryTerm::new("rare", None, 1.0).unwrap(),
+        ])
+        .unwrap();
+        let options = SearchOptions {
+            top_k: 17,
+            bm25: Bm25Params::default(),
+            ..SearchOptions::default()
+        };
+        let exhaustive = restored
+            .search(
+                &query,
+                SearchOptions {
+                    pruning: PruningStrategy::Exhaustive,
+                    ..options
+                },
+            )
+            .unwrap();
+        let block_max = restored
+            .search(
+                &query,
+                SearchOptions {
+                    pruning: PruningStrategy::BlockMaxWand,
+                    ..options
+                },
+            )
+            .unwrap();
+
+        assert!(block_max.stats.block_max_bounds_loaded > 0);
+        assert_eq!(block_max.stats.block_max_postings_scanned, 0);
+        assert_eq!(block_max.hits.len(), exhaustive.hits.len());
+        for (actual, expected) in block_max.hits.iter().zip(&exhaustive.hits) {
+            assert_eq!(actual.doc_id, expected.doc_id);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+        }
     }
 
     #[test]
@@ -485,6 +839,20 @@ mod tests {
         data[last] ^= 1;
         let error = InvertedIndex::read_from(Cursor::new(data)).unwrap_err();
         assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn rejects_incorrect_block_bounds_even_with_a_valid_checksum() {
+        let mut index = sample_index(AnalysisMode::Unicode);
+        let metadata = index.block_max.values_mut().next().unwrap();
+        metadata.default_bounds[0] = (f64::from_bits(metadata.default_bounds[0]) + 1.0).to_bits();
+
+        let error = InvertedIndex::read_from(Cursor::new(bytes(&index))).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("block-max metadata does not match")
+        );
     }
 
     #[test]
@@ -540,7 +908,7 @@ mod tests {
     #[test]
     fn rejects_truncated_large_payload_without_preallocating_declared_length() {
         let mut data = Vec::new();
-        data.extend_from_slice(MAGIC_V2);
+        data.extend_from_slice(MAGIC_V3);
         write_u32(&mut data, PERSISTENCE_FORMAT_VERSION).unwrap();
         write_u64(&mut data, MAX_INDEX_PAYLOAD_BYTES).unwrap();
         write_u64(&mut data, 0).unwrap();
@@ -552,14 +920,14 @@ mod tests {
     }
 
     #[test]
-    fn file_api_round_trips_without_external_dependencies() {
+    fn file_api_round_trips_without_external_services() {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("indexsail-{}-{suffix}.idx", std::process::id()));
         let original = sample_index(AnalysisMode::Unicode);
         original.save(&path).unwrap();
-        assert_eq!(persisted_format_version(&path).unwrap(), 2);
+        assert_eq!(persisted_format_version(&path).unwrap(), 3);
         let restored = InvertedIndex::load(&path).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(restored.stats(), original.stats());

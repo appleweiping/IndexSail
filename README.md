@@ -4,8 +4,9 @@
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-dea584.svg)](https://www.rust-lang.org/)
 [![MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
-IndexSail is a dependency-free information-retrieval experiment toolkit in safe Rust. It builds a
-field-aware positional index, ranks with BM25, executes exact exhaustive or WAND top-k queries, and runs
+IndexSail is an information-retrieval experiment toolkit in safe Rust. It builds a
+field-aware positional index, ranks with BM25, executes exact exhaustive, WAND, or block-max WAND top-k
+queries, and runs
 reproducible TREC-style experiments from collection ingestion through metrics and run files.
 
 The design favors observable algorithms, deterministic results, explicit format contracts, and strict
@@ -20,14 +21,15 @@ experiments small enough to fit in one process.
 | Analysis | Deterministic Unicode or ASCII tokenization, stored with the index |
 | Index | Named fields, stable external IDs, positions, field lengths, DF and collection statistics |
 | Retrieval | BM25, `AND`/`OR`, fielded terms, phrases, exact field filters, explanations |
-| Execution | Exhaustive reference executor and exact WAND with stable score/doc-ID tie-breaking |
+| Execution | Exhaustive oracle, exact WAND and block-max WAND with stable tie-breaking |
 | Experiments | TSV or classic TREC topics, qrels, six-column run files, JSON reports |
 | Metrics | MAP@k, MRR@k, nDCG@k, Recall@k, latency, candidates, advances and skips |
 | Verification | Optional per-query bit-exact WAND/exhaustive comparison |
-| Storage | Checksummed version 2 format with doc/position delta and variable-byte postings |
+| Storage | Checksummed v3 format with compressed postings and persisted block-max bounds; v1/v2 reads |
 | Operations | CLI, library API, Linux/Windows CI, strict Clippy, rustfmt and release tests |
 
-IndexSail has no runtime or build dependencies beyond the Rust standard library.
+IndexSail has one exactly pinned runtime dependency: the pure-Rust `libm` implementation used for
+cross-platform bit-stable BM25 IDF values. There are no network, parser, serialization, or CLI dependencies.
 
 ## Architecture
 
@@ -35,14 +37,16 @@ IndexSail has no runtime or build dependencies beyond the Rust standard library.
 flowchart LR
     A[TSV or TREC collection] --> B[Unicode or ASCII analyzer]
     B --> C[Field-aware positional index]
-    C --> D[v2 checksum + delta/varbyte persistence]
+    C --> D[v3 checksum + compressed postings + block bounds]
     T[TSV or classic TREC topics] --> Q[Typed batch queries]
     D --> E{Exact executor}
     Q --> E
     E -->|Exhaustive| X[Reference candidate traversal]
     E -->|WAND| W[Bounded cursor skipping]
+    E -->|Block-max WAND| BW[Block-bound skipping]
     X --> K[Stable top-k]
     W --> K
+    BW --> K
     K --> R[Six-column TREC run]
     J[Four-column qrels] --> M[MAP MRR nDCG Recall]
     K --> M
@@ -173,7 +177,7 @@ Against the bundled example the two steps print:
 
 ```text
 indexed documents=4 fields=2 terms=42 postings=43 tokens=44 output=target/collection.idx
-batch topics=3 hits=4 strategy=Wand verified=true elapsed_ms=0.117 evaluated=4 advanced=5 skipped=0 run=target/indexsail.run
+batch topics=3 hits=4 strategy=Wand verified=true elapsed_ms=0.117 evaluated=4 advanced=5 skipped=0 block_max_bounds_loaded=0 block_max_postings_covered=0 block_max_postings_scanned=0 run=target/indexsail.run
 metrics map=1.000000 mrr=1.000000 ndcg=0.932236 recall=1.000000
 report=target/report.json
 ```
@@ -247,8 +251,8 @@ indexsail search corpus.idx "local search ranking" --strategy block-max-wand
 
 The ranking is unchanged. A block maximum is a true upper bound inside its block, the bound covers every
 cursor that could contribute at the pivot, and the same `>=` boundary is used, so a result that wins on the
-document-ID tie-break is still not pruned. Both strategies share one code path; the block bound only ever
-decides to skip documents the shared pivot logic has already shown cannot reach the threshold.
+document-ID tie-break is still not pruned. All strategies share exact scoring and top-k maintenance; their
+different pruning control flow is checked against exhaustive retrieval in randomized and end-to-end tests.
 
 ### When it helps, and when it does not
 
@@ -260,36 +264,49 @@ own collection rather than assuming it:
 | skewed impacts, 20k docs | `common` | 10 | 20000 | 5568 | -72% |
 | skewed impacts, 20k docs | `common mid` | 10 | 6685 | 2834 | -58% |
 | skewed impacts, 20k docs | `common mid rare` | 10 | 331 | 327 | -1% |
-| benchmark corpus, 100k docs | 200 mixed | 10 | 415942 | 415543 | -0.1% |
+| benchmark corpus, 100k docs | 500 mixed | 10 | 1,136,956 | 1,136,119 | -0.074% |
 
 Block-max helps most where plain WAND helps least: a frequent term whose global bound prunes nothing. Where
-WAND already reaches a small candidate set, little is left to remove, and the extra bound arithmetic can make
-the run marginally slower -- the synthetic benchmark corpus generates near-uniform impacts, so it shows
-exactly that. Real text collections are skewed, which is the case the strategy is built for.
+WAND already reaches a small candidate set, little is left to remove, and the extra bound arithmetic may
+outweigh the saved work. On the formal synthetic benchmark, repeated WAND and block-max timing ranges overlap
+and reverse order, so they establish neither a latency win nor a loss. Real text collections are often more
+skewed, which is the case the strategy is built for.
 
-Block maxima are computed in the same pass that scores a term's postings, so they cost no index-time work and
-no change to the on-disk format.
+Block maxima are precomputed when an index is finalized and stored in format version 3. A field-qualified
+stream and the deterministic all-field merge are both represented, so default-BM25 query preparation loads
+one value per 64-posting block instead of rescanning scored postings. Custom valid BM25 parameters or boosts
+derive maxima directly from their exact materialized scores; this preserves the full public parameter range
+without relying on a numerically unsafe universal approximation. Version 1 and 2 files rebuild the default
+table once during load, and a subsequent save upgrades them to version 3.
 
 ## Persistence and compression
 
-New indexes use format version 2:
+New indexes use format version 3:
 
 - a magic value and explicit format version;
 - a payload length with allocation limits;
 - a deterministic 64-bit FNV-1a payload checksum;
 - stored documents, analyzer mode, field lengths, and sorted dictionary;
 - per-term compressed posting blocks;
+- one tight default-BM25 upper bound per 64-posting block for field-qualified and all-field logical term
+  streams;
 - positive document-ID and position gaps encoded as base-128 variable bytes;
 - term frequency encoded as a variable byte and used as the position count;
 - rejection of truncation, trailing bytes, checksum mismatch, integer overflow, non-UTF-8 data, duplicate
   keys, invalid references, and non-monotonic IDs or positions.
 
-Version 1 indexes remain readable and are written as version 2 on the next save. The checksum detects
+Version 1 and 2 indexes remain readable and are written as version 3 on the next save. Version 3 recomputes
+and bit-compares its default bound table while loading, then default-BM25 queries consume the validated
+persisted values. Custom BM25 parameters or boosts derive conservative block bounds directly from their
+materialized exact scores and report that work in `block_max_postings_scanned`. The checksum detects
 accidental damage; it is not authentication and must not be treated as protection from maliciously crafted
 input. Exact layouts and trust boundaries are documented in [docs/architecture.md](docs/architecture.md).
 
-The posting codec compresses postings only. Stored field text and dictionary strings remain uncompressed,
-and search loads the entire index into memory.
+The posting codec compresses postings only. Stored field text, dictionary strings, and block bounds remain
+uncompressed, and search loads the entire index into memory. A cross-platform standard-library mmap API does
+not exist, while this crate forbids unsafe code and intentionally limits itself to one pure-Rust math
+dependency; v3 therefore keeps the ordinary buffered reader rather than claiming an mmap path that would
+still materialize owned data.
 
 ## Library example
 
@@ -324,18 +341,27 @@ sh examples/benchmark_100k.sh
 ```
 
 For seed 42, the generator creates 100,000 documents, 500 three-term queries, and 5,592,575 posting-list
-entries. A measured WSL2 release run produced the following correctness-backed observation:
+entries. Two native Windows release repetitions on 2026-09-07 produced the following
+correctness-backed observation (elapsed ranges show their variability):
 
-| Executor | Evaluated candidates | Time |
+| Executor | Evaluated candidates | Time range |
 |---|---:|---:|
-| Exhaustive | 12,927,028 | 21.72 s |
-| WAND | 1,136,956 | 13.61 s |
+| Exhaustive | 12,927,028 | 9.65–10.42 s |
+| WAND | 1,136,956 | 6.56–8.26 s |
+| Block-max WAND | 1,136,119 | 8.16–17.35 s |
 
-Both returned bit-identical top-10 results for every query, checksum `70f92ad0827240fd`. The posting codec
+All three returned bit-identical top-10 results for every query, checksum `1310686fefd0b451`. The posting codec
 used 19,097,862 bytes versus 76,340,600 fixed-width value bytes (ratio 0.2502, excluding dictionary and
-stored documents). These numbers describe one machine and workload, not universal performance. The script
-writes configuration, timings, counters, compression statistics, and checksum as JSON. Full environment and
-measurement notes are in [docs/benchmark.md](docs/benchmark.md).
+stored documents). The v3 file was 70,139,763 bytes: 68,716,795 base bytes plus 1,422,968 bytes of block
+metadata, a 2.07% increase over that base. Across the 500 block-max queries, 223,772 precomputed bounds from
+the v3-persistable resident table covered
+14,275,721 scored postings and zero postings were scanned specifically to derive bounds. On this near-uniform
+workload the tighter bounds removed only 837 additional candidates; the overlapping, unstable timing ranges
+do not establish a latency win. These numbers describe one machine and workload, not universal performance.
+The benchmark queries the just-built resident index and serializes it afterward; “precomputed” does not
+claim a disk reload in this measurement. The script writes configuration, timings, work and storage counters, compression statistics,
+and checksum as schema-version-3 JSON. Full environment and measurement notes are in
+[docs/benchmark.md](docs/benchmark.md).
 
 ## Reproducibility contract
 
@@ -355,9 +381,11 @@ when publishing results.
 
 IndexSail is currently an in-memory, single-process research toolkit. It does not implement incremental
 segments, deletion, distributed shards, memory mapping, language-specific stemming, stopword lists, fuzzy
-matching, learning-to-rank, query expansion, or concurrent writes. Block-max WAND is available as an opt-in
-strategy, computed per query rather than stored as a pruning index, so it needs no format of its own and
-also gains nothing at index time. It does not claim state-of-the-art compressed-query throughput. Unicode analysis uses standard-library alphanumeric boundaries and lowercase conversion; it does
+matching, learning-to-rank, query expansion, or concurrent writes. Block-max metadata is an immutable
+snapshot: it increases index-build work and file size in exchange for removing the additional bound-
+derivation scan from default-BM25, unit-boost block-max queries. Custom parameters derive conservative
+bounds from the already materialized scores. It does not claim state-of-the-art compressed-query throughput. Unicode analysis uses
+standard-library alphanumeric boundaries and lowercase conversion; it does
 not perform Unicode normalization or language-aware segmentation.
 
 The local TREC reader supports the exact subset documented above. Convert other collection formats to TSV
@@ -377,4 +405,5 @@ by this repository's code, tests, and format documentation.
 
 IndexSail is available under the [MIT License](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) for the
 quality and review contract, [SECURITY.md](SECURITY.md) for private vulnerability reporting, and
-[CHANGELOG.md](CHANGELOG.md) for release history.
+[CHANGELOG.md](CHANGELOG.md) for release history. The [release process](docs/releasing.md) documents
+clean builds, checksums, the dependency SBOM, and build-provenance verification.
