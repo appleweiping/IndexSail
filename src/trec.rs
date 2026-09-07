@@ -13,6 +13,7 @@ use crate::analysis::Analyzer;
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::index::{IndexBuilder, InvertedIndex};
+use crate::shard::{ShardedIndex, ShardedIndexBuilder};
 
 const MAX_TREC_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
@@ -79,6 +80,28 @@ pub fn load_qrels(path: impl AsRef<Path>) -> Result<Qrels> {
 pub fn index_trec_collection(path: impl AsRef<Path>, analyzer: Analyzer) -> Result<InvertedIndex> {
     let reader = BufReader::new(File::open(path)?);
     index_trec_reader(reader, analyzer)
+}
+
+fn index_trec_reader(reader: impl BufRead, analyzer: Analyzer) -> Result<InvertedIndex> {
+    let mut builder = IndexBuilder::new(analyzer);
+    visit_trec_reader(reader, |document| {
+        builder.add_document(document).map(|_| ())
+    })?;
+    Ok(builder.finish())
+}
+
+/// Stream a TREC collection directly into deterministic physical shards.
+pub fn index_trec_collection_sharded(
+    path: impl AsRef<Path>,
+    analyzer: Analyzer,
+    shard_count: usize,
+) -> Result<ShardedIndex> {
+    let mut builder = ShardedIndexBuilder::new(analyzer, shard_count)?;
+    let reader = BufReader::new(File::open(path)?);
+    visit_trec_reader(reader, |document| {
+        builder.add_document(document).map(|_| ())
+    })?;
+    Ok(builder.finish())
 }
 
 fn parse_tsv_topics(content: &str) -> Result<Vec<Topic>> {
@@ -244,8 +267,10 @@ pub(crate) fn parse_qrels(reader: impl BufRead) -> Result<Qrels> {
     Ok(Qrels { judgments })
 }
 
-fn index_trec_reader(reader: impl BufRead, analyzer: Analyzer) -> Result<InvertedIndex> {
-    let mut builder = IndexBuilder::new(analyzer);
+fn visit_trec_reader(
+    reader: impl BufRead,
+    mut add_document: impl FnMut(Document) -> Result<()>,
+) -> Result<()> {
     let mut in_document = false;
     let mut record = String::new();
     let mut record_start = 0;
@@ -272,7 +297,7 @@ fn index_trec_reader(reader: impl BufRead, analyzer: Analyzer) -> Result<Inverte
                 )));
             }
             let document = parse_trec_document(&record, record_start)?;
-            builder.add_document(document)?;
+            add_document(document)?;
             document_count += 1;
             in_document = false;
         } else if in_document {
@@ -301,7 +326,7 @@ fn index_trec_reader(reader: impl BufRead, analyzer: Analyzer) -> Result<Inverte
             "TREC collection contains no documents".into(),
         ));
     }
-    Ok(builder.finish())
+    Ok(())
 }
 
 fn parse_trec_document(record: &str, line: usize) -> Result<Document> {

@@ -107,6 +107,15 @@ and IEEE-754 score bits must all match. A difference aborts the batch and no suc
 
 Verification time is recorded separately and is not included in `total_search_micros`.
 
+### Sharded batches
+
+`shard-batch` produces the same run and JSON schemas as `batch`. The public `RetrievalBackend` trait also lets
+`evaluate_batch` accept either an `InvertedIndex` or a `ShardedIndex`. Sharded result IDs are the original
+global insertion IDs, so run ordering, qrels joins, metrics, and exact-verification comparisons retain the
+same semantics. Aggregate work counters are checked sums across physical shards. Local block-max metadata is
+not counted as loaded because its local BM25 statistics are not valid global bounds; globally scored postings
+used to derive conservative bounds appear under `block_max_postings_scanned`.
+
 ## JSON schema version 1
 
 The report top level contains:

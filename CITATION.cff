@@ -1,16 +1,17 @@
 cff-version: 1.2.0
 message: "If you use IndexSail in research, please cite this software."
-title: "IndexSail: Reproducible BM25 and WAND Retrieval Experiments"
+title: "IndexSail: Reproducible BM25 Retrieval Experiments"
 type: software
 authors:
   - family-names: "Yan"
     given-names: "Weiping"
     alias: "appleweiping"
-version: 0.3.0
+version: 0.5.0
 date-released: 2026-09-07
 license: MIT
 repository-code: "https://github.com/appleweiping/IndexSail"
 url: "https://github.com/appleweiping/IndexSail"
 abstract: >-
   A deterministic safe-Rust toolkit for positional indexing, BM25 ranking, exact
-  WAND execution, TREC-style batch evaluation, and reproducible retrieval reports.
+  WAND, block-max WAND, and MaxScore execution, collection-wide physical sharding,
+  TREC-style batch evaluation, and reproducible retrieval reports.

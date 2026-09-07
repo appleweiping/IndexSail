@@ -52,6 +52,10 @@ pub fn persisted_format_version(path: impl AsRef<Path>) -> Result<u32> {
     let mut magic = [0_u8; 8];
     read_exact_corrupt(&mut reader, &mut magic, "file signature")?;
     let version = read_u32(&mut reader)?;
+    format_version_from_header(magic, version)
+}
+
+pub(crate) fn format_version_from_header(magic: [u8; 8], version: u32) -> Result<u32> {
     match &magic {
         value if value == MAGIC_V1 && version == LEGACY_VERSION => Ok(version),
         value if value == MAGIC_V2 && version == CHECKSUMMED_POSTINGS_VERSION => Ok(version),
@@ -196,6 +200,48 @@ pub(crate) fn block_max_metadata_encoded_bytes(index: &InvertedIndex) -> Result<
     let mut counter = ByteCounter::default();
     write_block_max_metadata(index, &mut counter)?;
     Ok(counter.bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_legacy_v1_for_test(index: &InvertedIndex) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(MAGIC_V1);
+    write_u32(&mut output, LEGACY_VERSION)?;
+    write_documents(index, &mut output)?;
+    write_len(&mut output, index.postings.len(), "dictionary terms")?;
+    for (key, postings) in &index.postings {
+        write_string(&mut output, &key.field)?;
+        write_string(&mut output, &key.term)?;
+        write_len(&mut output, postings.len(), "postings")?;
+        for posting in postings {
+            write_u32(&mut output, posting.doc_id)?;
+            write_u32(&mut output, posting.term_frequency)?;
+            write_len(&mut output, posting.positions.len(), "positions")?;
+            for &position in &posting.positions {
+                write_u32(&mut output, position)?;
+            }
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_v2_for_test(index: &InvertedIndex) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    write_documents(index, &mut payload)?;
+    write_compressed_postings(index, &mut payload)?;
+
+    let mut output = Vec::new();
+    output.extend_from_slice(MAGIC_V2);
+    write_u32(&mut output, CHECKSUMMED_POSTINGS_VERSION)?;
+    write_u64(
+        &mut output,
+        u64::try_from(payload.len())
+            .map_err(|_| Error::InvalidArgument("test payload does not fit u64".into()))?,
+    )?;
+    write_u64(&mut output, checksum(&payload))?;
+    output.extend_from_slice(&payload);
+    Ok(output)
 }
 
 fn read_v3(reader: &mut impl Read) -> Result<InvertedIndex> {

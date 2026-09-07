@@ -9,11 +9,12 @@
 | `index` | Builder, immutable document table, field lengths, dictionary, positional postings |
 | `query` | Typed terms, `AND`/`OR`, phrase constraints, and exact-field filters |
 | `search` | BM25 scorers, exhaustive/WAND/block-max WAND/MaxScore execution, stable heap, explanations and counters |
+| `shard` | Round-robin physical partitioning, global statistics, exact merge, v1 sharded container |
 | `codec` | Posting gaps, base-128 variable bytes, codec statistics, payload checksum |
 | `persistence` | v3 writer, v3/v2/v1 readers, checksums, bounds and structural validation |
 | `trec` | Collection, topic and qrels adapters |
-| `evaluation` | Batch execution, executor oracle, metrics, run and JSON writers |
-| `benchmark` | Seeded workload, exhaustive/WAND oracle, checksum and JSON report |
+| `evaluation` | Generic monolithic/sharded batch execution, executor oracle, metrics, run and JSON writers |
+| `benchmark` | Seeded workload, monolithic/sharded exhaustive oracle, checksum and JSON report |
 | `cli` | Hand-written standard-library command parsing and end-to-end workflows |
 
 ## Build data flow
@@ -25,6 +26,7 @@ sequenceDiagram
     participant N as Analyzer
     participant B as IndexBuilder
     participant I as InvertedIndex
+    participant S as ShardedIndexBuilder
     participant P as Persistence
 
     U->>A: TSV rows or TREC DOC blocks
@@ -36,6 +38,12 @@ sequenceDiagram
     P->>P: delta/varbyte posting blocks
     P->>P: persist block bounds + checksum payload
     P-->>U: version 3 index file
+    opt physical sharding
+        I->>S: documents in global insertion order
+        S->>S: global_id modulo shard_count
+        S->>P: independently validated v3 shard snapshots
+        P-->>U: checksummed sharded container v1
+    end
 ```
 
 ## Retrieval and evaluation flow
@@ -45,12 +53,15 @@ sequenceDiagram
     participant T as Topic adapter
     participant Q as SearchQuery
     participant S as Selected executor (Exhaustive/WAND/BMW/MaxScore)
+    participant H as Shard coordinator
     participant O as Other executor
     participant K as Stable top-k
     participant E as Evaluator
 
     T->>Q: topic ID + query text
-    Q->>S: analyzed logical clauses
+    Q->>H: analyzed logical clauses
+    H->>H: aggregate global N, DF, field totals
+    H->>S: same query and global statistics per shard
     S->>K: valid candidates + scores
     opt --verify
         Q->>O: identical query/options
@@ -78,6 +89,31 @@ sequenceDiagram
     contain finite bounds that bit-match recomputation from the postings.
 
 The builder establishes these invariants. All persistence readers distrust and validate stored data again.
+
+## Physical-shard invariants and exact merge
+
+1. A collection has between 1 and 4,096 physical shards and at most `u32::MAX` global documents.
+2. Global insertion ID `g` belongs to shard `g % shard_count` at local ID `g / shard_count`.
+3. Physical shard populations therefore differ by at most one and are fully determined by the global count.
+4. Every shard uses the same analyzer and validates as an independent `InvertedIndex`.
+5. External document IDs remain unique across the entire collection, not merely within a shard.
+6. Global field totals and document frequencies are checked integer sums of the physical-shard values.
+
+BM25 scores cannot be compared across shards when each shard substitutes its own `N`, `df`, or average field
+length. `ShardedIndex` therefore constructs one immutable global statistics snapshot and supplies it to every
+physical query. For a field/term pair, `df_global = sum(df_shard)`; token totals are summed by field; every
+average keeps the monolithic convention of dividing by the global document count, including documents that
+lack the field. Those integers lead to the same floating-point inputs and score bits as a monolithic index.
+
+Each shard retains at most global `k` results. A document in the collection-wide top-k cannot rank below `k`
+inside its own shard, so this is sufficient. The coordinator maps local IDs back to global IDs, sorts score
+descending/global ID ascending, and truncates to `k`. Round-robin local ID order is also global ID order within
+one shard, preserving ties before and after merge.
+
+Persisted default block maxima belong to the collection statistics that created their physical index. They
+are not valid after substituting global statistics. Sharded block-max execution therefore derives conservative
+bounds from exact globally scored postings and exposes that work through `block_max_postings_scanned`; it never
+reports local bounds as precomputed global bounds.
 
 ## Query preparation
 
@@ -209,6 +245,38 @@ posting contains fixed-width absolute `doc_id`, `term_frequency`, explicit posit
 positions. The reader also recognizes checksummed `IDXSAL02` version 2 files with the same compressed posting
 layout as version 3 but no block-max section. Both legacy formats are read-only compatibility: their bounds
 are built once during load and every new save uses version 3.
+
+## Sharded container format version 1
+
+The sharded format composes complete physical index snapshots instead of defining a second posting codec.
+All fixed-width integers are little-endian.
+
+```text
+8 bytes  magic: IDXSHD01
+u32      version: 1
+u64      payload byte length
+u64      FNV-1a checksum of payload bytes
+payload:
+  u32    physical shard count
+  u64    global document count
+  repeat physical shard count:
+    u64  embedded snapshot byte length
+    bytes complete IndexSail index snapshot
+EOF required
+```
+
+The current writer embeds format-v3 indexes. Each embedded reader independently accepts and validates
+IndexSail v1, v2, or v3, after which the container validates equal analyzers, the canonical round-robin
+population, collection-wide external-ID uniqueness, and the recomputed global count/statistics. The loaded
+index retains each observed embedded version so diagnostics do not mislabel mixed legacy containers. Container
+and embedded checksums detect accidental corruption but are not authentication. Both container and individual
+shard payloads have explicit 4-GiB safety limits.
+
+The outer writer counts and checksums deterministic shard serializations before emitting them directly. The
+seekable reader validates the complete outer payload and exact EOF in 8-KiB chunks before decoding any
+structures, seeks back, and parses one length-limited embedded index at a time. Outer-container memory is
+therefore bounded by a checksum buffer and the largest embedded index instead of simultaneous copies of every
+shard. This deliberate CPU-for-memory trade keeps format-v1 bytes stable.
 
 ## TREC adapter trust boundary
 

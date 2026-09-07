@@ -9,6 +9,7 @@ use crate::index::IndexBuilder;
 use crate::persistence::block_max_metadata_encoded_bytes;
 use crate::query::{BooleanOperator, SearchQuery};
 use crate::search::{PruningStrategy, SearchOptions, SearchStats};
+use crate::shard::ShardedIndex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BenchmarkConfig {
@@ -16,6 +17,7 @@ pub struct BenchmarkConfig {
     pub queries: usize,
     pub seed: u64,
     pub top_k: usize,
+    pub shards: usize,
 }
 
 impl Default for BenchmarkConfig {
@@ -25,6 +27,7 @@ impl Default for BenchmarkConfig {
             queries: 200,
             seed: 42,
             top_k: 10,
+            shards: 4,
         }
     }
 }
@@ -37,10 +40,13 @@ pub struct BenchmarkReport {
     pub wand_time: Duration,
     pub block_max_time: Duration,
     pub maxscore_time: Duration,
+    pub sharded_build_time: Duration,
+    pub sharded_time: Duration,
     pub exhaustive_stats: SearchStats,
     pub wand_stats: SearchStats,
     pub block_max_stats: SearchStats,
     pub maxscore_stats: SearchStats,
+    pub sharded_stats: SearchStats,
     pub checksum: u64,
     pub index_terms: usize,
     pub index_postings: usize,
@@ -50,14 +56,15 @@ pub struct BenchmarkReport {
     pub block_max_metadata_bytes: u64,
     pub block_max_streams: usize,
     pub block_max_blocks: usize,
+    pub sharded_index_bytes: u64,
 }
 
 /// Run a deterministic synthetic benchmark and verify every executor against exhaustive search.
 #[allow(clippy::too_many_lines)]
 pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
-    if config.documents == 0 || config.queries == 0 || config.top_k == 0 {
+    if config.documents == 0 || config.queries == 0 || config.top_k == 0 || config.shards == 0 {
         return Err(Error::InvalidArgument(
-            "benchmark documents, queries, and top_k must be greater than zero".into(),
+            "benchmark documents, queries, top_k, and shards must be greater than zero".into(),
         ));
     }
     if config.documents > u32::MAX as usize {
@@ -92,6 +99,9 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
     }
     let index = builder.finish();
     let index_time = index_started.elapsed();
+    let sharded_build_started = Instant::now();
+    let sharded = ShardedIndex::from_index(&index, config.shards)?;
+    let sharded_build_time = sharded_build_started.elapsed();
 
     let mut query_random = Lcg::new(config.seed ^ 0x9e37_79b9_7f4a_7c15);
     let mut queries = Vec::with_capacity(config.queries);
@@ -207,6 +217,45 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
     }
     let maxscore_time = maxscore_started.elapsed();
 
+    // A separate physical-shard pass uses one collection-wide statistics
+    // snapshot. It is compared directly to the monolithic exhaustive oracle,
+    // including every score bit and the original global document-id tie-break.
+    let sharded_started = Instant::now();
+    let mut sharded_stats = SearchStats::default();
+    let mut sharded_checksum = 0xcbf2_9ce4_8422_2325_u64;
+    for (query, exhaustive) in queries.iter().zip(&exhaustive_results) {
+        let outcome = sharded.search(
+            query,
+            SearchOptions {
+                top_k: config.top_k,
+                pruning: PruningStrategy::BlockMaxWand,
+                ..SearchOptions::default()
+            },
+        )?;
+        add_stats(&mut sharded_stats, outcome.stats);
+        if outcome.hits.len() != exhaustive.len()
+            || outcome.hits.iter().zip(exhaustive).any(|(left, right)| {
+                left.doc_id != right.doc_id || left.score.to_bits() != right.score.to_bits()
+            })
+        {
+            return Err(Error::CorruptIndex(
+                "sharded benchmark results differ from monolithic exhaustive results".into(),
+            ));
+        }
+        for hit in &outcome.hits {
+            sharded_checksum ^= u64::from(hit.doc_id);
+            sharded_checksum = sharded_checksum.wrapping_mul(0x0000_0100_0000_01b3);
+            sharded_checksum ^= hit.score.to_bits();
+            sharded_checksum = sharded_checksum.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let sharded_time = sharded_started.elapsed();
+    if sharded_checksum != checksum {
+        return Err(Error::CorruptIndex(
+            "sharded benchmark checksum differs from monolithic checksum".into(),
+        ));
+    }
+
     let stats = index.stats();
     let posting_codec = index.posting_codec_stats()?;
     let mut persisted = Vec::new();
@@ -220,6 +269,10 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         .values()
         .map(|metadata| metadata.default_bounds.len())
         .sum();
+    let mut persisted_shards = Vec::new();
+    sharded.write_to(&mut persisted_shards)?;
+    let sharded_index_bytes = u64::try_from(persisted_shards.len())
+        .map_err(|_| Error::InvalidArgument("sharded index size does not fit u64".into()))?;
 
     Ok(BenchmarkReport {
         config,
@@ -228,10 +281,13 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         wand_time,
         block_max_time,
         maxscore_time,
+        sharded_build_time,
+        sharded_time,
         exhaustive_stats,
         wand_stats,
         block_max_stats,
         maxscore_stats,
+        sharded_stats,
         checksum,
         index_terms: stats.terms,
         index_postings: stats.postings,
@@ -241,6 +297,7 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         block_max_metadata_bytes,
         block_max_streams,
         block_max_blocks,
+        sharded_index_bytes,
     })
 }
 
@@ -248,11 +305,12 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
 /// machine-dependent; workload counters and checksum are deterministic.
 pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()> {
     writeln!(writer, "{{")?;
-    writeln!(writer, "  \"schema_version\": 4,")?;
+    writeln!(writer, "  \"schema_version\": 5,")?;
     writeln!(writer, "  \"verified_exact\": true,")?;
     writeln!(writer, "  \"documents\": {},", report.config.documents)?;
     writeln!(writer, "  \"queries\": {},", report.config.queries)?;
     writeln!(writer, "  \"top_k\": {},", report.config.top_k)?;
+    writeln!(writer, "  \"shards\": {},", report.config.shards)?;
     writeln!(writer, "  \"seed\": {},", report.config.seed)?;
     writeln!(writer, "  \"index_terms\": {},", report.index_terms)?;
     writeln!(writer, "  \"index_postings\": {},", report.index_postings)?;
@@ -300,6 +358,7 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
         "  \"maxscore_elapsed_micros\": {},",
         report.maxscore_time.as_micros()
     )?;
+    write_sharded_json(report, &mut writer)?;
     writeln!(
         writer,
         "  \"exhaustive\": {{\"evaluated\": {}, \"advanced\": {}, \"skipped\": {}}},",
@@ -333,6 +392,31 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
     )?;
     writeln!(writer, "  \"checksum\": \"{:016x}\"", report.checksum)?;
     writeln!(writer, "}}")?;
+    Ok(())
+}
+
+fn write_sharded_json(report: &BenchmarkReport, writer: &mut impl Write) -> Result<()> {
+    writeln!(
+        writer,
+        "  \"sharded_build_elapsed_micros\": {},",
+        report.sharded_build_time.as_micros()
+    )?;
+    writeln!(
+        writer,
+        "  \"sharded_search_elapsed_micros\": {},",
+        report.sharded_time.as_micros()
+    )?;
+    writeln!(
+        writer,
+        "  \"sharded_block_max_wand\": {{\"physical_shards\": {}, \"serialized_bytes\": {}, \"evaluated\": {}, \"advanced\": {}, \"skipped\": {}, \"precomputed_bounds_loaded\": {}, \"postings_scanned_for_bounds\": {}}},",
+        report.config.shards,
+        report.sharded_index_bytes,
+        report.sharded_stats.evaluated_candidates,
+        report.sharded_stats.postings_advanced,
+        report.sharded_stats.postings_skipped,
+        report.sharded_stats.block_max_bounds_loaded,
+        report.sharded_stats.block_max_postings_scanned
+    )?;
     Ok(())
 }
 
@@ -388,6 +472,7 @@ mod tests {
             queries: 12,
             seed: 7,
             top_k: 5,
+            shards: 4,
         };
         let first = run(config).unwrap();
         let second = run(config).unwrap();
@@ -403,6 +488,7 @@ mod tests {
             queries: 8,
             seed: 19,
             top_k: 3,
+            shards: 4,
         })
         .unwrap();
         assert!(report.exhaustive_stats.evaluated_candidates > 0);
@@ -431,6 +517,10 @@ mod tests {
             report.maxscore_stats.evaluated_candidates
                 <= report.exhaustive_stats.evaluated_candidates
         );
+        assert!(report.sharded_stats.evaluated_candidates > 0);
+        assert_eq!(report.sharded_stats.block_max_bounds_loaded, 0);
+        assert!(report.sharded_stats.block_max_postings_scanned > 0);
+        assert!(report.sharded_index_bytes > report.persisted_index_bytes);
     }
 
     #[test]
@@ -440,16 +530,19 @@ mod tests {
             queries: 8,
             seed: 23,
             top_k: 3,
+            shards: 3,
         })
         .unwrap();
         let mut json = Vec::new();
         write_json(&report, &mut json).unwrap();
         let json = String::from_utf8(json).unwrap();
-        assert!(json.contains("\"schema_version\": 4"));
+        assert!(json.contains("\"schema_version\": 5"));
         assert!(json.contains("\"block_max_metadata_bytes\""));
         assert!(json.contains("\"precomputed_bounds_loaded\""));
         assert!(json.contains("\"postings_scanned_for_bounds\": 0"));
         assert!(json.contains("\"maxscore\""));
+        assert!(json.contains("\"sharded_block_max_wand\""));
+        assert!(json.contains("\"physical_shards\": 3"));
     }
 
     #[test]
@@ -471,6 +564,13 @@ mod tests {
         assert!(
             run(BenchmarkConfig {
                 top_k: 0,
+                ..BenchmarkConfig::default()
+            })
+            .is_err()
+        );
+        assert!(
+            run(BenchmarkConfig {
+                shards: 0,
                 ..BenchmarkConfig::default()
             })
             .is_err()

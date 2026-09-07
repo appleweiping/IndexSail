@@ -8,11 +8,12 @@ use crate::benchmark::{BenchmarkConfig, run as run_benchmark, write_json as writ
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::evaluation::{BatchConfig, evaluate_batch, write_json_report, write_trec_run};
-use crate::index::{IndexBuilder, InvertedIndex};
+use crate::index::{IndexBuilder, InternalDocId, InvertedIndex};
 use crate::persistence::{block_max_metadata_encoded_bytes, persisted_format_version};
 use crate::query::{BooleanOperator, FieldFilter, PhraseFilter, SearchQuery};
-use crate::search::{Bm25Params, PruningStrategy, SearchOptions};
-use crate::trec::{index_trec_collection, load_qrels, load_topics};
+use crate::search::{Bm25Params, PruningStrategy, SearchOptions, SearchOutcome};
+use crate::shard::{ShardedIndex, ShardedIndexBuilder, persisted_sharded_format_version};
+use crate::trec::{index_trec_collection, index_trec_collection_sharded, load_qrels, load_topics};
 
 pub const HELP: &str = "\
 IndexSail — compact local BM25 search\n\
@@ -20,10 +21,14 @@ IndexSail — compact local BM25 search\n\
 USAGE:\n\
   indexsail --version\n\
   indexsail index --input COLLECTION --output INDEX.idx [--format tsv|trec] [--ascii]\n\
+  indexsail shard-index --input COLLECTION --output SHARDS.idx --shards N [--format tsv|trec] [--ascii]\n\
   indexsail search --index INDEX.idx --query TEXT [OPTIONS]\n\
+  indexsail shard-search --index SHARDS.idx --query TEXT [OPTIONS]\n\
   indexsail batch --index INDEX.idx --topics TOPICS --run RUN.txt [OPTIONS]\n\
+  indexsail shard-batch --index SHARDS.idx --topics TOPICS --run RUN.txt [OPTIONS]\n\
   indexsail inspect --index INDEX.idx [--field NAME --term TERM]\n\
-  indexsail benchmark [--documents N] [--queries N] [--seed N] [--top-k N] [--json FILE]\n\
+  indexsail shard-inspect --index SHARDS.idx [--field NAME --term TERM]\n\
+  indexsail benchmark [--documents N] [--queries N] [--seed N] [--top-k N] [--shards N] [--json FILE]\n\
 \n\
 SEARCH OPTIONS:\n\
   --field NAME             Restrict all query terms to one field\n\
@@ -63,9 +68,13 @@ where
             writeln!(output, "indexsail {}", env!("CARGO_PKG_VERSION")).map_err(Error::from)
         }
         "index" => command_index(&remaining, &mut output),
+        "shard-index" => command_shard_index(&remaining, &mut output),
         "search" => command_search(&remaining, &mut output),
+        "shard-search" => command_shard_search(&remaining, &mut output),
         "batch" => command_batch(&remaining, &mut output),
+        "shard-batch" => command_shard_batch(&remaining, &mut output),
         "inspect" => command_inspect(&remaining, &mut output),
+        "shard-inspect" => command_shard_inspect(&remaining, &mut output),
         "benchmark" => command_benchmark(&remaining, &mut output),
         unknown => Err(Error::InvalidArgument(format!(
             "unknown command '{unknown}'; run 'indexsail help'"
@@ -91,15 +100,11 @@ fn command_index(arguments: &[String], output: &mut impl Write) -> Result<()> {
     } else {
         AnalysisMode::Unicode
     };
-    let index = match parsed.optional_one("--format")?.unwrap_or("tsv") {
-        "tsv" => index_tsv(input, Analyzer::new(mode))?,
-        "trec" => index_trec_collection(input, Analyzer::new(mode))?,
-        value => {
-            return Err(Error::InvalidArgument(format!(
-                "unknown collection format '{value}', expected tsv or trec"
-            )));
-        }
-    };
+    let index = index_collection(
+        input,
+        Analyzer::new(mode),
+        parsed.optional_one("--format")?.unwrap_or("tsv"),
+    )?;
     index.save(destination)?;
     let stats = index.stats();
     writeln!(
@@ -110,9 +115,76 @@ fn command_index(arguments: &[String], output: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
+fn command_shard_index(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let parsed = ParsedOptions::parse(
+        arguments,
+        &["--ascii"],
+        &["--input", "--output", "--format", "--shards"],
+    )?;
+    let input = parsed.required_one("--input")?;
+    let destination = parsed.required_one("--output")?;
+    if paths_conflict(input, destination)? {
+        return Err(Error::InvalidArgument(
+            "index input and output paths must be distinct".into(),
+        ));
+    }
+    let mode = if parsed.flag("--ascii") {
+        AnalysisMode::Ascii
+    } else {
+        AnalysisMode::Unicode
+    };
+    let shard_count = parse_optional(parsed.optional_one("--shards")?, 0_usize, "shards")?;
+    let index = index_sharded_collection(
+        input,
+        Analyzer::new(mode),
+        parsed.optional_one("--format")?.unwrap_or("tsv"),
+        shard_count,
+    )?;
+    index.save(destination)?;
+    let stats = index.stats();
+    writeln!(
+        output,
+        "indexed shards={} documents={} fields={} terms={} postings={} tokens={} output={}",
+        index.shard_count(),
+        stats.documents,
+        stats.fields,
+        stats.terms,
+        stats.postings,
+        stats.tokens,
+        destination
+    )?;
+    Ok(())
+}
+
+fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = parse_search_arguments(arguments)?;
+    let index_path = parsed.required_one("--index")?;
+    let index = InvertedIndex::load(index_path)?;
+    let (query, options) = build_search_request(&parsed, index.analyzer())?;
+    let pruning = options.pruning;
+    let outcome = index.search(&query, options)?;
+    write_search_output(&outcome, pruning, |doc_id| index.document(doc_id), output)
+}
+
+fn command_shard_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = parse_search_arguments(arguments)?;
+    let index_path = parsed.required_one("--index")?;
+    let index = ShardedIndex::load(index_path)?;
+    let (query, options) = build_search_request(&parsed, index.analyzer())?;
+    let pruning = options.pruning;
+    let outcome = index.search(&query, options)?;
+    write_search_output(&outcome, pruning, |doc_id| index.document(doc_id), output)?;
+    writeln!(
+        output,
+        "collection=sharded shards={} global_documents={}",
+        index.shard_count(),
+        index.document_count()
+    )?;
+    Ok(())
+}
+
+fn parse_search_arguments(arguments: &[String]) -> Result<ParsedOptions> {
+    ParsedOptions::parse(
         arguments,
         &["--explain"],
         &[
@@ -128,12 +200,16 @@ fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
             "--k1",
             "--b",
         ],
-    )?;
-    let index_path = parsed.required_one("--index")?;
+    )
+}
+
+fn build_search_request(
+    parsed: &ParsedOptions,
+    analyzer: Analyzer,
+) -> Result<(SearchQuery, SearchOptions)> {
     let query_text = parsed.required_one("--query")?;
-    let index = InvertedIndex::load(index_path)?;
     let field = parsed.optional_one("--field")?;
-    let mut query = SearchQuery::from_text(index.analyzer(), query_text, field)?;
+    let mut query = SearchQuery::from_text(analyzer, query_text, field)?;
     query = query.with_operator(match parsed.optional_one("--operator")?.unwrap_or("or") {
         "and" => BooleanOperator::And,
         "or" => BooleanOperator::Or,
@@ -146,11 +222,7 @@ fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
 
     if let Some(phrase) = parsed.optional_one("--phrase")? {
         let phrase_field = parsed.optional_one("--phrase-field")?.map(str::to_owned);
-        query = query.with_phrase(PhraseFilter::from_text(
-            index.analyzer(),
-            phrase,
-            phrase_field,
-        )?);
+        query = query.with_phrase(PhraseFilter::from_text(analyzer, phrase, phrase_field)?);
     } else if parsed.optional_one("--phrase-field")?.is_some() {
         return Err(Error::InvalidArgument(
             "--phrase-field requires --phrase".into(),
@@ -177,19 +249,26 @@ fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
             )));
         }
     };
-    let outcome = index.search(
-        &query,
+    Ok((
+        query,
         SearchOptions {
             top_k,
             pruning,
             explain: parsed.flag("--explain"),
             bm25: Bm25Params { k1, b },
         },
-    )?;
+    ))
+}
 
+fn write_search_output<'a>(
+    outcome: &SearchOutcome,
+    pruning: PruningStrategy,
+    document: impl Fn(InternalDocId) -> Option<&'a Document>,
+    output: &mut impl Write,
+) -> Result<()> {
     writeln!(output, "rank\tscore\tid\ttitle")?;
     for (rank, hit) in outcome.hits.iter().enumerate() {
-        let document = index.document(hit.doc_id).expect("hit document exists");
+        let document = document(hit.doc_id).expect("hit document exists");
         let title = document
             .field("title")
             .unwrap_or("")
@@ -235,6 +314,16 @@ fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
 
 #[allow(clippy::too_many_lines)]
 fn command_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    command_batch_impl(arguments, output, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn command_shard_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    command_batch_impl(arguments, output, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bool) -> Result<()> {
     let parsed = ParsedOptions::parse(
         arguments,
         &["--verify"],
@@ -278,7 +367,6 @@ fn command_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
         ));
     }
 
-    let index = InvertedIndex::load(index_path)?;
     let topics = load_topics(topics_path)?;
     let qrels = parsed
         .optional_one("--qrels")?
@@ -315,7 +403,20 @@ fn command_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
             b: parse_optional(parsed.optional_one("--b")?, 0.75_f64, "b")?,
         },
     };
-    let report = evaluate_batch(&index, &topics, qrels.as_ref(), config)?;
+    let (report, shard_count) = if sharded {
+        let index = ShardedIndex::load(index_path)?;
+        let shard_count = index.shard_count();
+        (
+            evaluate_batch(&index, &topics, qrels.as_ref(), config)?,
+            Some(shard_count),
+        )
+    } else {
+        let index = InvertedIndex::load(index_path)?;
+        (
+            evaluate_batch(&index, &topics, qrels.as_ref(), config)?,
+            None,
+        )
+    };
 
     let run_file = File::create(run_path)?;
     let mut run_writer = BufWriter::new(run_file);
@@ -363,6 +464,9 @@ fn command_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
     }
     if let Some(path) = report_path {
         writeln!(output, "report={path}")?;
+    }
+    if let Some(shard_count) = shard_count {
+        writeln!(output, "collection=sharded shards={shard_count}")?;
     }
     Ok(())
 }
@@ -459,12 +563,117 @@ fn command_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> 
     Ok(())
 }
 
+fn command_shard_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(arguments, &[], &["--index", "--field", "--term"])?;
+    let path = parsed.required_one("--index")?;
+    let index = ShardedIndex::load(path)?;
+    let format_version = persisted_sharded_format_version(path)?;
+    let stats = index.stats();
+    let embedded_versions = index
+        .embedded_format_versions()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let embedded_format = if embedded_versions.len() == 1 {
+        format!(
+            "IndexSail-v{}",
+            embedded_versions.iter().next().expect("one version")
+        )
+    } else {
+        format!(
+            "mixed({})",
+            embedded_versions
+                .iter()
+                .map(|version| format!("IndexSail-v{version}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    writeln!(
+        output,
+        "format=IndexSail-sharded-v{} embedded_format={} analyzer={:?} file_bytes={} shards={}",
+        format_version,
+        embedded_format,
+        index.analyzer().mode(),
+        std::fs::metadata(path)?.len(),
+        index.shard_count()
+    )?;
+    writeln!(
+        output,
+        "documents={} fields={} terms={} postings={} tokens={}",
+        stats.documents, stats.fields, stats.terms, stats.postings, stats.tokens
+    )?;
+    for shard in index.physical_shard_stats() {
+        writeln!(
+            output,
+            "shard={} documents={} fields={} terms={} postings={} tokens={}",
+            shard.shard_id,
+            shard.documents,
+            shard.fields,
+            shard.terms,
+            shard.postings,
+            shard.tokens
+        )?;
+    }
+    for field in index.fields() {
+        writeln!(
+            output,
+            "field={} global_avg_length={:.3}",
+            field,
+            index.average_field_length(field)
+        )?;
+    }
+
+    match (
+        parsed.optional_one("--field")?,
+        parsed.optional_one("--term")?,
+    ) {
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err(Error::InvalidArgument("--field requires --term".into()));
+        }
+        (field, Some(raw_term)) => {
+            let normalized = index.analyzer().normalize_single(raw_term).ok_or_else(|| {
+                Error::InvalidArgument("--term must analyze to exactly one token".into())
+            })?;
+            let fields = match field {
+                Some(field) => vec![field],
+                None => index.fields().into_iter().collect(),
+            };
+            for field in fields {
+                writeln!(
+                    output,
+                    "term={} field={} global_df={}",
+                    normalized,
+                    field,
+                    index.document_frequency(field, &normalized)
+                )?;
+                for shard_id in 0..index.shard_count() {
+                    let frequency = index
+                        .shard(shard_id)
+                        .expect("shard id is in range")
+                        .document_frequency(field, &normalized);
+                    writeln!(output, "  shard={shard_id} df={frequency}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let parsed = ParsedOptions::parse(
         arguments,
         &[],
-        &["--documents", "--queries", "--seed", "--top-k", "--json"],
+        &[
+            "--documents",
+            "--queries",
+            "--seed",
+            "--top-k",
+            "--shards",
+            "--json",
+        ],
     )?;
     let config = BenchmarkConfig {
         documents: parse_optional(
@@ -487,6 +696,11 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
             BenchmarkConfig::default().top_k,
             "top-k",
         )?,
+        shards: parse_optional(
+            parsed.optional_one("--shards")?,
+            BenchmarkConfig::default().shards,
+            "shards",
+        )?,
     };
     let report = run_benchmark(config)?;
     if let Some(path) = parsed.optional_one("--json")? {
@@ -497,8 +711,8 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
     }
     writeln!(
         output,
-        "config documents={} queries={} top_k={} seed={}",
-        config.documents, config.queries, config.top_k, config.seed
+        "config documents={} queries={} top_k={} shards={} seed={}",
+        config.documents, config.queries, config.top_k, config.shards, config.seed
     )?;
     writeln!(
         output,
@@ -540,6 +754,18 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
         report.maxscore_stats.postings_advanced,
         report.maxscore_stats.postings_skipped
     )?;
+    writeln!(
+        output,
+        "sharded-block-max-wand shards={} build_elapsed_ms={:.3} search_elapsed_ms={:.3} evaluated={} advanced={} skipped={} postings_scanned_for_bounds={} serialized_bytes={}",
+        report.config.shards,
+        report.sharded_build_time.as_secs_f64() * 1000.0,
+        report.sharded_time.as_secs_f64() * 1000.0,
+        report.sharded_stats.evaluated_candidates,
+        report.sharded_stats.postings_advanced,
+        report.sharded_stats.postings_skipped,
+        report.sharded_stats.block_max_postings_scanned,
+        report.sharded_index_bytes
+    )?;
     writeln!(output, "verified=true checksum={:016x}", report.checksum)?;
     writeln!(
         output,
@@ -565,7 +791,55 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
     Ok(())
 }
 
+fn index_collection(
+    path: impl AsRef<Path>,
+    analyzer: Analyzer,
+    format: &str,
+) -> Result<InvertedIndex> {
+    match format {
+        "tsv" => index_tsv(path, analyzer),
+        "trec" => index_trec_collection(path, analyzer),
+        value => Err(Error::InvalidArgument(format!(
+            "unknown collection format '{value}', expected tsv or trec"
+        ))),
+    }
+}
+
+fn index_sharded_collection(
+    path: impl AsRef<Path>,
+    analyzer: Analyzer,
+    format: &str,
+    shard_count: usize,
+) -> Result<ShardedIndex> {
+    match format {
+        "tsv" => index_tsv_sharded(path, analyzer, shard_count),
+        "trec" => index_trec_collection_sharded(path, analyzer, shard_count),
+        value => Err(Error::InvalidArgument(format!(
+            "unknown collection format '{value}', expected tsv or trec"
+        ))),
+    }
+}
+
 fn index_tsv(path: impl AsRef<Path>, analyzer: Analyzer) -> Result<InvertedIndex> {
+    let mut builder = IndexBuilder::new(analyzer);
+    visit_tsv(path, |document| builder.add_document(document).map(|_| ()))?;
+    Ok(builder.finish())
+}
+
+fn index_tsv_sharded(
+    path: impl AsRef<Path>,
+    analyzer: Analyzer,
+    shard_count: usize,
+) -> Result<ShardedIndex> {
+    let mut builder = ShardedIndexBuilder::new(analyzer, shard_count)?;
+    visit_tsv(path, |document| builder.add_document(document).map(|_| ()))?;
+    Ok(builder.finish())
+}
+
+fn visit_tsv(
+    path: impl AsRef<Path>,
+    mut add_document: impl FnMut(Document) -> Result<()>,
+) -> Result<()> {
     let file = File::open(path)?;
     let mut lines = BufReader::new(file).lines();
     let header = lines
@@ -591,8 +865,6 @@ fn index_tsv(path: impl AsRef<Path>, analyzer: Analyzer) -> Result<InvertedIndex
         // Validate field names before processing an otherwise-empty corpus.
         Document::from_fields("header-validation", [(*field, "")])?;
     }
-
-    let mut builder = IndexBuilder::new(analyzer);
     for (line_index, line) in lines.enumerate() {
         let line = line?;
         let line = line.trim_end_matches('\r');
@@ -612,9 +884,9 @@ fn index_tsv(path: impl AsRef<Path>, analyzer: Analyzer) -> Result<InvertedIndex
             .iter()
             .zip(&values[1..])
             .map(|(name, value)| (*name, *value));
-        builder.add_document(Document::from_fields(values[0], fields)?)?;
+        add_document(Document::from_fields(values[0], fields)?)?;
     }
-    Ok(builder.finish())
+    Ok(())
 }
 
 fn parse_optional<T>(value: Option<&str>, default: T, label: &str) -> Result<T>
@@ -973,6 +1245,143 @@ mod tests {
         assert!(text.contains("\"verified_exact\": true"));
         assert!(text.contains("\"checksum\""));
         std::fs::remove_file(report).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sharded_cli_supports_index_search_inspect_and_batch() {
+        let corpus = temp_path("shard.tsv");
+        let index_path = temp_path("shards.idx");
+        let topics = temp_path("shard.topics");
+        let qrels = temp_path("shard.qrels");
+        let run = temp_path("shard.run");
+        let report = temp_path("shard.json");
+        std::fs::write(
+            &corpus,
+            "id\ttitle\tbody\tcategory\nD1\tRust Search\tfast local search\tguide\nD2\tGrid\tpower model\treference\nD3\tSailing\tlocal retrieval engine\tguide\nD4\tOther\tsearch system\tnote\n",
+        )
+        .unwrap();
+        std::fs::write(&topics, "1\tlocal search\n2\tpower model\n").unwrap();
+        std::fs::write(&qrels, "1 0 D1 2\n1 0 D3 1\n2 0 D2 2\n").unwrap();
+
+        let mut index_output = Vec::new();
+        execute(
+            [
+                "shard-index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                index_path.to_str().unwrap(),
+                "--shards",
+                "3",
+            ],
+            &mut index_output,
+        )
+        .unwrap();
+        let index_output = String::from_utf8(index_output).unwrap();
+        assert!(index_output.contains("shards=3 documents=4"));
+
+        let mut inspect_output = Vec::new();
+        execute(
+            [
+                "shard-inspect",
+                "--index",
+                index_path.to_str().unwrap(),
+                "--field",
+                "body",
+                "--term",
+                "local",
+            ],
+            &mut inspect_output,
+        )
+        .unwrap();
+        let inspect_output = String::from_utf8(inspect_output).unwrap();
+        assert!(inspect_output.contains("format=IndexSail-sharded-v1"));
+        assert!(inspect_output.contains("embedded_format=IndexSail-v3"));
+        assert!(inspect_output.contains("term=local field=body global_df=2"));
+        assert!(inspect_output.contains("shard=2 documents=1"));
+
+        let mut search_output = Vec::new();
+        execute(
+            [
+                "shard-search",
+                "--index",
+                index_path.to_str().unwrap(),
+                "--query",
+                "local search",
+                "--field",
+                "body",
+                "--strategy",
+                "block-max-wand",
+                "--explain",
+            ],
+            &mut search_output,
+        )
+        .unwrap();
+        let search_output = String::from_utf8(search_output).unwrap();
+        assert_eq!(search_output.lines().next(), Some("rank\tscore\tid\ttitle"));
+        assert!(search_output.contains("collection=sharded shards=3 global_documents=4"));
+        assert!(search_output.contains("D1\tRust Search"));
+        assert!(search_output.contains("df=2"));
+        assert!(search_output.contains("block_max_bounds_loaded=0"));
+        assert!(search_output.contains("block_max_postings_scanned="));
+
+        let mut batch_output = Vec::new();
+        execute(
+            [
+                "shard-batch",
+                "--index",
+                index_path.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--qrels",
+                qrels.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--report",
+                report.to_str().unwrap(),
+                "--field",
+                "body",
+                "--strategy",
+                "maxscore",
+                "--verify",
+            ],
+            &mut batch_output,
+        )
+        .unwrap();
+        let batch_output = String::from_utf8(batch_output).unwrap();
+        assert!(batch_output.contains("verified=true"));
+        assert!(batch_output.contains("collection=sharded shards=3"));
+        assert!(std::fs::read_to_string(&run).unwrap().contains("1 Q0 D1 1"));
+        assert!(
+            std::fs::read_to_string(&report)
+                .unwrap()
+                .contains("\"verified_exact\": true")
+        );
+
+        for path in [corpus, index_path, topics, qrels, run, report] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn shard_index_requires_an_explicit_valid_shard_count() {
+        let corpus = temp_path("invalid-shard.tsv");
+        let index_path = temp_path("invalid-shards.idx");
+        std::fs::write(&corpus, "id\tbody\n1\tone\n").unwrap();
+        let error = execute(
+            [
+                "shard-index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                index_path.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("shard count"));
+        std::fs::remove_file(corpus).unwrap();
     }
 
     #[test]

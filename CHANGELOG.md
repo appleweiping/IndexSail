@@ -4,7 +4,32 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
-No unreleased changes.
+## [0.5.0] - 2026-09-07
+
+- Added deterministic round-robin physical sharding with collection-wide BM25
+  document count, field totals, and per-field document frequencies. Every
+  shard is searched independently and its local top-k is mapped back to the
+  original global document IDs before a stable exact merge.
+- Added `ShardedIndex`, `ShardedIndexBuilder`, shard diagnostics, a checksummed
+  v1 container of independently validated v3 indexes, and embedded v1/v2/v3
+  index read compatibility. Loading rejects analyzer mismatches, duplicate
+  external IDs across shards, non-canonical shard populations, corruption,
+  truncation, and trailing bytes.
+- Added a seekable two-pass persistence path that verifies the complete outer
+  checksum before parsing and bounds raw-container memory to one embedded
+  shard. Diagnostics retain and report actual mixed legacy versions.
+- Hardened untrusted cutoffs: `usize::MAX` and cutoffs above the collection no
+  longer drive eager heap/vector reservation, including 4,096 mostly empty
+  shards. A hand-calculated cross-shard BM25 oracle freezes global statistics.
+- Added `shard-index`, `shard-search`, `shard-batch`, and `shard-inspect` CLI
+  workflows. TSV and TREC ingestion streams each record directly to its
+  physical builder instead of retaining a second monolithic index.
+  `evaluate_batch` now accepts monolithic and sharded retrieval backends
+  through one public trait.
+- Extended the correctness benchmark with a configurable sharded block-max
+  pass checked bit-for-bit against the monolithic exhaustive oracle; benchmark
+  JSON schema version 5 records sharded build/search time, serialized bytes,
+  counters, and physical shard count.
 
 ## [0.4.0] - 2026-09-07
 

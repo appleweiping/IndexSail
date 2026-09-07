@@ -77,3 +77,12 @@ jobs:
           cargo run --locked --release -- batch --index target/ci.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci.run --report target/ci-report.json --field body --top-k 10 --verify
           test -s target/ci.run
           test -s target/ci-report.json
+      - name: Sharded TREC lifecycle smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo run --locked --release -- shard-index --input examples/collection.trec --output target/ci-shards.idx --format trec --shards 3
+          cargo run --locked --release -- shard-inspect --index target/ci-shards.idx --field body --term search
+          cargo run --locked --release -- shard-batch --index target/ci-shards.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-shards.run --report target/ci-shards-report.json --field body --top-k 10 --strategy block-max-wand --verify
+          test -s target/ci-shards.idx
+          test -s target/ci-shards.run
+          test -s target/ci-shards-report.json

@@ -4,11 +4,41 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
+use crate::analysis::Analyzer;
 use crate::error::{Error, Result};
 use crate::index::InvertedIndex;
 use crate::query::{BooleanOperator, SearchQuery};
-use crate::search::{Bm25Params, PruningStrategy, SearchHit, SearchOptions, SearchStats};
+use crate::search::{
+    Bm25Params, PruningStrategy, SearchHit, SearchOptions, SearchOutcome, SearchStats,
+};
+use crate::shard::ShardedIndex;
 use crate::trec::{Qrels, Topic};
+
+/// Common batch-evaluation surface for monolithic and sharded collections.
+pub trait RetrievalBackend {
+    fn analyzer(&self) -> Analyzer;
+    fn search(&self, query: &SearchQuery, options: SearchOptions) -> Result<SearchOutcome>;
+}
+
+impl RetrievalBackend for InvertedIndex {
+    fn analyzer(&self) -> Analyzer {
+        InvertedIndex::analyzer(self)
+    }
+
+    fn search(&self, query: &SearchQuery, options: SearchOptions) -> Result<SearchOutcome> {
+        InvertedIndex::search(self, query, options)
+    }
+}
+
+impl RetrievalBackend for ShardedIndex {
+    fn analyzer(&self) -> Analyzer {
+        ShardedIndex::analyzer(self)
+    }
+
+    fn search(&self, query: &SearchQuery, options: SearchOptions) -> Result<SearchOutcome> {
+        ShardedIndex::search(self, query, options)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BatchConfig {
@@ -73,8 +103,8 @@ pub struct BatchReport {
 
 /// Execute topics in input order, optionally evaluate qrels and cross-check
 /// every result against the other executor.
-pub fn evaluate_batch(
-    index: &InvertedIndex,
+pub fn evaluate_batch<B: RetrievalBackend + ?Sized>(
+    index: &B,
     topics: &[Topic],
     qrels: Option<&Qrels>,
     config: BatchConfig,

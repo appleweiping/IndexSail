@@ -6,6 +6,7 @@ use crate::index::{
     BLOCK_POSTINGS, BlockMaxKey, BlockMaxMetadata, InternalDocId, InvertedIndex, Posting,
 };
 use crate::query::{BooleanOperator, PhraseFilter, SearchQuery};
+use crate::shard::GlobalStatistics;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bm25Params {
@@ -80,7 +81,7 @@ impl Default for SearchOptions {
 }
 
 impl SearchOptions {
-    fn validate(self) -> Result<Self> {
+    pub(crate) fn validate(self) -> Result<Self> {
         if self.top_k == 0 {
             return Err(Error::InvalidArgument(
                 "top_k must be greater than zero".into(),
@@ -211,7 +212,10 @@ impl TopK {
     fn new(limit: usize) -> Self {
         Self {
             limit,
-            heap: BinaryHeap::with_capacity(limit),
+            // A caller may legitimately ask for more results than the
+            // collection contains. Grow only for candidates that actually
+            // exist instead of reserving attacker-controlled `top_k` bytes.
+            heap: BinaryHeap::new(),
         }
     }
 
@@ -419,6 +423,30 @@ impl InvertedIndex {
     }
 
     pub fn search(&self, query: &SearchQuery, options: SearchOptions) -> Result<SearchOutcome> {
+        self.search_with_statistics(query, options, None)
+    }
+
+    /// Search one physical shard with collection-wide scoring statistics.
+    ///
+    /// This stays crate-private because only [`crate::shard::ShardedIndex`]
+    /// can construct and validate a complete statistics snapshot. Exposing an
+    /// unchecked document-frequency override would make pruning bounds and
+    /// scores unsound.
+    pub(crate) fn search_with_global_statistics(
+        &self,
+        query: &SearchQuery,
+        options: SearchOptions,
+        statistics: &GlobalStatistics,
+    ) -> Result<SearchOutcome> {
+        self.search_with_statistics(query, options, Some(statistics))
+    }
+
+    fn search_with_statistics(
+        &self,
+        query: &SearchQuery,
+        options: SearchOptions,
+        statistics: Option<&GlobalStatistics>,
+    ) -> Result<SearchOutcome> {
         let options = options.validate()?;
         let prepared_terms = self.prepare_terms(query)?;
         let mut scorers = prepared_terms
@@ -430,6 +458,7 @@ impl InvertedIndex {
                     term,
                     options.bm25,
                     options.pruning == PruningStrategy::BlockMaxWand,
+                    statistics,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -490,9 +519,15 @@ impl InvertedIndex {
                     doc_id: entry.doc_id,
                     external_id: document.external_id().to_owned(),
                     score: entry.score,
-                    explanation: options
-                        .explain
-                        .then(|| self.explain(entry.doc_id, &prepared_terms, options.bm25, query)),
+                    explanation: options.explain.then(|| {
+                        self.explain(
+                            entry.doc_id,
+                            &prepared_terms,
+                            options.bm25,
+                            query,
+                            statistics,
+                        )
+                    }),
                 }
             })
             .collect();
@@ -537,6 +572,7 @@ impl InvertedIndex {
         term: &PreparedTerm,
         params: Bm25Params,
         load_block_max: bool,
+        statistics: Option<&GlobalStatistics>,
     ) -> Result<TermScorer> {
         let fields: Vec<&str> = match term.field.as_deref() {
             Some(field) => vec![field],
@@ -547,13 +583,21 @@ impl InvertedIndex {
             let Some(postings) = self.postings(field, &term.normalized) else {
                 continue;
             };
-            let document_frequency = postings.len();
-            let average_length = self.average_field_length(field);
+            let document_frequency = statistics.map_or(postings.len(), |statistics| {
+                statistics.document_frequency(field, &term.normalized)
+            });
+            let document_count = statistics.map_or(self.documents().len(), |statistics| {
+                statistics.document_count()
+            });
+            let average_length = statistics.map_or_else(
+                || self.average_field_length(field),
+                |statistics| statistics.average_field_length(field),
+            );
             for posting in postings {
                 let contribution = bm25_score(
                     posting.term_frequency,
                     document_frequency,
-                    self.documents().len(),
+                    document_count,
                     self.field_length(posting.doc_id, field),
                     average_length,
                     params,
@@ -603,7 +647,8 @@ impl InvertedIndex {
                 // Default, unit-boost queries use tight persisted bounds. All other
                 // valid options derive conservative bounds from their exact scores.
                 let defaults = Bm25Params::default();
-                let use_tight_bounds = params.k1.to_bits() == defaults.k1.to_bits()
+                let use_tight_bounds = statistics.is_none()
+                    && params.k1.to_bits() == defaults.k1.to_bits()
                     && params.b.to_bits() == defaults.b.to_bits()
                     && term.boost.to_bits() == 1.0_f64.to_bits();
                 if use_tight_bounds {
@@ -930,6 +975,7 @@ impl InvertedIndex {
         terms: &[PreparedTerm],
         params: Bm25Params,
         query: &SearchQuery,
+        statistics: Option<&GlobalStatistics>,
     ) -> Explanation {
         let mut contributions = Vec::new();
         for term in terms {
@@ -944,14 +990,21 @@ impl InvertedIndex {
                 let Some(posting) = posting_for_doc(postings, doc_id) else {
                     continue;
                 };
-                let document_frequency = postings.len();
-                let average_document_length = self.average_field_length(field);
-                let inverse_document_frequency =
-                    bm25_idf(self.documents().len(), document_frequency);
+                let document_frequency = statistics.map_or(postings.len(), |statistics| {
+                    statistics.document_frequency(field, &term.normalized)
+                });
+                let document_count = statistics.map_or(self.documents().len(), |statistics| {
+                    statistics.document_count()
+                });
+                let average_document_length = statistics.map_or_else(
+                    || self.average_field_length(field),
+                    |statistics| statistics.average_field_length(field),
+                );
+                let inverse_document_frequency = bm25_idf(document_count, document_frequency);
                 let score = bm25_score(
                     posting.term_frequency,
                     document_frequency,
-                    self.documents().len(),
+                    document_count,
                     self.field_length(doc_id, field),
                     average_document_length,
                     params,
@@ -1671,7 +1724,7 @@ mod tests {
             boost: 1.0,
         };
         let scorer = index
-            .build_term_scorer(0, &term, Bm25Params::default(), true)
+            .build_term_scorer(0, &term, Bm25Params::default(), true, None)
             .unwrap();
         assert!(scorer.entries.len() > BLOCK_POSTINGS, "corpus too small");
         assert_eq!(
@@ -1734,7 +1787,9 @@ mod tests {
                     field: None,
                     boost,
                 };
-                let scorer = index.build_term_scorer(0, &term, params, true).unwrap();
+                let scorer = index
+                    .build_term_scorer(0, &term, params, true, None)
+                    .unwrap();
                 assert_eq!(scorer.precomputed_block_bounds_loaded, 0);
                 assert_eq!(
                     scorer.postings_scanned_for_block_bounds,
@@ -1802,6 +1857,7 @@ mod tests {
                 },
                 Bm25Params::default(),
                 true,
+                None,
             )
             .unwrap();
 
@@ -1833,6 +1889,7 @@ mod tests {
                 },
                 Bm25Params::default(),
                 true,
+                None,
             )
             .unwrap();
         assert_eq!(scorer.block_max[0].to_bits(), altered.to_bits());

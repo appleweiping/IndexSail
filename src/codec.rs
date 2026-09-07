@@ -210,13 +210,34 @@ fn decode_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32> {
     ))
 }
 
-pub(crate) fn checksum(bytes: &[u8]) -> u64 {
-    let mut value = 0xcbf2_9ce4_8422_2325_u64;
-    for &byte in bytes {
-        value ^= u64::from(byte);
-        value = value.wrapping_mul(0x0000_0100_0000_01b3);
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Checksum {
+    value: u64,
+}
+
+impl Checksum {
+    pub(crate) const fn new() -> Self {
+        Self {
+            value: 0xcbf2_9ce4_8422_2325_u64,
+        }
     }
-    value
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.value ^= u64::from(byte);
+            self.value = self.value.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    pub(crate) const fn finish(self) -> u64 {
+        self.value
+    }
+}
+
+pub(crate) fn checksum(bytes: &[u8]) -> u64 {
+    let mut checksum = Checksum::new();
+    checksum.update(bytes);
+    checksum.finish()
 }
 
 #[cfg(test)]
@@ -283,6 +304,16 @@ mod tests {
     fn checksum_is_stable_and_sensitive() {
         assert_eq!(checksum(b"IndexSail"), 0x7db0_e97a_206f_511e);
         assert_ne!(checksum(b"IndexSail"), checksum(b"indexsail"));
+    }
+
+    #[test]
+    fn incremental_checksum_matches_one_shot_checksum() {
+        let bytes = b"a deterministic payload split across arbitrary chunks";
+        let mut incremental = Checksum::new();
+        incremental.update(&bytes[..7]);
+        incremental.update(&bytes[7..31]);
+        incremental.update(&bytes[31..]);
+        assert_eq!(incremental.finish(), checksum(bytes));
     }
 
     #[test]

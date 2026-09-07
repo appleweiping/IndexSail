@@ -7,7 +7,9 @@
 IndexSail is an information-retrieval experiment toolkit in safe Rust. It builds a
 field-aware positional index, ranks with BM25, executes exact exhaustive, WAND, block-max WAND, or MaxScore top-k
 queries, and runs
-reproducible TREC-style experiments from collection ingestion through metrics and run files.
+reproducible TREC-style experiments from collection ingestion through metrics and run files. A collection can also
+be partitioned into independently searchable physical shards while using collection-wide statistics and an exact,
+deterministic global top-k merge.
 
 The design favors observable algorithms, deterministic results, explicit format contracts, and strict
 input validation. It is useful for teaching, local research prototypes, regression oracles, and
@@ -20,12 +22,13 @@ experiments small enough to fit in one process.
 | Collection | UTF-8 TSV and a documented streaming subset of TREC SGML |
 | Analysis | Deterministic Unicode or ASCII tokenization, stored with the index |
 | Index | Named fields, stable external IDs, positions, field lengths, DF and collection statistics |
+| Sharding | Deterministic round-robin physical shards, global BM25 statistics, stable merged top-k |
 | Retrieval | BM25, `AND`/`OR`, fielded terms, phrases, exact field filters, explanations |
 | Execution | Exhaustive oracle, exact WAND, block-max WAND, and MaxScore with stable tie-breaking |
 | Experiments | TSV or classic TREC topics, qrels, six-column run files, JSON reports |
 | Metrics | MAP@k, MRR@k, nDCG@k, Recall@k, latency, candidates, advances and skips |
 | Verification | Optional per-query bit-exact executor/exhaustive comparison |
-| Storage | Checksummed v3 format with compressed postings and persisted block-max bounds; v1/v2 reads |
+| Storage | Checksummed v3 index format plus checksummed v1 sharded container; embedded v1/v2/v3 index reads |
 | Operations | CLI, library API, Linux/Windows CI, strict Clippy, rustfmt and release tests |
 
 IndexSail has one exactly pinned runtime dependency: the pure-Rust `libm` implementation used for
@@ -38,6 +41,9 @@ flowchart LR
     A[TSV or TREC collection] --> B[Unicode or ASCII analyzer]
     B --> C[Field-aware positional index]
     C --> D[v3 checksum + compressed postings + block bounds]
+    C --> S[Round-robin physical shards]
+    S --> G[Collection-wide N DF and field totals]
+    S --> SD[Checksummed sharded container]
     T[TSV or classic TREC topics] --> Q[Typed batch queries]
     D --> E{Exact executor}
     Q --> E
@@ -48,6 +54,7 @@ flowchart LR
     X --> K[Stable top-k]
     W --> K
     BW --> K
+    G --> E
     K --> R[Six-column TREC run]
     J[Four-column qrels] --> M[MAP MRR nDCG Recall]
     K --> M
@@ -102,6 +109,60 @@ cargo run --release -- inspect \
 
 `inspect` reports collection statistics, persisted file size, and fixed-width versus encoded posting
 bytes. It can also display one normalized posting list.
+
+## Deterministic physical sharding
+
+`shard-index` streams TSV or TREC records directly into round-robin physical builders, assigning global
+insertion IDs without first retaining a second monolithic index. `shard-search` queries each shard independently, but computes every BM25 value from one aggregate
+snapshot: global document count, per-field token totals, and per-field term document frequencies. It then
+maps local IDs back to original global IDs and merges the shard-local top-k lists by score descending and
+global ID ascending.
+
+```shell
+cargo run --release -- shard-index \
+  --input examples/corpus.tsv \
+  --output target/corpus.shards.idx \
+  --shards 4
+
+cargo run --release -- shard-search \
+  --index target/corpus.shards.idx \
+  --query "search ranking" \
+  --strategy block-max-wand \
+  --top-k 5 \
+  --explain
+
+cargo run --release -- shard-inspect \
+  --index target/corpus.shards.idx \
+  --field body \
+  --term search
+```
+
+The format is a checksummed container of independently validated v3 indexes. It stores the global document
+count and physical shard count, while the global scoring snapshot is recomputed from validated shard data on
+load. The round-robin mapping needs no routing table: `shard = global_id % shard_count` and
+`local_id = global_id / shard_count`. Duplicate external IDs across shards, analyzer disagreement, an invalid
+shard population, checksum damage, truncation, and trailing bytes are rejected.
+
+Persistence uses a bounded two-pass protocol. Writing counts and checksums deterministic shard bytes before
+emitting them; loading requires a seekable source, validates the outer checksum and EOF in 8-KiB chunks, then
+parses one embedded index at a time. `shard-inspect` reports the observed embedded version set, including mixed
+v1/v2/v3 containers, rather than assuming the current writer version.
+
+`shard-batch` accepts the same topics, qrels, run, report, scoring, and `--verify` options as `batch`. The
+library's generic `evaluate_batch` API accepts either `InvertedIndex` or `ShardedIndex` through the
+`RetrievalBackend` contract.
+
+Run the complete committed example with
+[`examples/shard_demo.sh`](examples/shard_demo.sh) or
+[`examples/shard_demo.ps1`](examples/shard_demo.ps1).
+
+The exactness claim is executable: deterministic tests compare every sharded executor against a monolithic
+exhaustive oracle over OR/AND queries, multiple cutoffs, custom BM25 parameters, fielded and unfielded terms,
+phrases, filters, explanations, equal-score ties, empty shards, and persistence round trips. Comparisons
+require identical global document IDs, order, and IEEE-754 score bits. For sharded block-max WAND, local
+persisted bounds are deliberately not reused because they were built from local statistics; conservative
+bounds are instead derived from the globally scored postings and counted in
+`block_max_postings_scanned`.
 
 ## Reproducible TREC-style experiment
 
@@ -250,7 +311,7 @@ apply. `AND` queries use the exact intersection walk because MaxScore's essentia
 defined for disjunctive retrieval.
 
 ```bash
-indexsail search corpus.idx "local search ranking" --strategy maxscore
+indexsail search --index corpus.idx --query "local search ranking" --strategy maxscore
 ```
 
 The executor reports the same `evaluated`, `advanced`, and `skipped` counters as WAND. Batch `--verify`
@@ -263,7 +324,7 @@ every other document in the list. Remembering a maximum for each run of 64 posti
 low-impact documents be skipped in one step instead of one document at a time.
 
 ```bash
-indexsail search corpus.idx "local search ranking" --strategy block-max-wand
+indexsail search --index corpus.idx --query "local search ranking" --strategy block-max-wand
 ```
 
 The ranking is unchanged. A block maximum is a true upper bound inside its block, the bound covers every
@@ -347,6 +408,24 @@ assert_eq!(outcome.hits[0].external_id, "doc-1");
 The public batch API exposes `Topic`, `Qrels`, `BatchConfig`, `evaluate_batch`, `write_trec_run`, and
 `write_json_report`, so experiments do not have to invoke the CLI.
 
+To create a sharded collection from the same input order:
+
+```rust
+use indexsail::{Analyzer, Document, SearchOptions, SearchQuery, ShardedIndexBuilder};
+
+let analyzer = Analyzer::default();
+let mut builder = ShardedIndexBuilder::new(analyzer, 4)?;
+builder.add_document(Document::from_fields(
+    "doc-1",
+    [("body", "globally scored physical shards")],
+)?)?;
+let index = builder.finish();
+let query = SearchQuery::from_text(analyzer, "physical shards", Some("body"))?;
+let outcome = index.search(&query, SearchOptions::default())?;
+assert_eq!(outcome.hits[0].doc_id, 0);
+# Ok::<(), indexsail::Error>(())
+```
+
 ## 100k-document reproducible benchmark
 
 ```shell
@@ -377,8 +456,9 @@ workload the tighter bounds removed only 837 additional candidates; the overlapp
 do not establish a latency win. These numbers describe one machine and workload, not universal performance.
 The benchmark queries the just-built resident index and serializes it afterward; “precomputed” does not
 claim a disk reload in this measurement. The script writes configuration, timings, work and storage counters, compression statistics,
-and checksum as schema-version-4 JSON. The table above is a frozen v0.3.0 observation and therefore omits
-the MaxScore row; current reports include its timing and pruning counters. Full environment and measurement notes are in
+and checksum as schema-version-5 JSON. The table above is a frozen v0.3.0 observation and therefore omits
+the MaxScore and sharded rows; current reports include MaxScore plus a configurable sharded block-max pass,
+its independently measured build/search times, serialized bytes, and global-bound preparation counters. Full environment and measurement notes are in
 [docs/benchmark.md](docs/benchmark.md).
 
 ## Reproducibility contract
@@ -397,8 +477,9 @@ when publishing results.
 
 ## Scope and limitations
 
-IndexSail is currently an in-memory, single-process research toolkit. It does not implement incremental
-segments, deletion, distributed shards, memory mapping, language-specific stemming, stopword lists, fuzzy
+IndexSail is currently an in-memory, single-process research toolkit. Its physical shards are local and queried
+serially; they are not network-distributed workers. It does not implement incremental segments, deletion,
+replication, shard routing across services, memory mapping, language-specific stemming, stopword lists, fuzzy
 matching, learning-to-rank, query expansion, or concurrent writes. Block-max metadata is an immutable
 snapshot: it increases index-build work and file size in exchange for removing the additional bound-
 derivation scan from default-BM25, unit-boost block-max queries. Custom parameters derive conservative
@@ -415,6 +496,12 @@ than production engines.
 - S. Robertson and H. Zaragoza, “The Probabilistic Relevance Framework: BM25 and Beyond,” 2009.
 - A. Broder et al., “Efficient Query Evaluation using a Two-Level Retrieval Process,” 2003.
 - K. Järvelin and J. Kekäläinen, “Cumulated Gain-Based Evaluation of IR Techniques,” 2002.
+- [PISA project overview at `e88b09f`](https://github.com/pisa-engine/pisa/blob/e88b09fedba2da15e3afa2345648b4407cb105f1/README.md) and
+  its [`partition_fwd_index`](https://github.com/pisa-engine/pisa/blob/e88b09fedba2da15e3afa2345648b4407cb105f1/tools/partition_fwd_index.cpp) and
+  [`shards`](https://github.com/pisa-engine/pisa/blob/e88b09fedba2da15e3afa2345648b4407cb105f1/tools/shards.cpp) tools, together with the
+  [official sharding documentation](https://pisa.readthedocs.io/en/latest/sharding.html), consulted for the
+  research-tool capability taxonomy (parsing, indexing, sharding, compression, query processing, and document
+  reordering).
 
 These references define standard retrieval ideas and evaluation measures; IndexSail's behavior is specified
 by this repository's code, tests, and format documentation.

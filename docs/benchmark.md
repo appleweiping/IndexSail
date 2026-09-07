@@ -2,13 +2,15 @@
 
 These are correctness-backed observations for deterministic synthetic workloads, not general throughput
 claims. The benchmark constructs one in-memory index, runs exhaustive retrieval, runs WAND, block-max WAND,
-and MaxScore, compares every ranked document and score against the exhaustive results, and only then emits
+MaxScore, and a configurable physical-shard block-max pass. It compares every ranked document and score against the exhaustive results, and only then emits
 `verified=true` and a checksum.
 
 The numeric table below is a frozen v0.3.0 storage/query-work observation and
 therefore lists the three executors that existed in that release. Current
 v0.4.0 benchmark JSON additionally records `maxscore_elapsed_micros` and a
-`maxscore` counter object; the same exactness checks run before `verified=true`
+`maxscore` counter object. Current schema-version-5 reports also record the
+physical shard count, sharded build/search durations, serialized bytes, and
+global-bound work counters; the same exactness checks run before `verified=true`
 is emitted.
 
 ## Version 3 storage/query-work measurement
@@ -72,7 +74,31 @@ The near-uniform generator is unfavorable to block-max pruning: it removed only 
 (0.074%). The wide, overlapping timing ranges even reverse the WAND/block-max order, so they establish no
 latency win. The result is retained because storage and preparation savings must not be converted into a
 speed claim. Both generated v0.3.0 benchmark reports were parsed after their runs; those historical reports use
-`schema_version` 3. Current v0.4.0 reports use `schema_version` 4 and include the independently verified MaxScore pass.
+`schema_version` 3. v0.4.0 reports use `schema_version` 4 and include the independently verified MaxScore pass.
+v0.5.0 reports use `schema_version` 5 and additionally verify the sharded block-max pass against
+the same monolithic exhaustive result bits. Historical numbers above remain unchanged because they did not
+measure that pass.
+
+## Current physical-shard verification
+
+The current benchmark adds a separate sharded build and query pass. The shard count is explicit and does not
+alter the seeded collection or monolithic executor passes:
+
+```shell
+cargo run --locked --release -- benchmark \
+  --documents 100000 \
+  --queries 500 \
+  --top-k 10 \
+  --shards 4 \
+  --seed 42 \
+  --json target/benchmark-100k/report.json
+```
+
+`sharded_block_max_wand` is accepted only after every global document ID, rank, and score bit matches the
+monolithic exhaustive result for all queries. Its `serialized_bytes` is the complete sharded-container size.
+The sharded build/search durations remain environment-dependent. Because each physical index persists bounds
+computed from its local statistics, this globally scored pass derives safe bounds from exact scores and reports
+the work in `postings_scanned_for_bounds`; `precomputed_bounds_loaded` must remain zero.
 
 ## Historical WSL2 baseline
 
