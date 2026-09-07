@@ -4,6 +4,10 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## [0.4.0] - 2026-09-07
+
 - Added an exact `MaxScore` term-at-a-time executor for disjunctive queries.
   It uses essential-list upper-bound pruning, preserves complete-term scoring,
   post-filter and phrase semantics, deterministic ties, and bit-exact

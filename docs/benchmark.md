@@ -5,6 +5,12 @@ claims. The benchmark constructs one in-memory index, runs exhaustive retrieval,
 and MaxScore, compares every ranked document and score against the exhaustive results, and only then emits
 `verified=true` and a checksum.
 
+The numeric table below is a frozen v0.3.0 storage/query-work observation and
+therefore lists the three executors that existed in that release. Current
+v0.4.0 benchmark JSON additionally records `maxscore_elapsed_micros` and a
+`maxscore` counter object; the same exactness checks run before `verified=true`
+is emitted.
+
 ## Version 3 storage/query-work measurement
 
 Two consecutive runs measure the current persisted-bound implementation. They are observations from a
@@ -65,7 +71,8 @@ not CPU instructions or end-to-end speed.
 The near-uniform generator is unfavorable to block-max pruning: it removed only 837 candidates beyond WAND
 (0.074%). The wide, overlapping timing ranges even reverse the WAND/block-max order, so they establish no
 latency win. The result is retained because storage and preparation savings must not be converted into a
-speed claim. Both generated schema-version-3 JSON reports were parsed after their runs.
+speed claim. Both generated v0.3.0 benchmark reports were parsed after their runs; those historical reports use
+`schema_version` 3. Current v0.4.0 reports use `schema_version` 4 and include the independently verified MaxScore pass.
 
 ## Historical WSL2 baseline
 

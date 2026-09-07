@@ -377,7 +377,8 @@ workload the tighter bounds removed only 837 additional candidates; the overlapp
 do not establish a latency win. These numbers describe one machine and workload, not universal performance.
 The benchmark queries the just-built resident index and serializes it afterward; “precomputed” does not
 claim a disk reload in this measurement. The script writes configuration, timings, work and storage counters, compression statistics,
-and checksum as schema-version-3 JSON. Full environment and measurement notes are in
+and checksum as schema-version-4 JSON. The table above is a frozen v0.3.0 observation and therefore omits
+the MaxScore row; current reports include its timing and pruning counters. Full environment and measurement notes are in
 [docs/benchmark.md](docs/benchmark.md).
 
 ## Reproducibility contract
