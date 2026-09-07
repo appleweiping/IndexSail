@@ -21,9 +21,8 @@ jobs:
           toolchain: 1.85.0
       - run: cargo test --locked --all-targets
 
-  # The Python repositories in this suite run CodeQL. CodeQL support for Rust is
-  # still a preview, so this job audits the locked Rust dependency graph against
-  # the RustSec advisory database.
+  # CodeQL covers source-level findings; this job independently audits the
+  # locked Rust dependency graph against the RustSec advisory database.
   advisories:
     name: Dependency advisories
     runs-on: ubuntu-latest
