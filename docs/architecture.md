@@ -10,11 +10,13 @@
 | `query` | Typed terms, `AND`/`OR`, phrase constraints, and exact-field filters |
 | `search` | BM25 scorers, exhaustive/WAND/block-max WAND/MaxScore execution, stable heap, explanations and counters |
 | `shard` | Round-robin physical partitioning, global statistics, exact merge, v1 sharded container |
+| `ciff` | CIFF v1 model, bounded protobuf framing, d-gap validation, canonical export and portable BM25 |
 | `codec` | Posting gaps, base-128 variable bytes, codec statistics, payload checksum |
 | `persistence` | v3 writer, v3/v2/v1 readers, checksums, bounds and structural validation |
 | `trec` | Collection, topic and qrels adapters |
 | `evaluation` | Generic monolithic/sharded batch execution, executor oracle, metrics, run and JSON writers |
 | `benchmark` | Seeded workload, monolithic/sharded exhaustive oracle, checksum and JSON report |
+| `atomic` | Same-directory staged persistence and recoverable multi-output commits |
 | `cli` | Hand-written standard-library command parsing and end-to-end workflows |
 
 ## Build data flow
@@ -43,6 +45,10 @@ sequenceDiagram
         S->>S: global_id modulo shard_count
         S->>P: independently validated v3 shard snapshots
         P-->>U: checksummed sharded container v1
+    end
+    opt CIFF interchange
+        I->>P: flattened terms + global statistics
+        P-->>U: canonical delimited protobuf stream
     end
 ```
 
@@ -289,6 +295,28 @@ shard. This deliberate CPU-for-memory trade keeps format-v1 bytes stable.
 - Only documented content tags are extracted. Unknown nested markup is removed.
 
 The adapter is deterministic and narrow. It is not an XML/SGML compatibility layer.
+
+## CIFF interoperability invariants
+
+CIFF is a separate bag-of-words index surface. A stream has one Header, exactly the declared number of
+PostingsLists and DocRecords, and then EOF. Known scalar fields occur at most once and use their declared protobuf
+wire types; unknown non-group fields are skipped. Every decoded d-gap prefix sum fits a non-negative `int32`, is
+strictly increasing after the first posting, has positive `tf`, and belongs to a declared DocRecord. Each list's
+posting count and summed frequencies equal `df` and `cf`. Terms, integer document IDs, and external IDs are unique.
+The schema's `tf` payload can also be a quantized learned-sparse impact, so `cf` is required to equal the payload sum
+and fit non-negative `int64`, but is not compared with `total_terms_in_collection`.
+
+Resource limits are applied in dependency order: decoded or encoded frame length before payload allocation, Header counts before
+collection loops, each nested posting against the remaining aggregate budget, and local/duplicate validation before
+the next posting list or DocRecord. Exact EOF uses a one-byte probe. Canonical writing
+orders terms and DocRecords and emits protobuf fields numerically with proto3 defaults omitted. CIFF global `N` and
+`avgdl` are exporter-controlled and remain the BM25 inputs; third-party approximate document lengths are not
+silently replaced. See [ciff.md](ciff.md) for the complete wire and lossy-native-export contracts.
+
+Single-file saves and benchmark reports are fully serialized into synced, same-directory `create_new` staging files before an
+existing destination is replaced. Related TREC run and JSON report files use one rollback-capable transaction: all stages and
+old-file backups exist before the first install, and any returned commit error or unwinding panic restores both old paths.
+Output symlinks are rejected, while replacing one hard-link name leaves the other names attached to the old inode.
 
 ## Reproducibility versus timing
 

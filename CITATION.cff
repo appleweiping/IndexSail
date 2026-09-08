@@ -6,7 +6,7 @@ authors:
   - family-names: "Yan"
     given-names: "Weiping"
     alias: "appleweiping"
-version: 0.5.0
+version: 0.6.0
 date-released: 2026-09-07
 license: MIT
 repository-code: "https://github.com/appleweiping/IndexSail"
@@ -14,4 +14,4 @@ url: "https://github.com/appleweiping/IndexSail"
 abstract: >-
   A deterministic safe-Rust toolkit for positional indexing, BM25 ranking, exact
   WAND, block-max WAND, and MaxScore execution, collection-wide physical sharding,
-  TREC-style batch evaluation, and reproducible retrieval reports.
+  CIFF v1 interchange, TREC-style batch evaluation, and reproducible retrieval reports.

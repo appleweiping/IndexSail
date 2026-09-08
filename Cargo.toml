@@ -1,9 +1,9 @@
 [package]
 name = "indexsail"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Deterministic BM25, sharded retrieval, WAND, and TREC experiment toolkit"
+description = "Deterministic BM25, sharded retrieval, CIFF, WAND, and TREC experiment toolkit"
 authors = ["Weiping Yan"]
 license = "MIT"
 readme = "README.md"
@@ -22,6 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 libm = { version = "=0.2.16", default-features = false }
+same-file = "=1.0.6"
 
 [profile.release]
 codegen-units = 1

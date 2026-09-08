@@ -86,3 +86,15 @@ jobs:
           test -s target/ci-shards.idx
           test -s target/ci-shards.run
           test -s target/ci-shards-report.json
+      - name: CIFF interoperability lifecycle smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo run --locked --release -- ciff-export --index target/ci.idx --output target/ci.ciff --description "CI fixture"
+          cargo run --locked --release -- ciff-inspect --index target/ci.ciff --term search
+          cargo run --locked --release -- ciff-search --index target/ci.ciff --query "local search" --top-k 10
+          cargo run --locked --release -- ciff-batch --index target/ci.ciff --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-ciff.run --report target/ci-ciff-report.json --top-k 10
+          test -s target/ci.ciff
+          test -s target/ci-ciff.run
+          test -s target/ci-ciff-report.json
+          grep -q '"strategy": "exhaustive"' target/ci-ciff-report.json
+          grep -q '"map": 1.000000000000' target/ci-ciff-report.json

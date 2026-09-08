@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::analysis::{AnalysisMode, Analyzer};
+use crate::atomic::{atomic_write, atomic_write_many, prevalidate_output_path};
 use crate::benchmark::{BenchmarkConfig, run as run_benchmark, write_json as write_benchmark_json};
+use crate::ciff::{CiffIndex, CiffSearchOptions};
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::evaluation::{BatchConfig, evaluate_batch, write_json_report, write_trec_run};
@@ -28,6 +30,10 @@ USAGE:\n\
   indexsail shard-batch --index SHARDS.idx --topics TOPICS --run RUN.txt [OPTIONS]\n\
   indexsail inspect --index INDEX.idx [--field NAME --term TERM]\n\
   indexsail shard-inspect --index SHARDS.idx [--field NAME --term TERM]\n\
+  indexsail ciff-export --index INDEX.idx --output INDEX.ciff [--description TEXT]\n\
+  indexsail ciff-search --index INDEX.ciff --query TEXT [--ascii] [OPTIONS]\n\
+  indexsail ciff-batch --index INDEX.ciff --topics TOPICS --run RUN.txt [OPTIONS]\n\
+  indexsail ciff-inspect --index INDEX.ciff [--term TERM]\n\
   indexsail benchmark [--documents N] [--queries N] [--seed N] [--top-k N] [--shards N] [--json FILE]\n\
 \n\
 SEARCH OPTIONS:\n\
@@ -49,7 +55,14 @@ BATCH OPTIONS:\n\
   --report FILE            Optional machine-readable JSON report\n\
   --tag NAME               Run tag (default: indexsail)\n\
   --verify                 Compare the selected strategy against exhaustive exactly\n\
-  --field/--operator/...   Same ranking controls as search\n";
+  --field/--operator/...   Same ranking controls as search\n\
+\n\
+CIFF OPTIONS:\n\
+  --ascii                  Use ASCII-compatible query analysis instead of Unicode\n\
+  --operator and|or        Boolean term semantics (default: or)\n\
+  --top-k N                Number of hits (search: 10; batch: 1000)\n\
+  --k1 NUMBER --b NUMBER   BM25 parameters; CIFF execution is exhaustive\n\
+                            BM25 requires frequency-valued CIFF tf payloads\n";
 
 pub fn execute<I, S>(arguments: I, mut output: impl Write) -> Result<()>
 where
@@ -75,11 +88,264 @@ where
         "shard-batch" => command_shard_batch(&remaining, &mut output),
         "inspect" => command_inspect(&remaining, &mut output),
         "shard-inspect" => command_shard_inspect(&remaining, &mut output),
+        "ciff-export" => command_ciff_export(&remaining, &mut output),
+        "ciff-search" => command_ciff_search(&remaining, &mut output),
+        "ciff-batch" => command_ciff_batch(&remaining, &mut output),
+        "ciff-inspect" => command_ciff_inspect(&remaining, &mut output),
         "benchmark" => command_benchmark(&remaining, &mut output),
         unknown => Err(Error::InvalidArgument(format!(
             "unknown command '{unknown}'; run 'indexsail help'"
         ))),
     }
+}
+
+fn command_ciff_export(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(arguments, &[], &["--index", "--output", "--description"])?;
+    let source = parsed.required_one("--index")?;
+    let destination = parsed.required_one("--output")?;
+    if paths_conflict(source, destination)? {
+        return Err(Error::InvalidArgument(
+            "CIFF source and output paths must be distinct".into(),
+        ));
+    }
+    let native = InvertedIndex::load(source)?;
+    let description = parsed
+        .optional_one("--description")?
+        .unwrap_or("IndexSail export");
+    let ciff = CiffIndex::from_native(&native, description)?;
+    ciff.save(destination)?;
+    let stats = ciff.stats();
+    writeln!(
+        output,
+        "exported format=CIFF-v{} documents={} terms={} postings={} tokens={} bytes={} output={}",
+        ciff.header().version,
+        stats.contained_documents,
+        stats.contained_posting_lists,
+        stats.postings,
+        stats.total_terms_in_collection,
+        std::fs::metadata(destination)?.len(),
+        destination
+    )?;
+    Ok(())
+}
+
+fn command_ciff_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(
+        arguments,
+        &["--ascii"],
+        &["--index", "--query", "--operator", "--top-k", "--k1", "--b"],
+    )?;
+    let path = parsed.required_one("--index")?;
+    let index = CiffIndex::load(path)?;
+    let analyzer = Analyzer::new(if parsed.flag("--ascii") {
+        AnalysisMode::Ascii
+    } else {
+        AnalysisMode::Unicode
+    });
+    let options = CiffSearchOptions {
+        top_k: parse_optional(parsed.optional_one("--top-k")?, 10_usize, "top-k")?,
+        operator: parse_operator(parsed.optional_one("--operator")?)?,
+        bm25: Bm25Params {
+            k1: parse_optional(parsed.optional_one("--k1")?, 1.2_f64, "k1")?,
+            b: parse_optional(parsed.optional_one("--b")?, 0.75_f64, "b")?,
+        },
+    };
+    let outcome = index.search(analyzer, parsed.required_one("--query")?, options)?;
+    writeln!(output, "rank\tscore\tid")?;
+    for (rank, hit) in outcome.hits.iter().enumerate() {
+        writeln!(
+            output,
+            "{}\t{:.6}\t{}",
+            rank + 1,
+            hit.score,
+            hit.external_id
+        )?;
+    }
+    writeln!(
+        output,
+        "format=CIFF-v{} strategy=exhaustive evaluated={} postings_visited={} total_documents={}",
+        index.header().version,
+        outcome.stats.evaluated_candidates,
+        outcome.stats.postings_advanced,
+        index.header().total_documents
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn command_ciff_batch(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(
+        arguments,
+        &["--ascii"],
+        &[
+            "--index",
+            "--topics",
+            "--qrels",
+            "--run",
+            "--report",
+            "--tag",
+            "--operator",
+            "--top-k",
+            "--k1",
+            "--b",
+        ],
+    )?;
+    let index_path = parsed.required_one("--index")?;
+    let topics_path = parsed.required_one("--topics")?;
+    let run_path = parsed.required_one("--run")?;
+    let report_path = parsed.optional_one("--report")?;
+    ensure_distinct_batch_paths(
+        index_path,
+        topics_path,
+        parsed.optional_one("--qrels")?,
+        run_path,
+        report_path,
+    )?;
+
+    let index = CiffIndex::load(index_path)?;
+    let analyzer = Analyzer::new(if parsed.flag("--ascii") {
+        AnalysisMode::Ascii
+    } else {
+        AnalysisMode::Unicode
+    });
+    let topics = load_topics(topics_path)?;
+    let qrels = parsed
+        .optional_one("--qrels")?
+        .map(load_qrels)
+        .transpose()?;
+    let config = BatchConfig {
+        top_k: parse_optional(parsed.optional_one("--top-k")?, 1_000_usize, "top-k")?,
+        pruning: PruningStrategy::Exhaustive,
+        verify_exact: false,
+        field: None,
+        operator: parse_operator(parsed.optional_one("--operator")?)?,
+        bm25: Bm25Params {
+            k1: parse_optional(parsed.optional_one("--k1")?, 1.2_f64, "k1")?,
+            b: parse_optional(parsed.optional_one("--b")?, 0.75_f64, "b")?,
+        },
+    };
+    let report = evaluate_batch(&index.retrieval(analyzer), &topics, qrels.as_ref(), config)?;
+    let mut run_bytes = Vec::new();
+    write_trec_run(
+        &report,
+        parsed.optional_one("--tag")?.unwrap_or("indexsail-ciff"),
+        &mut run_bytes,
+    )?;
+    let report_bytes = if report_path.is_some() {
+        let mut bytes = Vec::new();
+        write_json_report(&report, &mut bytes)?;
+        Some(bytes)
+    } else {
+        None
+    };
+    if let Some(path) = report_path {
+        atomic_write_many(&[
+            (Path::new(run_path), run_bytes.as_slice()),
+            (
+                Path::new(path),
+                report_bytes
+                    .as_deref()
+                    .expect("a requested report was serialized before output opened"),
+            ),
+        ])?;
+    } else {
+        atomic_write(Path::new(run_path), &run_bytes)?;
+    }
+    let hits = report
+        .queries
+        .iter()
+        .map(|query| query.hits.len())
+        .sum::<usize>();
+    writeln!(
+        output,
+        "batch format=CIFF-v{} topics={} hits={} strategy=Exhaustive elapsed_ms={:.3} evaluated={} postings_visited={} run={}",
+        index.header().version,
+        report.queries.len(),
+        hits,
+        report.total_search_time.as_secs_f64() * 1_000.0,
+        report.total_stats.evaluated_candidates,
+        report.total_stats.postings_advanced,
+        run_path
+    )?;
+    if let Some(metrics) = report.aggregate {
+        writeln!(
+            output,
+            "metrics map={:.6} mrr={:.6} ndcg={:.6} recall={:.6}",
+            metrics.map, metrics.mrr, metrics.mean_ndcg, metrics.mean_recall
+        )?;
+    }
+    if let Some(path) = report_path {
+        writeln!(output, "report={path}")?;
+    }
+    Ok(())
+}
+
+fn command_ciff_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(arguments, &[], &["--index", "--term"])?;
+    let path = parsed.required_one("--index")?;
+    let index = CiffIndex::load(path)?;
+    let stats = index.stats();
+    writeln!(
+        output,
+        "format=CIFF-v{} file_bytes={} contained_documents={} total_documents={} contained_terms={} total_terms={} postings={} tokens={} avg_length={:.6}",
+        index.header().version,
+        std::fs::metadata(path)?.len(),
+        stats.contained_documents,
+        stats.total_documents,
+        stats.contained_posting_lists,
+        stats.total_posting_lists,
+        stats.postings,
+        stats.total_terms_in_collection,
+        index.header().average_document_length
+    )?;
+    writeln!(
+        output,
+        "description={}",
+        index
+            .header()
+            .description
+            .chars()
+            .map(|character| if character.is_control() {
+                ' '
+            } else {
+                character
+            })
+            .collect::<String>()
+    )?;
+    if let Some(term) = parsed.optional_one("--term")? {
+        if term.is_empty() || term.chars().any(char::is_control) {
+            return Err(Error::InvalidArgument(
+                "--term must be non-empty and contain no control characters".into(),
+            ));
+        }
+        let list = index.posting_list(term);
+        writeln!(
+            output,
+            "term={} df={} cf={}",
+            term,
+            list.map_or(0, |list| list.document_frequency),
+            list.map_or(0, |list| list.collection_frequency)
+        )?;
+        if let Some(list) = list {
+            for posting in &list.postings {
+                let document = index.document(posting.document_id).ok_or_else(|| {
+                    Error::CorruptIndex(format!(
+                        "CIFF posting references missing document {}",
+                        posting.document_id
+                    ))
+                })?;
+                writeln!(
+                    output,
+                    "  doc={} internal={} tf={} length={}",
+                    document.external_id,
+                    document.document_id,
+                    posting.term_frequency,
+                    document.document_length
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn command_index(arguments: &[String], output: &mut impl Write) -> Result<()> {
@@ -346,26 +612,13 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
     let topics_path = parsed.required_one("--topics")?;
     let run_path = parsed.required_one("--run")?;
     let report_path = parsed.optional_one("--report")?;
-    let mut paths = vec![(index_path, false), (topics_path, false), (run_path, true)];
-    if let Some(path) = parsed.optional_one("--qrels")? {
-        paths.push((path, false));
-    }
-    if let Some(path) = report_path {
-        paths.push((path, true));
-    }
-    let mut conflict = false;
-    for left in 0..paths.len() {
-        for right in left + 1..paths.len() {
-            if (paths[left].1 || paths[right].1) && paths_conflict(paths[left].0, paths[right].0)? {
-                conflict = true;
-            }
-        }
-    }
-    if conflict {
-        return Err(Error::InvalidArgument(
-            "batch input, run, and report paths must be distinct".into(),
-        ));
-    }
+    ensure_distinct_batch_paths(
+        index_path,
+        topics_path,
+        parsed.optional_one("--qrels")?,
+        run_path,
+        report_path,
+    )?;
 
     let topics = load_topics(topics_path)?;
     let qrels = parsed
@@ -418,20 +671,31 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
         )
     };
 
-    let run_file = File::create(run_path)?;
-    let mut run_writer = BufWriter::new(run_file);
+    let mut run_bytes = Vec::new();
     write_trec_run(
         &report,
         parsed.optional_one("--tag")?.unwrap_or("indexsail"),
-        &mut run_writer,
+        &mut run_bytes,
     )?;
-    run_writer.flush()?;
-
+    let report_bytes = if report_path.is_some() {
+        let mut bytes = Vec::new();
+        write_json_report(&report, &mut bytes)?;
+        Some(bytes)
+    } else {
+        None
+    };
     if let Some(path) = report_path {
-        let report_file = File::create(path)?;
-        let mut report_writer = BufWriter::new(report_file);
-        write_json_report(&report, &mut report_writer)?;
-        report_writer.flush()?;
+        atomic_write_many(&[
+            (Path::new(run_path), run_bytes.as_slice()),
+            (
+                Path::new(path),
+                report_bytes
+                    .as_deref()
+                    .expect("a requested report was serialized before output opened"),
+            ),
+        ])?;
+    } else {
+        atomic_write(Path::new(run_path), &run_bytes)?;
     }
 
     let hit_count = report
@@ -702,12 +966,17 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
             "shards",
         )?,
     };
+    let json_path = parsed.optional_one("--json")?;
+    if let Some(path) = json_path {
+        // Validate before the potentially expensive benchmark. The atomic
+        // writer repeats this check immediately before replacement.
+        prevalidate_output_path(Path::new(path))?;
+    }
     let report = run_benchmark(config)?;
-    if let Some(path) = parsed.optional_one("--json")? {
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
-        write_benchmark_json(&report, &mut writer)?;
-        writer.flush()?;
+    if let Some(path) = json_path {
+        let mut bytes = Vec::new();
+        write_benchmark_json(&report, &mut bytes)?;
+        atomic_write(Path::new(path), &bytes)?;
     }
     writeln!(
         output,
@@ -785,7 +1054,7 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
         report.block_max_streams,
         report.block_max_blocks
     )?;
-    if let Some(path) = parsed.optional_one("--json")? {
+    if let Some(path) = json_path {
         writeln!(output, "report={path}")?;
     }
     Ok(())
@@ -900,9 +1169,54 @@ where
     })
 }
 
+fn parse_operator(value: Option<&str>) -> Result<BooleanOperator> {
+    match value.unwrap_or("or") {
+        "and" => Ok(BooleanOperator::And),
+        "or" => Ok(BooleanOperator::Or),
+        value => Err(Error::InvalidArgument(format!(
+            "unknown operator '{value}', expected and or or"
+        ))),
+    }
+}
+
+fn ensure_distinct_batch_paths(
+    index: &str,
+    topics: &str,
+    qrels: Option<&str>,
+    run: &str,
+    report: Option<&str>,
+) -> Result<()> {
+    prevalidate_output_path(Path::new(run))?;
+    if let Some(path) = report {
+        prevalidate_output_path(Path::new(path))?;
+    }
+    let mut paths = vec![(index, false), (topics, false), (run, true)];
+    if let Some(path) = qrels {
+        paths.push((path, false));
+    }
+    if let Some(path) = report {
+        paths.push((path, true));
+    }
+    for left in 0..paths.len() {
+        for right in left + 1..paths.len() {
+            if (paths[left].1 || paths[right].1) && paths_conflict(paths[left].0, paths[right].0)? {
+                return Err(Error::InvalidArgument(
+                    "batch input, run, and report paths must be distinct".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn paths_conflict(left: impl AsRef<Path>, right: impl AsRef<Path>) -> Result<bool> {
-    let left = normalized_path(left.as_ref())?;
-    let right = normalized_path(right.as_ref())?;
+    let left = left.as_ref();
+    let right = right.as_ref();
+    if same_existing_file(left, right)? {
+        return Ok(true);
+    }
+    let left = normalized_path(left)?;
+    let right = normalized_path(right)?;
     #[cfg(windows)]
     {
         Ok(left
@@ -913,6 +1227,13 @@ fn paths_conflict(left: impl AsRef<Path>, right: impl AsRef<Path>) -> Result<boo
     {
         Ok(left == right)
     }
+}
+
+fn same_existing_file(left: &Path, right: &Path) -> Result<bool> {
+    if !left.exists() || !right.exists() {
+        return Ok(false);
+    }
+    same_file::is_same_file(left, right).map_err(Error::from)
 }
 
 fn normalized_path(path: &Path) -> Result<PathBuf> {
@@ -1222,6 +1543,348 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ciff_export_search_inspect_and_trec_batch_form_an_end_to_end_flow() {
+        let corpus = temp_path("ciff.tsv");
+        let native = temp_path("ciff.idx");
+        let ciff = temp_path("ciff");
+        let topics = temp_path("ciff.topics");
+        let qrels = temp_path("ciff.qrels");
+        let run = temp_path("ciff.run");
+        let report = temp_path("ciff.json");
+        std::fs::write(
+            &corpus,
+            "id\ttitle\tbody\nD1\tRust Search\tfast local search engine\nD2\tGrid\tpower grid solver\nD3\tSailing\tlocal retrieval system\n",
+        )
+        .unwrap();
+        std::fs::write(&topics, "1\tlocal search\n2\tpower grid\n").unwrap();
+        std::fs::write(&qrels, "1 0 D1 2\n1 0 D3 1\n2 0 D2 2\n").unwrap();
+
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let mut export_output = Vec::new();
+        execute(
+            [
+                "ciff-export",
+                "--index",
+                native.to_str().unwrap(),
+                "--output",
+                ciff.to_str().unwrap(),
+                "--description",
+                "CLI\nfixture\u{1b}",
+            ],
+            &mut export_output,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(export_output)
+                .unwrap()
+                .starts_with("exported format=CIFF-v1 documents=3")
+        );
+
+        let mut inspect_output = Vec::new();
+        execute(
+            [
+                "ciff-inspect",
+                "--index",
+                ciff.to_str().unwrap(),
+                "--term",
+                "local",
+            ],
+            &mut inspect_output,
+        )
+        .unwrap();
+        let inspect_output = String::from_utf8(inspect_output).unwrap();
+        assert!(inspect_output.contains("format=CIFF-v1"));
+        assert!(inspect_output.contains("description=CLI fixture "));
+        assert!(inspect_output.contains("term=local df=2 cf=2"));
+        assert!(inspect_output.contains("doc=D1 internal=0 tf=1"));
+
+        let mut search_output = Vec::new();
+        execute(
+            [
+                "ciff-search",
+                "--index",
+                ciff.to_str().unwrap(),
+                "--query",
+                "local search",
+                "--top-k",
+                "2",
+            ],
+            &mut search_output,
+        )
+        .unwrap();
+        let search_output = String::from_utf8(search_output).unwrap();
+        assert_eq!(search_output.lines().next(), Some("rank\tscore\tid"));
+        assert!(search_output.contains("D1"));
+        assert!(search_output.contains("strategy=exhaustive"));
+
+        let mut batch_output = Vec::new();
+        execute(
+            [
+                "ciff-batch",
+                "--index",
+                ciff.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--qrels",
+                qrels.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--report",
+                report.to_str().unwrap(),
+                "--top-k",
+                "10",
+            ],
+            &mut batch_output,
+        )
+        .unwrap();
+        let batch_output = String::from_utf8(batch_output).unwrap();
+        assert!(batch_output.contains("batch format=CIFF-v1 topics=2"));
+        assert!(batch_output.contains("map=1.000000"));
+        assert!(std::fs::read_to_string(&run).unwrap().contains("1 Q0 D1 1"));
+        assert!(
+            std::fs::read_to_string(&report)
+                .unwrap()
+                .contains("\"strategy\": \"exhaustive\"")
+        );
+
+        for path in [corpus, native, ciff, topics, qrels, run, report] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn ciff_commands_reject_destructive_output_aliases_before_reading() {
+        let error = execute(
+            [
+                "ciff-export",
+                "--index",
+                "same.ciff",
+                "--output",
+                "./same.ciff",
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("distinct"));
+
+        let error = execute(
+            [
+                "ciff-batch",
+                "--index",
+                "same.ciff",
+                "--topics",
+                "topics.tsv",
+                "--run",
+                "./same.ciff",
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("distinct"));
+    }
+
+    #[test]
+    fn ciff_export_rejects_a_hard_link_to_the_native_index_without_data_loss() {
+        let corpus = temp_path("hardlink.tsv");
+        let native = temp_path("hardlink.idx");
+        let alias = temp_path("hardlink.ciff");
+        std::fs::write(&corpus, "id\tbody\nD1\tlocal search\n").unwrap();
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let original = std::fs::read(&native).unwrap();
+        std::fs::hard_link(&native, &alias).unwrap();
+        let error = execute(
+            [
+                "ciff-export",
+                "--index",
+                native.to_str().unwrap(),
+                "--output",
+                alias.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("distinct"));
+        assert_eq!(std::fs::read(&native).unwrap(), original);
+        assert_eq!(std::fs::read(&alias).unwrap(), original);
+        for path in [alias, native, corpus] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn batch_path_checks_detect_hard_links_for_every_input_and_output_role() {
+        let index = temp_path("identity.idx");
+        let topics = temp_path("identity.topics");
+        let qrels = temp_path("identity.qrels");
+        for (path, bytes) in [
+            (&index, b"index".as_slice()),
+            (&topics, b"topics".as_slice()),
+            (&qrels, b"qrels".as_slice()),
+        ] {
+            std::fs::write(path, bytes).unwrap();
+        }
+        for input in [&index, &topics, &qrels] {
+            let run = temp_path("identity.run");
+            std::fs::hard_link(input, &run).unwrap();
+            assert!(
+                ensure_distinct_batch_paths(
+                    index.to_str().unwrap(),
+                    topics.to_str().unwrap(),
+                    Some(qrels.to_str().unwrap()),
+                    run.to_str().unwrap(),
+                    None,
+                )
+                .is_err()
+            );
+            std::fs::remove_file(run).unwrap();
+
+            let run = temp_path("identity.run");
+            let report = temp_path("identity.json");
+            std::fs::hard_link(input, &report).unwrap();
+            assert!(
+                ensure_distinct_batch_paths(
+                    index.to_str().unwrap(),
+                    topics.to_str().unwrap(),
+                    Some(qrels.to_str().unwrap()),
+                    run.to_str().unwrap(),
+                    Some(report.to_str().unwrap()),
+                )
+                .is_err()
+            );
+            std::fs::remove_file(report).unwrap();
+        }
+
+        let run = temp_path("identity.run");
+        let report = temp_path("identity.json");
+        std::fs::write(&run, b"run").unwrap();
+        std::fs::hard_link(&run, &report).unwrap();
+        assert!(
+            ensure_distinct_batch_paths(
+                index.to_str().unwrap(),
+                topics.to_str().unwrap(),
+                Some(qrels.to_str().unwrap()),
+                run.to_str().unwrap(),
+                Some(report.to_str().unwrap()),
+            )
+            .is_err()
+        );
+        for path in [report, run, qrels, topics, index] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn batch_validation_failures_preserve_existing_native_and_ciff_outputs() {
+        let corpus = temp_path("atomic.tsv");
+        let native = temp_path("atomic.idx");
+        let ciff = temp_path("atomic.ciff");
+        let topics = temp_path("atomic.topics");
+        let run = temp_path("atomic.run");
+        let report = temp_path("atomic.json");
+        std::fs::write(&corpus, "id\tbody\nD 1\tlocal search\n").unwrap();
+        std::fs::write(&topics, "q1\tlocal\n").unwrap();
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        execute(
+            [
+                "ciff-export",
+                "--index",
+                native.to_str().unwrap(),
+                "--output",
+                ciff.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        for command in ["batch", "ciff-batch"] {
+            std::fs::write(&run, b"run sentinel").unwrap();
+            std::fs::write(&report, b"report sentinel").unwrap();
+            let selected_index = if command == "batch" { &native } else { &ciff };
+            let error = execute(
+                [
+                    command,
+                    "--index",
+                    selected_index.to_str().unwrap(),
+                    "--topics",
+                    topics.to_str().unwrap(),
+                    "--run",
+                    run.to_str().unwrap(),
+                    "--report",
+                    report.to_str().unwrap(),
+                    "--tag",
+                    "invalid tag",
+                ],
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("tag"));
+            assert_eq!(std::fs::read(&run).unwrap(), b"run sentinel");
+            assert_eq!(std::fs::read(&report).unwrap(), b"report sentinel");
+        }
+
+        for command in ["batch", "ciff-batch"] {
+            std::fs::write(&run, b"run sentinel").unwrap();
+            std::fs::write(&report, b"report sentinel").unwrap();
+            let selected_index = if command == "batch" { &native } else { &ciff };
+            let error = execute(
+                [
+                    command,
+                    "--index",
+                    selected_index.to_str().unwrap(),
+                    "--topics",
+                    topics.to_str().unwrap(),
+                    "--run",
+                    run.to_str().unwrap(),
+                    "--report",
+                    report.to_str().unwrap(),
+                ],
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("document id"));
+            assert_eq!(std::fs::read(&run).unwrap(), b"run sentinel");
+            assert_eq!(std::fs::read(&report).unwrap(), b"report sentinel");
+        }
+
+        atomic_write(&run, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&run).unwrap(), b"replacement");
+        for path in [report, run, topics, ciff, native, corpus] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn benchmark_can_write_machine_readable_report() {
         let report = temp_path("json");
         execute(
@@ -1245,6 +1908,101 @@ mod tests {
         assert!(text.contains("\"verified_exact\": true"));
         assert!(text.contains("\"checksum\""));
         std::fs::remove_file(report).unwrap();
+    }
+
+    #[test]
+    fn benchmark_report_replacement_preserves_existing_hard_link_sibling() {
+        let report = temp_path("benchmark-hardlink.json");
+        let sibling = temp_path("benchmark-hardlink-backup.json");
+        std::fs::write(&report, b"old benchmark").unwrap();
+        std::fs::hard_link(&report, &sibling).unwrap();
+        execute(
+            [
+                "benchmark",
+                "--documents",
+                "20",
+                "--queries",
+                "2",
+                "--top-k",
+                "2",
+                "--seed",
+                "7",
+                "--json",
+                report.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&report)
+                .unwrap()
+                .contains("\"checksum\"")
+        );
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"old benchmark");
+        std::fs::remove_file(report).unwrap();
+        std::fs::remove_file(sibling).unwrap();
+    }
+
+    #[test]
+    fn native_and_ciff_batch_commit_failure_restores_both_outputs() {
+        let corpus = temp_path("transaction.tsv");
+        let native = temp_path("transaction.idx");
+        let ciff = temp_path("transaction.ciff");
+        let topics = temp_path("transaction.topics");
+        let run = temp_path("transaction.run");
+        let report = temp_path("transaction.json");
+        std::fs::write(&corpus, "id\tbody\nD1\tlocal search\n").unwrap();
+        std::fs::write(&topics, "q1\tlocal\n").unwrap();
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        execute(
+            [
+                "ciff-export",
+                "--index",
+                native.to_str().unwrap(),
+                "--output",
+                ciff.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        for (command, selected_index) in [("batch", &native), ("ciff-batch", &ciff)] {
+            std::fs::write(&run, b"old run").unwrap();
+            std::fs::write(&report, b"old report").unwrap();
+            crate::atomic::inject_error_after_install_for_test(1);
+            let error = execute(
+                [
+                    command,
+                    "--index",
+                    selected_index.to_str().unwrap(),
+                    "--topics",
+                    topics.to_str().unwrap(),
+                    "--run",
+                    run.to_str().unwrap(),
+                    "--report",
+                    report.to_str().unwrap(),
+                ],
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("injected output commit failure"));
+            assert_eq!(std::fs::read(&run).unwrap(), b"old run");
+            assert_eq!(std::fs::read(&report).unwrap(), b"old report");
+        }
+
+        for path in [report, run, topics, ciff, native, corpus] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

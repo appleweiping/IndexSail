@@ -9,7 +9,7 @@ field-aware positional index, ranks with BM25, executes exact exhaustive, WAND, 
 queries, and runs
 reproducible TREC-style experiments from collection ingestion through metrics and run files. A collection can also
 be partitioned into independently searchable physical shards while using collection-wide statistics and an exact,
-deterministic global top-k merge.
+deterministic global top-k merge, or exported to and searched directly from the interoperable CIFF v1 format.
 
 The design favors observable algorithms, deterministic results, explicit format contracts, and strict
 input validation. It is useful for teaching, local research prototypes, regression oracles, and
@@ -26,13 +26,16 @@ experiments small enough to fit in one process.
 | Retrieval | BM25, `AND`/`OR`, fielded terms, phrases, exact field filters, explanations |
 | Execution | Exhaustive oracle, exact WAND, block-max WAND, and MaxScore with stable tie-breaking |
 | Experiments | TSV or classic TREC topics, qrels, six-column run files, JSON reports |
+| Interchange | Bounded CIFF v1 import/export, d-gap decoding, direct BM25 and TREC batch evaluation |
 | Metrics | MAP@k, MRR@k, nDCG@k, Recall@k, latency, candidates, advances and skips |
 | Verification | Optional per-query bit-exact executor/exhaustive comparison |
 | Storage | Checksummed v3 index format plus checksummed v1 sharded container; embedded v1/v2/v3 index reads |
 | Operations | CLI, library API, Linux/Windows CI, strict Clippy, rustfmt and release tests |
 
-IndexSail has one exactly pinned runtime dependency: the pure-Rust `libm` implementation used for
-cross-platform bit-stable BM25 IDF values. There are no network, parser, serialization, or CLI dependencies.
+IndexSail has two exactly pinned direct runtime dependencies: the pure-Rust `libm` implementation used for
+cross-platform bit-stable BM25 IDF values, and `same-file` for real cross-platform filesystem identity checks.
+The latter's Windows support crates are also locked. There are no network, parser, serialization, or CLI-framework
+dependencies.
 
 ## Architecture
 
@@ -42,6 +45,7 @@ flowchart LR
     B --> C[Field-aware positional index]
     C --> D[v3 checksum + compressed postings + block bounds]
     C --> S[Round-robin physical shards]
+    C --> I[Canonical CIFF v1 export]
     S --> G[Collection-wide N DF and field totals]
     S --> SD[Checksummed sharded container]
     T[TSV or classic TREC topics] --> Q[Typed batch queries]
@@ -55,6 +59,9 @@ flowchart LR
     W --> K
     BW --> K
     G --> E
+    I --> CE[Exhaustive CIFF BM25]
+    Q --> CE
+    CE --> K
     K --> R[Six-column TREC run]
     J[Four-column qrels] --> M[MAP MRR nDCG Recall]
     K --> M
@@ -63,7 +70,8 @@ flowchart LR
 
 The module boundaries, invariants, WAND safety argument, and binary layout are detailed in
 [docs/architecture.md](docs/architecture.md). Experiment formats and metric definitions are in
-[docs/evaluation.md](docs/evaluation.md).
+[docs/evaluation.md](docs/evaluation.md). The exact CIFF wire, validation, scoring, and lossiness contracts are in
+[docs/ciff.md](docs/ciff.md).
 
 ## Build and quality gates
 
@@ -163,6 +171,51 @@ require identical global document IDs, order, and IEEE-754 score bits. For shard
 persisted bounds are deliberately not reused because they were built from local statistics; conservative
 bounds are instead derived from the globally scored postings and counted in
 `block_max_postings_scanned`.
+
+## CIFF v1 interoperability
+
+IndexSail implements the official Common Index File Format v1 delimited protobuf wire contract in safe Rust,
+without adding a general protobuf runtime. The reader bounds every frame and aggregate collection count, decodes
+posting document IDs from d-gaps, keeps the header's global statistics, skips supported unknown fields, and rejects
+wrong wire types, duplicate known scalars, invalid UTF-8, overflow, inconsistent `df`/`cf`, missing DocRecords,
+truncation, and trailing messages.
+
+```shell
+cargo run --release -- ciff-export \
+  --index target/corpus.idx \
+  --output target/corpus.ciff \
+  --description "local experiment"
+
+cargo run --release -- ciff-inspect \
+  --index target/corpus.ciff \
+  --term search
+
+cargo run --release -- ciff-search \
+  --index target/corpus.ciff \
+  --query "local search" \
+  --top-k 10
+
+cargo run --release -- ciff-batch \
+  --index target/corpus.ciff \
+  --topics examples/topics.tsv \
+  --qrels examples/qrels.txt \
+  --run target/ciff.run \
+  --report target/ciff-report.json
+```
+
+Native export necessarily flattens named fields: frequencies for the same normalized term are summed and field
+lengths become one document length. CIFF has no source text, fields, positions, phrases, stored filters, or native
+impact bounds, so `CiffIndex` is deliberately separate from `InvertedIndex` and currently uses exhaustive BM25.
+The query analyzer is caller-selected because CIFF describes tokenization but does not standardize it.
+BM25 requires conventional frequency-valued `Posting.tf` payloads. Learned-sparse CIFF producers may instead put
+quantized impacts in that field; IndexSail accepts, inspects, and round-trips those files without imposing a false
+frequency/token-count relationship, but does not present BM25 over impacts as learned-impact retrieval. Repeated
+query tokens and explicit library `QueryTerm` boosts are normalized and summed deterministically.
+
+Run the complete offline lifecycle with [`examples/ciff_demo.sh`](examples/ciff_demo.sh) or
+[`examples/ciff_demo.ps1`](examples/ciff_demo.ps1). The normative schema is the OSIRRC
+[`CommonIndexFileFormat.proto`](https://github.com/osirrc/ciff/blob/master/src/main/protobuf/CommonIndexFileFormat.proto);
+[the detailed contract](docs/ciff.md) records format semantics and trust boundaries.
 
 ## Reproducible TREC-style experiment
 

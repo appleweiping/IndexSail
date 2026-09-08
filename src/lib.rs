@@ -6,10 +6,14 @@
 //! a checksummed, delta/variable-byte version 3 format with persisted block
 //! bounds and version 1/2 read compatibility. Collections can also be split
 //! into deterministic physical shards while retaining exact global BM25
-//! scores and stable cross-shard top-k merging.
+//! scores and stable cross-shard top-k merging. The CIFF v1 surface provides
+//! bounded canonical index interchange plus direct exhaustive BM25 and TREC
+//! evaluation over portable files.
 
 pub mod analysis;
+mod atomic;
 pub mod benchmark;
+pub mod ciff;
 pub mod cli;
 pub mod codec;
 pub mod document;
@@ -23,6 +27,10 @@ pub mod shard;
 pub mod trec;
 
 pub use analysis::{AnalysisMode, Analyzer, Token};
+pub use ciff::{
+    CIFF_FORMAT_VERSION, CiffDocumentRecord, CiffHeader, CiffIndex, CiffLimits, CiffPosting,
+    CiffPostingList, CiffRetrieval, CiffSearchOptions, CiffStats,
+};
 pub use codec::PostingCodecStats;
 pub use document::Document;
 pub use error::{Error, Result};

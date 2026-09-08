@@ -4,6 +4,44 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-07
+
+- Added a safe-Rust Common Index File Format v1 implementation covering the
+  official delimited protobuf Header, PostingsList, Posting, and DocRecord
+  messages without adding a protobuf runtime dependency. The reader decodes
+  d-gap document IDs, accepts unknown non-group fields, checks scalar wire
+  types and duplicates, and rejects truncation, trailing messages, overflow,
+  inconsistent statistics, duplicate identifiers, and missing DocRecords.
+- Added configurable per-frame, posting-list, document, posting, term, external
+  ID, and description limits. Collection counts are checked before vector
+  growth, frame sizes before payload allocation, and total postings while the
+  stream is consumed.
+- Added deterministic native-to-CIFF export. Native fields are flattened by
+  summing same-term frequencies and document lengths; the explicit format
+  description records that field and position information is intentionally
+  absent from CIFF.
+- Added exhaustive CIFF BM25 with explicit query analysis, Boolean AND/OR,
+  repeated-token and explicit query-boost aggregation, global header
+  statistics, stable document-ID ties, and a shared TREC batch adapter.
+  `ciff-export`, `ciff-search`, `ciff-batch`, and `ciff-inspect` provide an
+  executable interchange lifecycle.
+- Added an independently transcribed CIFF wire fixture with byte-exact
+  canonical write verification, a fixture from PISA's pinned learned-sparse
+  producer, and hand-computed BM25 values. Tests cover unknown fields, proto3
+  zero defaults, malformed varints/wire types/UTF-8, d-gap overflow, hostile
+  limits, native flattening, real score ties, and CLI-to-TREC output.
+- CIFF collection-frequency validation preserves learned-sparse impact
+  semantics: each `cf` must equal its list's payload sum and fit non-negative
+  `int64`, but need not be bounded by the document-length token statistic.
+- CLI output guards now detect hard-linked aliases by filesystem identity.
+  Native and CIFF batch outputs are pre-serialized, synced, and committed as a
+  rollback-capable pair, so a second-output error or unwinding panic cannot
+  leave a half-updated run/report pair. CIFF indexes and benchmark reports use
+  the same same-directory staging and old-file protection; output symlinks are
+  rejected and replacing a hard-link name leaves its sibling unchanged.
+- CIFF writing now computes checked protobuf message sizes before allocating
+  frame buffers, making `max_frame_bytes` a read-and-write allocation bound.
+
 ## [0.5.0] - 2026-09-07
 
 - Added deterministic round-robin physical sharding with collection-wide BM25
