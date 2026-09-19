@@ -1,29 +1,36 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::analysis::{AnalysisMode, Analyzer};
-use crate::atomic::{atomic_write, atomic_write_many, prevalidate_output_path};
+use crate::atomic::{atomic_write, atomic_write_many, atomic_write_with, prevalidate_output_path};
 use crate::benchmark::{BenchmarkConfig, run as run_benchmark, write_json as write_benchmark_json};
 use crate::ciff::{CiffIndex, CiffSearchOptions};
+use crate::collection::{
+    CollectionFormat, CollectionLimits, index_collection, index_collection_sharded,
+};
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::evaluation::{BatchConfig, evaluate_batch, write_json_report, write_trec_run};
-use crate::index::{IndexBuilder, InternalDocId, InvertedIndex};
+use crate::forward::ForwardIndex;
+use crate::index::{InternalDocId, InvertedIndex};
 use crate::persistence::{block_max_metadata_encoded_bytes, persisted_format_version};
 use crate::query::{BooleanOperator, FieldFilter, PhraseFilter, SearchQuery};
 use crate::search::{Bm25Params, PruningStrategy, SearchOptions, SearchOutcome};
-use crate::shard::{ShardedIndex, ShardedIndexBuilder, persisted_sharded_format_version};
-use crate::trec::{index_trec_collection, index_trec_collection_sharded, load_qrels, load_topics};
+use crate::shard::{ShardedIndex, persisted_sharded_format_version};
+use crate::trec::{load_qrels, load_topics};
 
 pub const HELP: &str = "\
 IndexSail — compact local BM25 search\n\
 \n\
 USAGE:\n\
   indexsail --version\n\
-  indexsail index --input COLLECTION --output INDEX.idx [--format tsv|trec] [--ascii]\n\
-  indexsail shard-index --input COLLECTION --output SHARDS.idx --shards N [--format tsv|trec] [--ascii]\n\
+  indexsail index --input COLLECTION --output INDEX.idx [--format tsv|trec|jsonl] [--ascii]\n\
+  indexsail shard-index --input COLLECTION --output SHARDS.idx --shards N [--format tsv|trec|jsonl] [--ascii]\n\
+  indexsail forward-build --input COLLECTION --output INDEX.fwd [--format tsv|trec|jsonl] [--ascii]\n\
+  indexsail forward-invert --input INDEX.fwd --output INDEX.idx\n\
+  indexsail forward-inspect --index INDEX.fwd [--document N] [--limit N]\n\
+  indexsail lexicon --index INDEX.fwd [--id N | --field NAME --term TERM | --offset N --limit N]\n\
   indexsail search --index INDEX.idx --query TEXT [OPTIONS]\n\
   indexsail shard-search --index SHARDS.idx --query TEXT [OPTIONS]\n\
   indexsail batch --index INDEX.idx --topics TOPICS --run RUN.txt [OPTIONS]\n\
@@ -82,6 +89,10 @@ where
         }
         "index" => command_index(&remaining, &mut output),
         "shard-index" => command_shard_index(&remaining, &mut output),
+        "forward-build" => command_forward_build(&remaining, &mut output),
+        "forward-invert" => command_forward_invert(&remaining, &mut output),
+        "forward-inspect" => command_forward_inspect(&remaining, &mut output),
+        "lexicon" => command_lexicon(&remaining, &mut output),
         "search" => command_search(&remaining, &mut output),
         "shard-search" => command_shard_search(&remaining, &mut output),
         "batch" => command_batch(&remaining, &mut output),
@@ -369,7 +380,8 @@ fn command_index(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let index = index_collection(
         input,
         Analyzer::new(mode),
-        parsed.optional_one("--format")?.unwrap_or("tsv"),
+        CollectionFormat::parse(parsed.optional_one("--format")?.unwrap_or("tsv"))?,
+        CollectionLimits::default(),
     )?;
     index.save(destination)?;
     let stats = index.stats();
@@ -400,10 +412,11 @@ fn command_shard_index(arguments: &[String], output: &mut impl Write) -> Result<
         AnalysisMode::Unicode
     };
     let shard_count = parse_optional(parsed.optional_one("--shards")?, 0_usize, "shards")?;
-    let index = index_sharded_collection(
+    let index = index_collection_sharded(
         input,
         Analyzer::new(mode),
-        parsed.optional_one("--format")?.unwrap_or("tsv"),
+        CollectionFormat::parse(parsed.optional_one("--format")?.unwrap_or("tsv"))?,
+        CollectionLimits::default(),
         shard_count,
     )?;
     index.save(destination)?;
@@ -420,6 +433,223 @@ fn command_shard_index(arguments: &[String], output: &mut impl Write) -> Result<
         destination
     )?;
     Ok(())
+}
+
+fn command_forward_build(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(
+        arguments,
+        &["--ascii"],
+        &["--input", "--output", "--format"],
+    )?;
+    let input = parsed.required_one("--input")?;
+    let destination = parsed.required_one("--output")?;
+    if paths_conflict(input, destination)? {
+        return Err(Error::InvalidArgument(
+            "forward input and output paths must be distinct".into(),
+        ));
+    }
+    let mode = if parsed.flag("--ascii") {
+        AnalysisMode::Ascii
+    } else {
+        AnalysisMode::Unicode
+    };
+    let format = CollectionFormat::parse(parsed.optional_one("--format")?.unwrap_or("tsv"))?;
+    let forward = ForwardIndex::from_collection(
+        input,
+        Analyzer::new(mode),
+        format,
+        CollectionLimits::default(),
+    )?;
+    forward.save(destination)?;
+    let stats = forward.stats();
+    writeln!(
+        output,
+        "forward documents={} fields={} terms={} occurrences={} analyzer={:?} format={} output={}",
+        stats.documents,
+        stats.fields,
+        stats.terms,
+        stats.occurrences,
+        forward.analyzer().mode(),
+        format_name(format),
+        destination
+    )?;
+    Ok(())
+}
+
+fn command_forward_invert(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(arguments, &[], &["--input", "--output"])?;
+    let input = parsed.required_one("--input")?;
+    let destination = parsed.required_one("--output")?;
+    if paths_conflict(input, destination)? {
+        return Err(Error::InvalidArgument(
+            "forward source and inverted output paths must be distinct".into(),
+        ));
+    }
+    let forward = ForwardIndex::load(input)?;
+    let index = forward.invert()?;
+    atomic_write_with(Path::new(destination), |writer| index.write_to(writer))?;
+    let stats = index.stats();
+    writeln!(
+        output,
+        "inverted documents={} fields={} terms={} postings={} tokens={} input={} output={}",
+        stats.documents,
+        stats.fields,
+        stats.terms,
+        stats.postings,
+        stats.tokens,
+        input,
+        destination
+    )?;
+    Ok(())
+}
+
+fn command_forward_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(arguments, &[], &["--index", "--document", "--limit"])?;
+    let path = parsed.required_one("--index")?;
+    let forward = ForwardIndex::load(path)?;
+    let stats = forward.stats();
+    writeln!(
+        output,
+        "forward format={} analyzer={:?} documents={} fields={} terms={} occurrences={}",
+        crate::forward::FORWARD_FORMAT_VERSION,
+        forward.analyzer().mode(),
+        stats.documents,
+        stats.fields,
+        stats.terms,
+        stats.occurrences
+    )?;
+    let Some(document_value) = parsed.optional_one("--document")? else {
+        if parsed.optional_one("--limit")?.is_some() {
+            return Err(Error::InvalidArgument(
+                "--limit requires --document for forward-inspect".into(),
+            ));
+        }
+        return Ok(());
+    };
+    let document_id = document_value.parse::<u32>().map_err(|_| {
+        Error::InvalidArgument(format!(
+            "document id '{document_value}' is not an unsigned integer"
+        ))
+    })?;
+    let limit = parse_optional(parsed.optional_one("--limit")?, 20_usize, "limit")?;
+    if limit == 0 || limit > 1_000 {
+        return Err(Error::InvalidArgument(
+            "forward preview limit must be between 1 and 1000".into(),
+        ));
+    }
+    let document = usize::try_from(document_id)
+        .ok()
+        .and_then(|id| forward.documents().get(id))
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!("forward document {document_id} does not exist"))
+        })?;
+    writeln!(
+        output,
+        "document={} external_id={:?}",
+        document_id,
+        document.document().external_id()
+    )?;
+    for field in document.document().fields().keys() {
+        let ids = document
+            .term_ids(field)
+            .expect("validated forward documents have one sequence per field");
+        let preview = ids
+            .iter()
+            .take(limit)
+            .map(|&id| {
+                forward
+                    .term(id)
+                    .map(|term| term.term.as_str())
+                    .ok_or_else(|| Error::CorruptIndex(format!("unknown forward term id {id}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        writeln!(
+            output,
+            "field={} occurrences={} preview={}",
+            field,
+            ids.len(),
+            preview.join(" ")
+        )?;
+    }
+    Ok(())
+}
+
+fn command_lexicon(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(
+        arguments,
+        &[],
+        &[
+            "--index", "--id", "--field", "--term", "--offset", "--limit",
+        ],
+    )?;
+    let forward = ForwardIndex::load(parsed.required_one("--index")?)?;
+    let id = parsed.optional_one("--id")?;
+    let field = parsed.optional_one("--field")?;
+    let term = parsed.optional_one("--term")?;
+    let offset = parsed.optional_one("--offset")?;
+    let limit = parsed.optional_one("--limit")?;
+
+    if let Some(id) = id {
+        if field.is_some() || term.is_some() || offset.is_some() || limit.is_some() {
+            return Err(Error::InvalidArgument(
+                "--id cannot be combined with field, term, offset, or limit".into(),
+            ));
+        }
+        let id = id.parse::<u32>().map_err(|_| {
+            Error::InvalidArgument(format!("term id '{id}' is not an unsigned integer"))
+        })?;
+        let entry = forward
+            .term(id)
+            .ok_or_else(|| Error::InvalidArgument(format!("term id {id} does not exist")))?;
+        writeln!(output, "{id}\t{}\t{}", entry.field, entry.term)?;
+        return Ok(());
+    }
+
+    match (field, term) {
+        (Some(field), Some(term)) => {
+            if offset.is_some() || limit.is_some() {
+                return Err(Error::InvalidArgument(
+                    "field/term lookup cannot be combined with offset or limit".into(),
+                ));
+            }
+            let normalized = forward.analyzer().normalize_single(term).ok_or_else(|| {
+                Error::InvalidArgument(
+                    "lexicon lookup term must normalize to exactly one token".into(),
+                )
+            })?;
+            let id = forward.term_id(field, &normalized).ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "term '{normalized}' does not exist in field '{field}'"
+                ))
+            })?;
+            writeln!(output, "{id}\t{field}\t{normalized}")?;
+            Ok(())
+        }
+        (None, None) => {
+            let offset = parse_optional(offset, 0_usize, "offset")?;
+            let limit = parse_optional(limit, 20_usize, "limit")?;
+            if limit == 0 || limit > 1_000 {
+                return Err(Error::InvalidArgument(
+                    "lexicon page limit must be between 1 and 1000".into(),
+                ));
+            }
+            for (id, entry) in forward.terms().iter().enumerate().skip(offset).take(limit) {
+                writeln!(output, "{id}\t{}\t{}", entry.field, entry.term)?;
+            }
+            Ok(())
+        }
+        _ => Err(Error::InvalidArgument(
+            "--field and --term must be supplied together".into(),
+        )),
+    }
+}
+
+const fn format_name(format: CollectionFormat) -> &'static str {
+    match format {
+        CollectionFormat::Tsv => "tsv",
+        CollectionFormat::Trec => "trec",
+        CollectionFormat::Jsonl => "jsonl",
+    }
 }
 
 fn command_search(arguments: &[String], output: &mut impl Write) -> Result<()> {
@@ -1056,104 +1286,6 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
     )?;
     if let Some(path) = json_path {
         writeln!(output, "report={path}")?;
-    }
-    Ok(())
-}
-
-fn index_collection(
-    path: impl AsRef<Path>,
-    analyzer: Analyzer,
-    format: &str,
-) -> Result<InvertedIndex> {
-    match format {
-        "tsv" => index_tsv(path, analyzer),
-        "trec" => index_trec_collection(path, analyzer),
-        value => Err(Error::InvalidArgument(format!(
-            "unknown collection format '{value}', expected tsv or trec"
-        ))),
-    }
-}
-
-fn index_sharded_collection(
-    path: impl AsRef<Path>,
-    analyzer: Analyzer,
-    format: &str,
-    shard_count: usize,
-) -> Result<ShardedIndex> {
-    match format {
-        "tsv" => index_tsv_sharded(path, analyzer, shard_count),
-        "trec" => index_trec_collection_sharded(path, analyzer, shard_count),
-        value => Err(Error::InvalidArgument(format!(
-            "unknown collection format '{value}', expected tsv or trec"
-        ))),
-    }
-}
-
-fn index_tsv(path: impl AsRef<Path>, analyzer: Analyzer) -> Result<InvertedIndex> {
-    let mut builder = IndexBuilder::new(analyzer);
-    visit_tsv(path, |document| builder.add_document(document).map(|_| ()))?;
-    Ok(builder.finish())
-}
-
-fn index_tsv_sharded(
-    path: impl AsRef<Path>,
-    analyzer: Analyzer,
-    shard_count: usize,
-) -> Result<ShardedIndex> {
-    let mut builder = ShardedIndexBuilder::new(analyzer, shard_count)?;
-    visit_tsv(path, |document| builder.add_document(document).map(|_| ()))?;
-    Ok(builder.finish())
-}
-
-fn visit_tsv(
-    path: impl AsRef<Path>,
-    mut add_document: impl FnMut(Document) -> Result<()>,
-) -> Result<()> {
-    let file = File::open(path)?;
-    let mut lines = BufReader::new(file).lines();
-    let header = lines
-        .next()
-        .transpose()?
-        .ok_or_else(|| Error::InvalidDocument("TSV input has no header".into()))?;
-    let columns = header
-        .trim_end_matches('\r')
-        .split('\t')
-        .collect::<Vec<_>>();
-    if columns.len() < 2 || columns[0] != "id" {
-        return Err(Error::InvalidDocument(
-            "TSV header must start with id and contain at least one field".into(),
-        ));
-    }
-    let mut seen_fields = BTreeSet::new();
-    for field in &columns[1..] {
-        if !seen_fields.insert(*field) {
-            return Err(Error::InvalidDocument(format!(
-                "duplicate TSV field '{field}'"
-            )));
-        }
-        // Validate field names before processing an otherwise-empty corpus.
-        Document::from_fields("header-validation", [(*field, "")])?;
-    }
-    for (line_index, line) in lines.enumerate() {
-        let line = line?;
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            continue;
-        }
-        let values = line.split('\t').collect::<Vec<_>>();
-        if values.len() != columns.len() {
-            return Err(Error::InvalidDocument(format!(
-                "TSV line {} has {} columns; expected {}",
-                line_index + 2,
-                values.len(),
-                columns.len()
-            )));
-        }
-        let fields = columns[1..]
-            .iter()
-            .zip(&values[1..])
-            .map(|(name, value)| (*name, *value));
-        add_document(Document::from_fields(values[0], fields)?)?;
     }
     Ok(())
 }
@@ -2001,6 +2133,123 @@ mod tests {
         }
 
         for path in [report, run, topics, ciff, native, corpus] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn jsonl_forward_lexicon_invert_and_search_form_an_end_to_end_flow() {
+        let collection = temp_path("forward.jsonl");
+        let forward = temp_path("forward.fwd");
+        let native = temp_path("forward.idx");
+        std::fs::write(
+            &collection,
+            "{\"id\":\"D1\",\"fields\":{\"title\":\"Blue Sail\",\"body\":\"local blue search\"}}\n{\"id\":\"D2\",\"fields\":{\"title\":\"Grid\",\"body\":\"power model\"}}\n",
+        )
+        .unwrap();
+
+        let mut build_output = Vec::new();
+        execute(
+            [
+                "forward-build",
+                "--input",
+                collection.to_str().unwrap(),
+                "--output",
+                forward.to_str().unwrap(),
+                "--format",
+                "jsonl",
+            ],
+            &mut build_output,
+        )
+        .unwrap();
+        let build_output = String::from_utf8(build_output).unwrap();
+        assert!(build_output.contains("documents=2"));
+        assert!(build_output.contains("format=jsonl"));
+
+        let mut inspect_output = Vec::new();
+        execute(
+            [
+                "forward-inspect",
+                "--index",
+                forward.to_str().unwrap(),
+                "--document",
+                "0",
+                "--limit",
+                "2",
+            ],
+            &mut inspect_output,
+        )
+        .unwrap();
+        let inspect_output = String::from_utf8(inspect_output).unwrap();
+        assert!(inspect_output.contains("format=1"));
+        assert!(inspect_output.contains("external_id=\"D1\""));
+        assert!(inspect_output.contains("field=body occurrences=3 preview=local blue"));
+
+        let mut reverse_output = Vec::new();
+        execute(
+            [
+                "lexicon",
+                "--index",
+                forward.to_str().unwrap(),
+                "--field",
+                "body",
+                "--term",
+                "BLUE",
+            ],
+            &mut reverse_output,
+        )
+        .unwrap();
+        let reverse_output = String::from_utf8(reverse_output).unwrap();
+        let term_id = reverse_output.split('\t').next().unwrap().to_owned();
+        assert!(reverse_output.ends_with("\tbody\tblue\n"));
+
+        let mut lookup_output = Vec::new();
+        execute(
+            [
+                "lexicon",
+                "--index",
+                forward.to_str().unwrap(),
+                "--id",
+                &term_id,
+            ],
+            &mut lookup_output,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(lookup_output).unwrap(), reverse_output);
+
+        execute(
+            [
+                "forward-invert",
+                "--input",
+                forward.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let mut search_output = Vec::new();
+        execute(
+            [
+                "search",
+                "--index",
+                native.to_str().unwrap(),
+                "--query",
+                "blue",
+                "--field",
+                "body",
+            ],
+            &mut search_output,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(search_output)
+                .unwrap()
+                .contains("D1\tBlue Sail")
+        );
+
+        for path in [native, forward, collection] {
             std::fs::remove_file(path).unwrap();
         }
     }

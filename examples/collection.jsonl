@@ -1,0 +1,4 @@
+{"id":"DOC-001","fields":{"title":"Local Search","body":"BM25 ranks local documents with deterministic scores","category":"guide"}}
+{"id":"DOC-002","fields":{"title":"Exact Retrieval","body":"WAND and exhaustive retrieval return the same ranking","category":"reference"}}
+{"id":"DOC-003","fields":{"title":"Grid Models","body":"Power grid models describe connected electrical networks","category":"reference"}}
+{"title":"DOC-004","content":"Portable collection parsing builds a stable forward index","url":"https://example.invalid/doc-004"}

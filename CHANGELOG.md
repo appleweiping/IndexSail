@@ -4,6 +4,31 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-08
+
+- Added one bounded collection API for header-led TSV, the documented TREC
+  subset, canonical JSON Lines records, and PISA-style JSON Lines records.
+  Native and sharded indexing now share those adapters, strict protocol
+  validation, duplicate-key detection, UTF-8 checks, and explicit input,
+  record, field, and document limits.
+- Added a canonical field-qualified lexicon and occurrence-preserving forward
+  index. Term IDs are independent of document order, every original named
+  field remains inspectable, and inversion rebuilds exact field lengths,
+  frequencies, and token positions without reopening the source collection.
+- Added the checksummed `IDXFW001` forward format with analyzer state, exact
+  length and EOF validation, bounded structural allocation, and complete
+  semantic closure against re-analysis of the stored fields. Corruption,
+  duplicate identifiers, unsorted or unused lexicon entries, and term-ID/token
+  disagreement are rejected before a snapshot becomes usable.
+- Added `forward-build`, `forward-inspect`, `lexicon`, and `forward-invert`
+  commands, a committed JSONL example, portable shell and PowerShell demos,
+  an end-to-end CI lifecycle, and a complete format and trust-boundary
+  specification.
+- Enforced collection byte limits on the opened stream and rejected append or
+  path replacement during parsing. TREC blocks now bound each line before
+  allocation and count their raw markers and terminators; topic and qrels
+  inputs have explicit total-byte limits, with a per-line qrels limit.
+
 ## [0.6.0] - 2026-09-07
 
 - Added a safe-Rust Common Index File Format v1 implementation covering the

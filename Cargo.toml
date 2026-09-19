@@ -1,9 +1,9 @@
 [package]
 name = "indexsail"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Deterministic BM25, sharded retrieval, CIFF, WAND, and TREC experiment toolkit"
+description = "Deterministic forward and inverted indexing, exact BM25 retrieval, CIFF, and TREC experiments"
 authors = ["Weiping Yan"]
 license = "MIT"
 readme = "README.md"
@@ -23,6 +23,8 @@ path = "src/main.rs"
 [dependencies]
 libm = { version = "=0.2.16", default-features = false }
 same-file = "=1.0.6"
+serde = { version = "=1.0.229", default-features = false, features = ["std"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
 
 [profile.release]
 codegen-units = 1

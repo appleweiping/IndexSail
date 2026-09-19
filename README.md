@@ -19,9 +19,10 @@ experiments small enough to fit in one process.
 
 | Area | Included behavior |
 |---|---|
-| Collection | UTF-8 TSV and a documented streaming subset of TREC SGML |
+| Collection | Bounded UTF-8 TSV, JSON Lines (native and PISA-style records), and a documented TREC SGML subset |
 | Analysis | Deterministic Unicode or ASCII tokenization, stored with the index |
 | Index | Named fields, stable external IDs, positions, field lengths, DF and collection statistics |
+| Forward pipeline | Canonical field-qualified lexicon, occurrence-preserving forward snapshots, inspection, and exact inversion |
 | Sharding | Deterministic round-robin physical shards, global BM25 statistics, stable merged top-k |
 | Retrieval | BM25, `AND`/`OR`, fielded terms, phrases, exact field filters, explanations |
 | Execution | Exhaustive oracle, exact WAND, block-max WAND, and MaxScore with stable tie-breaking |
@@ -32,16 +33,18 @@ experiments small enough to fit in one process.
 | Storage | Checksummed v3 index format plus checksummed v1 sharded container; embedded v1/v2/v3 index reads |
 | Operations | CLI, library API, Linux/Windows CI, strict Clippy, rustfmt and release tests |
 
-IndexSail has two exactly pinned direct runtime dependencies: the pure-Rust `libm` implementation used for
-cross-platform bit-stable BM25 IDF values, and `same-file` for real cross-platform filesystem identity checks.
-The latter's Windows support crates are also locked. There are no network, parser, serialization, or CLI-framework
-dependencies.
+IndexSail pins its direct runtime dependencies exactly. The pure-Rust `libm` implementation provides
+cross-platform bit-stable BM25 IDF values; `same-file` provides real cross-platform filesystem identity checks;
+and `serde`/`serde_json` implement strict, bounded JSON Lines record decoding. All transitive crates are locked.
+There are no network or CLI-framework dependencies.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    A[TSV or TREC collection] --> B[Unicode or ASCII analyzer]
+    A[TSV, JSONL, or TREC collection] --> B[Unicode or ASCII analyzer]
+    B --> F[Canonical forward index and lexicon]
+    F --> C
     B --> C[Field-aware positional index]
     C --> D[v3 checksum + compressed postings + block bounds]
     C --> S[Round-robin physical shards]
@@ -71,7 +74,8 @@ flowchart LR
 The module boundaries, invariants, WAND safety argument, and binary layout are detailed in
 [docs/architecture.md](docs/architecture.md). Experiment formats and metric definitions are in
 [docs/evaluation.md](docs/evaluation.md). The exact CIFF wire, validation, scoring, and lossiness contracts are in
-[docs/ciff.md](docs/ciff.md).
+[docs/ciff.md](docs/ciff.md). The collection protocols, forward format, canonical lexicon, inversion invariants, and
+resource bounds are specified in [docs/forward-index.md](docs/forward-index.md).
 
 ## Build and quality gates
 
@@ -85,7 +89,7 @@ cargo test --release --all-targets
 ```
 
 CI runs formatting and strict Clippy on Ubuntu; release tests and builds run on Ubuntu and Windows. A
-deterministic executor benchmark and a complete TREC adapter/evaluation smoke test run on Ubuntu.
+deterministic executor benchmark plus complete TREC evaluation, sharded, CIFF, and forward-index lifecycles run on Ubuntu.
 
 ## Quick start: local TSV collection
 
@@ -118,9 +122,43 @@ cargo run --release -- inspect \
 `inspect` reports collection statistics, persisted file size, and fixed-width versus encoded posting
 bytes. It can also display one normalized posting list.
 
+## Inspectable forward-index pipeline
+
+Use `forward-build` when parsing, tokenization, and inversion need to be separate reproducible stages. The committed
+JSONL example uses the canonical `{"id":"...","fields":{"title":"...","body":"..."}}` shape; the adapter also
+accepts PISA-style `{"title":"document-id","content":"...","url":"..."}` records. The lexicon is sorted by
+`(field, normalized term)`, so its identifiers do not depend on source document order.
+
+```shell
+cargo run --release -- forward-build \
+  --input examples/collection.jsonl \
+  --output target/collection.fwd \
+  --format jsonl
+
+cargo run --release -- forward-inspect \
+  --index target/collection.fwd \
+  --document 0 \
+  --limit 12
+
+cargo run --release -- lexicon \
+  --index target/collection.fwd \
+  --field body \
+  --term retrieval
+
+cargo run --release -- forward-invert \
+  --input target/collection.fwd \
+  --output target/collection.idx
+```
+
+The `IDXFW001` snapshot preserves original fields and every normalized occurrence, stores the analyzer mode, and is
+validated against a fresh analysis before use. The resulting native index has the same positional semantics as direct
+indexing and can be passed to `search`, `batch`, sharding, or CIFF export. Run the complete example with
+[`examples/forward_demo.sh`](examples/forward_demo.sh) or
+[`examples/forward_demo.ps1`](examples/forward_demo.ps1).
+
 ## Deterministic physical sharding
 
-`shard-index` streams TSV or TREC records directly into round-robin physical builders, assigning global
+`shard-index` streams TSV, JSONL, or TREC records directly into round-robin physical builders, assigning global
 insertion IDs without first retaining a second monolithic index. `shard-search` queries each shard independently, but computes every BM25 value from one aggregate
 snapshot: global document count, per-field token totals, and per-field term document frequencies. It then
 maps local IDs back to original global IDs and merges the shard-local top-k lists by score descending and
@@ -267,6 +305,8 @@ topic  iteration  document  relevance
 
 Duplicate topic IDs and duplicate topic/document judgments are rejected instead of being resolved
 silently. Positive relevance means relevant; graded values from 1 through 31 contribute to nDCG.
+Topic files are capped at 64 MiB. Qrels are parsed with a 64 MiB total input
+ceiling and a 64 KiB raw-line ceiling, with both limits enforced while reading.
 
 ### 3. Run, verify, and evaluate
 

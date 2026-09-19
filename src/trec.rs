@@ -10,12 +10,22 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use crate::analysis::Analyzer;
+use crate::collection::{
+    CollectionFormat, CollectionLimits, InputLimitReader, index_collection,
+    index_collection_sharded, read_bounded_raw_line,
+};
 use crate::document::Document;
 use crate::error::{Error, Result};
-use crate::index::{IndexBuilder, InvertedIndex};
-use crate::shard::{ShardedIndex, ShardedIndexBuilder};
+#[cfg(test)]
+use crate::index::IndexBuilder;
+use crate::index::InvertedIndex;
+use crate::shard::ShardedIndex;
 
+#[cfg(test)]
 const MAX_TREC_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TOPICS_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_QRELS_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_QRELS_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Topic {
@@ -54,8 +64,7 @@ impl Qrels {
 /// Load either `topic-id<TAB>query text` records or classic `<top>` records
 /// with `<num> Number: ...` and `<title> ...` lines.
 pub fn load_topics(path: impl AsRef<Path>) -> Result<Vec<Topic>> {
-    let mut content = String::new();
-    BufReader::new(File::open(path)?).read_to_string(&mut content)?;
+    let content = read_topics_with_limit(File::open(path)?, MAX_TOPICS_BYTES)?;
     if content
         .lines()
         .any(|line| line.trim().eq_ignore_ascii_case("<top>"))
@@ -64,6 +73,13 @@ pub fn load_topics(path: impl AsRef<Path>) -> Result<Vec<Topic>> {
     } else {
         parse_tsv_topics(&content)
     }
+}
+
+fn read_topics_with_limit(reader: impl Read, maximum: u64) -> Result<String> {
+    let mut bytes = Vec::new();
+    InputLimitReader::new(reader, maximum).read_to_end(&mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|_| Error::InvalidArgument("topic file is not valid UTF-8".into()))
 }
 
 /// Load standard whitespace-separated qrels: `topic iteration docid relevance`.
@@ -78,10 +94,15 @@ pub fn load_qrels(path: impl AsRef<Path>) -> Result<Qrels> {
 /// one `<DOCNO>`. Repeated `<TEXT>`/`<BODY>` sections are concatenated; title
 /// uses `<TITLE>` and `<HEADLINE>` sections. Unknown markup is stripped.
 pub fn index_trec_collection(path: impl AsRef<Path>, analyzer: Analyzer) -> Result<InvertedIndex> {
-    let reader = BufReader::new(File::open(path)?);
-    index_trec_reader(reader, analyzer)
+    index_collection(
+        path,
+        analyzer,
+        CollectionFormat::Trec,
+        CollectionLimits::default(),
+    )
 }
 
+#[cfg(test)]
 fn index_trec_reader(reader: impl BufRead, analyzer: Analyzer) -> Result<InvertedIndex> {
     let mut builder = IndexBuilder::new(analyzer);
     visit_trec_reader(reader, |document| {
@@ -96,12 +117,13 @@ pub fn index_trec_collection_sharded(
     analyzer: Analyzer,
     shard_count: usize,
 ) -> Result<ShardedIndex> {
-    let mut builder = ShardedIndexBuilder::new(analyzer, shard_count)?;
-    let reader = BufReader::new(File::open(path)?);
-    visit_trec_reader(reader, |document| {
-        builder.add_document(document).map(|_| ())
-    })?;
-    Ok(builder.finish())
+    index_collection_sharded(
+        path,
+        analyzer,
+        CollectionFormat::Trec,
+        CollectionLimits::default(),
+        shard_count,
+    )
 }
 
 fn parse_tsv_topics(content: &str) -> Result<Vec<Topic>> {
@@ -217,9 +239,30 @@ fn push_topic(
 }
 
 pub(crate) fn parse_qrels(reader: impl BufRead) -> Result<Qrels> {
+    parse_qrels_with_limits(reader, MAX_QRELS_BYTES, MAX_QRELS_LINE_BYTES)
+}
+
+fn parse_qrels_with_limits(
+    reader: impl BufRead,
+    max_input_bytes: u64,
+    max_line_bytes: usize,
+) -> Result<Qrels> {
+    if max_input_bytes == 0 || max_line_bytes == 0 {
+        return Err(Error::InvalidArgument(
+            "qrels byte limits must be positive".into(),
+        ));
+    }
+    let mut reader = BufReader::new(InputLimitReader::new(reader, max_input_bytes));
     let mut judgments = BTreeMap::<String, BTreeMap<String, i32>>::new();
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
+    let mut line_index = 0_usize;
+    while let Some(line) = read_bounded_raw_line(
+        &mut reader,
+        max_line_bytes,
+        max_line_bytes,
+        line_index + 1,
+        "qrels",
+    )? {
+        line_index += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -267,33 +310,64 @@ pub(crate) fn parse_qrels(reader: impl BufRead) -> Result<Qrels> {
     Ok(Qrels { judgments })
 }
 
-fn visit_trec_reader(
+#[cfg(test)]
+pub(crate) fn visit_trec_reader(
     reader: impl BufRead,
     mut add_document: impl FnMut(Document) -> Result<()>,
 ) -> Result<()> {
+    visit_trec_reader_with_limit(reader, MAX_TREC_RECORD_BYTES, &mut add_document)
+}
+
+pub(crate) fn visit_trec_reader_with_limit(
+    mut reader: impl BufRead,
+    max_record_bytes: usize,
+    mut add_document: impl FnMut(Document) -> Result<()>,
+) -> Result<()> {
+    if max_record_bytes == 0 {
+        return Err(Error::InvalidArgument(
+            "TREC record byte limit must be positive".into(),
+        ));
+    }
     let mut in_document = false;
     let mut record = String::new();
+    let mut record_bytes = 0_usize;
     let mut record_start = 0;
     let mut document_count = 0_usize;
 
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
+    let mut line_index = 0_usize;
+    loop {
+        let remaining = if in_document {
+            max_record_bytes.saturating_sub(record_bytes)
+        } else {
+            max_record_bytes
+        };
+        let Some(line) = read_bounded_raw_line(
+            &mut reader,
+            remaining,
+            max_record_bytes,
+            line_index + 1,
+            "TREC record",
+        )?
+        else {
+            break;
+        };
+        line_index += 1;
+        let raw_bytes = line.len();
         let trimmed = line.trim();
         if trimmed.eq_ignore_ascii_case("<DOC>") {
             if in_document {
                 return Err(Error::InvalidDocument(format!(
-                    "nested <DOC> at collection line {}",
-                    line_index + 1
+                    "nested <DOC> at collection line {line_index}"
                 )));
             }
             in_document = true;
             record.clear();
-            record_start = line_index + 1;
+            record_bytes = raw_bytes;
+            record_start = line_index;
         } else if trimmed.eq_ignore_ascii_case("</DOC>") {
             if !in_document {
                 return Err(Error::InvalidDocument(format!(
-                    "unexpected </DOC> at collection line {}",
-                    line_index + 1
+                    "unexpected </DOC> at collection line {line_index}"
                 )));
             }
             let document = parse_trec_document(&record, record_start)?;
@@ -301,18 +375,12 @@ fn visit_trec_reader(
             document_count += 1;
             in_document = false;
         } else if in_document {
-            let extra = line.len().saturating_add(1);
-            if record.len().saturating_add(extra) > MAX_TREC_RECORD_BYTES {
-                return Err(Error::InvalidDocument(format!(
-                    "TREC record at line {record_start} exceeds {MAX_TREC_RECORD_BYTES} bytes"
-                )));
-            }
-            record.push_str(&line);
+            record_bytes += raw_bytes;
+            record.push_str(line.trim_end_matches('\n').trim_end_matches('\r'));
             record.push('\n');
         } else if !trimmed.is_empty() {
             return Err(Error::InvalidDocument(format!(
-                "content outside <DOC> at collection line {}",
-                line_index + 1
+                "content outside <DOC> at collection line {line_index}"
             )));
         }
     }
@@ -453,6 +521,7 @@ fn valid_trec_token(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::io::Cursor;
 
     use super::*;
@@ -475,6 +544,47 @@ mod tests {
                 text: "International Organized Crime".into()
             }]
         );
+    }
+
+    #[test]
+    fn topic_reader_stops_after_the_declared_byte_ceiling() {
+        let mut source = Cursor::new(vec![b'x'; 20_000]);
+        let error = read_topics_with_limit(&mut source, 9_000).unwrap_err();
+        assert!(error.to_string().contains("exceeds 9000 byte limit"));
+        assert_eq!(source.position(), 9_001);
+    }
+
+    #[test]
+    fn qrels_reader_bounds_both_a_line_and_the_full_stream() {
+        let mut long_line = Cursor::new(vec![b'x'; 20_000]);
+        let error = parse_qrels_with_limits(&mut long_line, 30_000, 32).unwrap_err();
+        assert!(error.to_string().contains("exceeds 32 bytes"));
+        assert!(long_line.position() <= 8_192);
+
+        let mut rows = String::new();
+        for id in 0..2_000 {
+            writeln!(rows, "1 0 D{id} 1").unwrap();
+        }
+        let mut many_lines = Cursor::new(rows.into_bytes());
+        let error = parse_qrels_with_limits(&mut many_lines, 9_000, 64).unwrap_err();
+        assert!(error.to_string().contains("exceeds 9000 byte limit"));
+        assert_eq!(many_lines.position(), 9_001);
+    }
+
+    #[test]
+    fn trec_reader_bounds_one_line_and_the_complete_doc_block() {
+        let mut input = b"<DOC>\n".to_vec();
+        input.extend(std::iter::repeat_n(b'x', 20_000));
+        let mut source = Cursor::new(input);
+        let error = visit_trec_reader_with_limit(&mut source, 32, |_| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("exceeds 32 bytes"));
+        assert_eq!(source.position(), 33);
+
+        let mut source =
+            Cursor::new(b"<DOC>\n<DOCNO>D1</DOCNO>\n<TEXT>x</TEXT>\n</DOC>\n".to_vec());
+        let error = visit_trec_reader_with_limit(&mut source, 40, |_| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("exceeds 40 bytes"));
+        assert!(source.position() <= 41);
     }
 
     #[test]

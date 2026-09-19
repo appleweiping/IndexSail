@@ -6,6 +6,8 @@
 |---|---|
 | `analysis` | Deterministic Unicode/ASCII tokenization, normalization, and positions |
 | `document` | External identifiers and validated, deterministically ordered named fields |
+| `collection` | Bounded TSV, JSONL, and TREC dispatch shared by direct, sharded, and forward builds |
+| `forward` | Canonical field-qualified lexicon, occurrence snapshots, v1 persistence, and exact inversion |
 | `index` | Builder, immutable document table, field lengths, dictionary, positional postings |
 | `query` | Typed terms, `AND`/`OR`, phrase constraints, and exact-field filters |
 | `search` | BM25 scorers, exhaustive/WAND/block-max WAND/MaxScore execution, stable heap, explanations and counters |
@@ -13,7 +15,7 @@
 | `ciff` | CIFF v1 model, bounded protobuf framing, d-gap validation, canonical export and portable BM25 |
 | `codec` | Posting gaps, base-128 variable bytes, codec statistics, payload checksum |
 | `persistence` | v3 writer, v3/v2/v1 readers, checksums, bounds and structural validation |
-| `trec` | Collection, topic and qrels adapters |
+| `trec` | TREC collection subset, topic, and qrels adapters |
 | `evaluation` | Generic monolithic/sharded batch execution, executor oracle, metrics, run and JSON writers |
 | `benchmark` | Seeded workload, monolithic/sharded exhaustive oracle, checksum and JSON report |
 | `atomic` | Same-directory staged persistence and recoverable multi-output commits |
@@ -26,13 +28,20 @@ sequenceDiagram
     participant U as Caller or CLI
     participant A as Collection adapter
     participant N as Analyzer
+    participant F as ForwardIndex
     participant B as IndexBuilder
     participant I as InvertedIndex
     participant S as ShardedIndexBuilder
     participant P as Persistence
 
-    U->>A: TSV rows or TREC DOC blocks
+    U->>A: TSV rows, JSONL objects, or TREC DOC blocks
     A->>N: named UTF-8 field values
+    opt inspectable forward pipeline
+        N-->>F: normalized field-qualified occurrences
+        F->>P: canonical lexicon + original fields + term IDs
+        P-->>F: checksummed IDXFW001 snapshot
+        F->>B: exact positional inversion
+    end
     N-->>B: normalized tokens + ordinal positions
     B->>I: documents + lengths + sorted postings
     I->>I: fielded + all-field block bounds
@@ -95,6 +104,28 @@ sequenceDiagram
     contain finite bounds that bit-match recomputation from the postings.
 
 The builder establishes these invariants. All persistence readers distrust and validate stored data again.
+
+## Collection and forward-index invariants
+
+The shared collection boundary accepts exactly three explicit protocols. TSV requires an `id` column and at least
+one unique validated field column. Canonical JSONL requires only a string `id` and a nonempty object of unique string
+fields. PISA-style JSONL requires string `title` and `content`, treats `title` as the external identifier, maps content
+to `body`, and retains a nonempty string `url`; mixing either JSON shape or supplying unknown keys is an error. The
+TREC path retains the narrower adapter contract below. Every path validates UTF-8, regular-file size, record size,
+field count, document count, and the normal `Document` invariants before invoking a builder.
+
+A forward lexicon is strictly sorted and unique by `(field, normalized term)`. Each document retains its original
+ordered field map and one term-ID sequence per field; sequence order is token position. Every ID resolves to the
+same field and token produced by re-analyzing the stored value, every lexicon term is used, external IDs are unique,
+and aggregate document, field, term, string, and occurrence counts are bounded. Inversion groups equal IDs within
+each document, preserving positions and frequencies, then passes all reconstructed state through the same
+`InvertedIndex` invariant validator as direct indexing.
+
+`IDXFW001` persists analyzer mode, lexicon, source documents, and occurrence sequences under an exact payload length
+and FNV-1a checksum. Loading checks the file and declared sizes before allocation, checks minimum structural bytes
+before collection-sized allocation, requires exact EOF, then re-establishes all semantic invariants. The checksum
+detects accidental corruption but is not authentication. Saving uses same-directory atomic replacement; building a
+forward snapshot intentionally materializes the source collection and term sequences, unlike direct streaming.
 
 ## Physical-shard invariants and exact merge
 
@@ -290,7 +321,12 @@ shard. This deliberate CPU-for-memory trade keeps format-v1 bytes stable.
 - Topic files reject empty text and duplicates.
 - Qrels require exactly four columns and one judgment per topic/document pair.
 - Relevance above 31 is rejected to keep exponential gain finite and reproducible.
-- TREC collection records are streamed and limited to 64 MiB each.
+- TREC collection records are streamed and limited to 64 MiB per raw block,
+  with single lines bounded before allocation.
+- Collection input reads are metered against the 4 GiB default ceiling; path
+  replacement or append during parsing is rejected.
+- Topic inputs have a 64 MiB total cap. Qrels have a 64 MiB total cap and
+  a 64 KiB raw-line cap.
 - `<DOC>` markers must be line-separated; exactly one `<DOCNO>` is required.
 - Only documented content tags are extracted. Unknown nested markup is removed.
 

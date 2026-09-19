@@ -16,9 +16,11 @@ pub mod benchmark;
 pub mod ciff;
 pub mod cli;
 pub mod codec;
+pub mod collection;
 pub mod document;
 pub mod error;
 pub mod evaluation;
+pub mod forward;
 pub mod index;
 pub mod persistence;
 pub mod query;
@@ -32,11 +34,17 @@ pub use ciff::{
     CiffPostingList, CiffRetrieval, CiffSearchOptions, CiffStats,
 };
 pub use codec::PostingCodecStats;
+pub use collection::{
+    CollectionFormat, CollectionLimits, index_collection, index_collection_sharded, load_collection,
+};
 pub use document::Document;
 pub use error::{Error, Result};
 pub use evaluation::{
     AggregateMetrics, BatchConfig, BatchReport, QueryMetrics, QueryReport, RetrievalBackend,
     evaluate_batch, write_json_report, write_trec_run,
+};
+pub use forward::{
+    FORWARD_FORMAT_VERSION, ForwardDocument, ForwardIndex, ForwardStats, ForwardTerm, TermId,
 };
 pub use index::{IndexBuilder, IndexStats, InvertedIndex, Posting};
 pub use query::{BooleanOperator, FieldFilter, PhraseFilter, QueryTerm, SearchQuery};

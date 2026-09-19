@@ -77,6 +77,19 @@ jobs:
           cargo run --locked --release -- batch --index target/ci.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci.run --report target/ci-report.json --field body --top-k 10 --verify
           test -s target/ci.run
           test -s target/ci-report.json
+      - name: Forward index and JSONL collection lifecycle smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo run --locked --release -- forward-build --input examples/collection.jsonl --output target/ci.fwd --format jsonl
+          cargo run --locked --release -- forward-inspect --index target/ci.fwd --document 0 --limit 10 | tee target/ci-forward-inspect.txt
+          cargo run --locked --release -- lexicon --index target/ci.fwd --field body --term retrieval | tee target/ci-lexicon.txt
+          cargo run --locked --release -- forward-invert --input target/ci.fwd --output target/ci-forward.idx
+          cargo run --locked --release -- search --index target/ci-forward.idx --query "local documents" --field body --top-k 10 | tee target/ci-forward-search.txt
+          test -s target/ci.fwd
+          test -s target/ci-forward.idx
+          grep -q 'documents=4' target/ci-forward-inspect.txt
+          grep -q $'body\tretrieval' target/ci-lexicon.txt
+          grep -q 'DOC-001' target/ci-forward-search.txt
       - name: Sharded TREC lifecycle smoke test
         if: matrix.os == 'ubuntu-latest'
         run: |
