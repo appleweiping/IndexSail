@@ -42,6 +42,8 @@ cargo run --release -- search \
 
 The committed `examples/forward_demo.sh` and `examples/forward_demo.ps1` run
 that chain without network access.
+For bounded native document-ID permutation after `forward-build`, see
+[document-ID reordering](reordering.md).
 
 ## Collection protocols
 

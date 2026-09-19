@@ -24,6 +24,7 @@ pub mod forward;
 pub mod index;
 pub mod persistence;
 pub mod query;
+pub mod reorder;
 pub mod search;
 pub mod shard;
 pub mod trec;
@@ -48,6 +49,7 @@ pub use forward::{
 };
 pub use index::{IndexBuilder, IndexStats, InvertedIndex, Posting};
 pub use query::{BooleanOperator, FieldFilter, PhraseFilter, QueryTerm, SearchQuery};
+pub use reorder::{DocIdMap, MAX_REORDER_DOCUMENTS};
 pub use search::{
     Bm25Params, Explanation, PruningStrategy, SearchHit, SearchOptions, SearchOutcome, SearchStats,
     TermContribution,

@@ -82,6 +82,22 @@ pub(crate) fn atomic_write_many(outputs: &[(&Path, &[u8])]) -> Result<()> {
     OutputTransaction::new(staged).commit()
 }
 
+/// Stream several related outputs into one recoverable transaction, avoiding
+/// a second full in-memory copy of each serialized index.
+pub(crate) fn atomic_write_many_with(outputs: &mut [StreamedOutput<'_>]) -> Result<()> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    ensure_distinct_targets(outputs.iter().map(|(path, _)| *path))?;
+    let mut staged = Vec::with_capacity(outputs.len());
+    for (path, write) in outputs {
+        staged.push(StagedOutput::from_writer(path, |file| write(file))?);
+    }
+    OutputTransaction::new(staged).commit()
+}
+
+type StreamedOutput<'a> = (&'a Path, &'a mut dyn FnMut(&mut File) -> Result<()>);
+
 fn ensure_distinct_targets<'a>(paths: impl Iterator<Item = &'a Path>) -> Result<()> {
     let paths = paths.collect::<Vec<_>>();
     for left in 0..paths.len() {

@@ -4,6 +4,24 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-19
+
+- Added a scoped, native document-ID reordering workflow for checksummed
+  forward snapshots: portable seeded random shuffle, deterministic UTF-8
+  feature sorting, and checked two-column old-to-new permutations. The CLI
+  emits both map directions, a reordered forward snapshot, and a rebuilt
+  positional inverted index in one rollback-capable four-output transaction.
+- Preserved external IDs, named fields, normalized occurrences, and BM25
+  scores across reordered indexes. Frozen permutation oracles, posting-list
+  remapping checks, persistence/CLI tests, and CI compare query hits by
+  external ID and score and verify the inverse map. Exact-score ties can
+  legitimately change rank because native tie-breaking uses internal ID.
+- Bounded the workflow to 256 MiB of forward payload, 1,000,000 documents,
+  20,000,000 token occurrences, and 64 MiB per feature or mapping file.
+  This release does **not** implement recursive graph bisection and does not
+  claim PISA byte or RNG compatibility; the broader PISA reordering roadmap
+  item remains open.
+
 ## [0.7.0] - 2026-09-08
 
 - Added one bounded collection API for header-led TSV, the documented TREC

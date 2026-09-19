@@ -10,6 +10,8 @@ queries, and runs
 reproducible TREC-style experiments from collection ingestion through metrics and run files. A collection can also
 be partitioned into independently searchable physical shards while using collection-wide statistics and an exact,
 deterministic global top-k merge, or exported to and searched directly from the interoperable CIFF v1 format.
+Native forward snapshots can be reordered by a seeded shuffle, document feature, or validated explicit mapping;
+recursive graph bisection remains outside the v0.8.0 scope.
 
 The design favors observable algorithms, deterministic results, explicit format contracts, and strict
 input validation. It is useful for teaching, local research prototypes, regression oracles, and
@@ -23,6 +25,7 @@ experiments small enough to fit in one process.
 | Analysis | Deterministic Unicode or ASCII tokenization, stored with the index |
 | Index | Named fields, stable external IDs, positions, field lengths, DF and collection statistics |
 | Forward pipeline | Canonical field-qualified lexicon, occurrence-preserving forward snapshots, inspection, and exact inversion |
+| Reordering | Seeded random, feature-sorted, or explicit document-ID permutation; bidirectional maps and rebuilt native indexes |
 | Sharding | Deterministic round-robin physical shards, global BM25 statistics, stable merged top-k |
 | Retrieval | BM25, `AND`/`OR`, fielded terms, phrases, exact field filters, explanations |
 | Execution | Exhaustive oracle, exact WAND, block-max WAND, and MaxScore with stable tie-breaking |
@@ -76,6 +79,8 @@ The module boundaries, invariants, WAND safety argument, and binary layout are d
 [docs/evaluation.md](docs/evaluation.md). The exact CIFF wire, validation, scoring, and lossiness contracts are in
 [docs/ciff.md](docs/ciff.md). The collection protocols, forward format, canonical lexicon, inversion invariants, and
 resource bounds are specified in [docs/forward-index.md](docs/forward-index.md).
+The supported document-ID reordering methods and native-format boundaries are in
+[docs/reordering.md](docs/reordering.md).
 
 ## Build and quality gates
 
@@ -89,7 +94,8 @@ cargo test --release --all-targets
 ```
 
 CI runs formatting and strict Clippy on Ubuntu; release tests and builds run on Ubuntu and Windows. A
-deterministic executor benchmark plus complete TREC evaluation, sharded, CIFF, and forward-index lifecycles run on Ubuntu.
+deterministic executor benchmark plus complete TREC evaluation, sharded, CIFF, forward-index, and
+document-reordering lifecycles run on Ubuntu.
 
 ## Quick start: local TSV collection
 

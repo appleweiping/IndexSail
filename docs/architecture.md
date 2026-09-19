@@ -8,6 +8,7 @@
 | `document` | External identifiers and validated, deterministically ordered named fields |
 | `collection` | Bounded TSV, JSONL, and TREC dispatch shared by direct, sharded, and forward builds |
 | `forward` | Canonical field-qualified lexicon, occurrence snapshots, v1 persistence, and exact inversion |
+| `reorder` | Bounded, validated old/new ID permutations for native forward-index rebuilding |
 | `index` | Builder, immutable document table, field lengths, dictionary, positional postings |
 | `query` | Typed terms, `AND`/`OR`, phrase constraints, and exact-field filters |
 | `search` | BM25 scorers, exhaustive/WAND/block-max WAND/MaxScore execution, stable heap, explanations and counters |

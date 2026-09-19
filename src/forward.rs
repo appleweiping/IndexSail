@@ -17,6 +17,7 @@ use crate::collection::{CollectionFormat, CollectionLimits, load_collection};
 use crate::document::{Document, validate_field_name};
 use crate::error::{Error, Result};
 use crate::index::{InvertedIndex, Posting, TermKey};
+use crate::reorder::{DocIdMap, MAX_REORDER_FORWARD_BYTES, MAX_REORDER_OCCURRENCES};
 
 const MAGIC: &[u8; 8] = b"IDXFW001";
 pub const FORWARD_FORMAT_VERSION: u32 = 1;
@@ -256,6 +257,43 @@ impl ForwardIndex {
         &self.documents
     }
 
+    /// Reassign internal IDs while preserving each document's external ID,
+    /// stored fields, normalized occurrences, and canonical term lexicon.
+    pub fn reordered(&self, mapping: &DocIdMap) -> Result<Self> {
+        if mapping.len() != self.documents.len() {
+            return Err(Error::InvalidArgument(format!(
+                "document mapping has {} entries; forward index has {} documents",
+                mapping.len(),
+                self.documents.len()
+            )));
+        }
+        if self.occurrences > MAX_REORDER_OCCURRENCES {
+            return Err(Error::InvalidArgument(format!(
+                "reordering exceeds {MAX_REORDER_OCCURRENCES} occurrence limit"
+            )));
+        }
+        let mut counter = ByteCounter::default();
+        self.write_payload(&mut counter)?;
+        if counter.bytes > MAX_REORDER_FORWARD_BYTES {
+            return Err(Error::InvalidArgument(format!(
+                "reordering exceeds {MAX_REORDER_FORWARD_BYTES} forward payload byte limit"
+            )));
+        }
+        let mut documents = Vec::new();
+        documents.try_reserve_exact(mapping.len()).map_err(|_| {
+            Error::InvalidArgument("could not allocate reordered forward documents".into())
+        })?;
+        for &old in mapping.new_to_old() {
+            documents.push(self.documents[old as usize].clone());
+        }
+        Ok(Self {
+            analyzer: self.analyzer,
+            terms: self.terms.clone(),
+            documents,
+            occurrences: self.occurrences,
+        })
+    }
+
     pub fn term(&self, id: TermId) -> Option<&ForwardTerm> {
         usize::try_from(id)
             .ok()
@@ -350,6 +388,11 @@ impl ForwardIndex {
 
     /// Atomically persist a checksummed version 1 forward snapshot.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        atomic_write_with(path.as_ref(), |writer| self.write_to(writer))
+    }
+
+    /// Serialize the same version 1 forward snapshot to a caller-owned writer.
+    pub fn write_to(&self, mut writer: impl Write) -> Result<()> {
         let mut counter = ByteCounter::default();
         self.write_payload(&mut counter)?;
         if counter.bytes > MAX_PAYLOAD_BYTES {
@@ -371,14 +414,12 @@ impl ForwardIndex {
                 "forward payload exceeds {MAX_PAYLOAD_BYTES} byte safety limit"
             )));
         }
-        atomic_write_with(path.as_ref(), |writer| {
-            writer.write_all(MAGIC)?;
-            write_u32(writer, FORWARD_FORMAT_VERSION)?;
-            write_u64(writer, payload_length)?;
-            write_u64(writer, checksum(&payload))?;
-            writer.write_all(&payload)?;
-            Ok(())
-        })
+        writer.write_all(MAGIC)?;
+        write_u32(&mut writer, FORWARD_FORMAT_VERSION)?;
+        write_u64(&mut writer, payload_length)?;
+        write_u64(&mut writer, checksum(&payload))?;
+        writer.write_all(&payload)?;
+        Ok(())
     }
 
     /// Load and semantically validate a version 1 forward snapshot.
@@ -909,6 +950,114 @@ mod tests {
         let mut direct_bytes = Vec::new();
         direct.finish().write_to(&mut direct_bytes).unwrap();
         assert_eq!(inverted_bytes, direct_bytes);
+    }
+
+    #[test]
+    fn reordering_preserves_external_id_search_semantics_and_persistence() {
+        use crate::query::{FieldFilter, PhraseFilter, SearchQuery};
+        use crate::search::{PruningStrategy, SearchOptions};
+
+        let source = vec![
+            Document::from_fields("A", [("body", "blue sea blue"), ("kind", "water")]).unwrap(),
+            Document::from_fields("B", [("body", "red wind"), ("kind", "air")]).unwrap(),
+            Document::from_fields("C", [("body", "blue wind sea"), ("kind", "water")]).unwrap(),
+            Document::from_fields("D", [("body", "sea wind wind"), ("kind", "water")]).unwrap(),
+        ];
+        let forward = ForwardIndex::from_documents(Analyzer::default(), source).unwrap();
+        let original = forward.invert().unwrap();
+        let mappings = [
+            DocIdMap::from_old_to_new(vec![3, 0, 2, 1]).unwrap(),
+            DocIdMap::by_feature(4, b"z\na\nc\nb\n".as_slice()).unwrap(),
+            DocIdMap::random(4, 17).unwrap(),
+        ];
+        for mapping in mappings {
+            let reordered = forward.reordered(&mapping).unwrap();
+            assert_eq!(reordered.stats(), forward.stats());
+            assert_eq!(reordered.terms(), forward.terms());
+            for (old, &new) in mapping.old_to_new().iter().enumerate() {
+                assert_eq!(
+                    reordered.documents()[new as usize],
+                    forward.documents()[old]
+                );
+            }
+            let forward_path = temp_path("reordered.fwd");
+            let index_path = temp_path("reordered.idx");
+            reordered.save(&forward_path).unwrap();
+            assert_eq!(ForwardIndex::load(&forward_path).unwrap(), reordered);
+            let rebuilt = reordered.invert().unwrap();
+            rebuilt.save(&index_path).unwrap();
+            let loaded = InvertedIndex::load(&index_path).unwrap();
+            assert_eq!(loaded.documents(), rebuilt.documents());
+            for term in ["blue", "sea", "wind", "red"] {
+                let mut expected = original
+                    .postings("body", term)
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .map(|mut posting| {
+                        posting.doc_id = mapping.old_to_new()[posting.doc_id as usize];
+                        posting
+                    })
+                    .collect::<Vec<_>>();
+                expected.sort_by_key(|posting| posting.doc_id);
+                assert_eq!(loaded.postings("body", term).unwrap(), expected);
+            }
+            for text in ["blue", "sea wind", "red wind"] {
+                let query =
+                    SearchQuery::from_text(original.analyzer(), text, Some("body")).unwrap();
+                for pruning in [PruningStrategy::Exhaustive, PruningStrategy::Wand] {
+                    let options = SearchOptions {
+                        top_k: 4,
+                        pruning,
+                        ..SearchOptions::default()
+                    };
+                    let before = original.search(&query, options).unwrap();
+                    let after = loaded.search(&query, options).unwrap();
+                    let by_external = |hits: &[crate::search::SearchHit]| {
+                        hits.iter()
+                            .map(|hit| (hit.external_id.clone(), hit.score.to_bits()))
+                            .collect::<BTreeMap<_, _>>()
+                    };
+                    assert_eq!(by_external(&before.hits), by_external(&after.hits));
+                }
+            }
+            let query = SearchQuery::from_text(original.analyzer(), "blue sea", Some("body"))
+                .unwrap()
+                .with_phrase(
+                    PhraseFilter::from_text(original.analyzer(), "blue sea", Some("body".into()))
+                        .unwrap(),
+                )
+                .with_filter(FieldFilter::exact("kind", "water").unwrap());
+            let options = SearchOptions {
+                top_k: 4,
+                pruning: PruningStrategy::Exhaustive,
+                ..SearchOptions::default()
+            };
+            let before = original.search(&query, options).unwrap();
+            let after = loaded.search(&query, options).unwrap();
+            assert_eq!(before.hits.len(), 1);
+            assert_eq!(before.hits[0].external_id, after.hits[0].external_id);
+            assert_eq!(
+                before.hits[0].score.to_bits(),
+                after.hits[0].score.to_bits()
+            );
+            std::fs::remove_file(forward_path).unwrap();
+            std::fs::remove_file(index_path).unwrap();
+        }
+        assert!(
+            forward
+                .reordered(&DocIdMap::from_old_to_new(vec![1, 0]).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn empty_forward_index_can_be_reordered_and_inverted() {
+        let empty = ForwardIndex::from_documents(Analyzer::default(), Vec::new()).unwrap();
+        let mapping = DocIdMap::random(0, 3).unwrap();
+        let reordered = empty.reordered(&mapping).unwrap();
+        assert_eq!(reordered, empty);
+        assert_eq!(reordered.invert().unwrap().stats().documents, 0);
     }
 
     #[test]

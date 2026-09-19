@@ -1,10 +1,14 @@
 # Release process
 
-A push of a semantic-version tag such as `v0.7.0` invokes the release
+A push of a semantic-version tag such as `v0.8.0` invokes the release
 workflow. The workflow refuses a tag that differs from `Cargo.toml`, runs the
 release-mode test suite with the minimum supported Rust toolchain, builds
 Linux and Windows binaries, and creates the source `.crate` from the committed
 lockfile.
+
+The v0.8.0 scope is the native seeded-random, by-feature, and explicit-mapping
+reordering workflow. Recursive graph bisection remains unimplemented; this
+release does not close the broader PISA reordering roadmap item.
 
 The GitHub Release contains platform archives, the source crate, a CycloneDX
 1.5 SBOM, and `SHA256SUMS`. The SBOM is generated from locked Cargo metadata
@@ -18,7 +22,7 @@ Verify a downloaded file with:
 
 ```bash
 sha256sum --check SHA256SUMS
-gh attestation verify indexsail-v0.7.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify indexsail-v0.8.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo appleweiping/IndexSail
 ```
 

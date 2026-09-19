@@ -3,7 +3,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::analysis::{AnalysisMode, Analyzer};
-use crate::atomic::{atomic_write, atomic_write_many, atomic_write_with, prevalidate_output_path};
+use crate::atomic::{
+    atomic_write, atomic_write_many, atomic_write_many_with, atomic_write_with,
+    prevalidate_output_path,
+};
 use crate::benchmark::{BenchmarkConfig, run as run_benchmark, write_json as write_benchmark_json};
 use crate::ciff::{CiffIndex, CiffSearchOptions};
 use crate::collection::{
@@ -16,6 +19,7 @@ use crate::forward::ForwardIndex;
 use crate::index::{InternalDocId, InvertedIndex};
 use crate::persistence::{block_max_metadata_encoded_bytes, persisted_format_version};
 use crate::query::{BooleanOperator, FieldFilter, PhraseFilter, SearchQuery};
+use crate::reorder::{DocIdMap, MAX_REORDER_FORWARD_BYTES};
 use crate::search::{Bm25Params, PruningStrategy, SearchOptions, SearchOutcome};
 use crate::shard::{ShardedIndex, persisted_sharded_format_version};
 use crate::trec::{load_qrels, load_topics};
@@ -29,6 +33,8 @@ USAGE:\n\
   indexsail shard-index --input COLLECTION --output SHARDS.idx --shards N [--format tsv|trec|jsonl] [--ascii]\n\
   indexsail forward-build --input COLLECTION --output INDEX.fwd [--format tsv|trec|jsonl] [--ascii]\n\
   indexsail forward-invert --input INDEX.fwd --output INDEX.idx\n\
+  indexsail reorder --input INDEX.fwd --forward-output NEW.fwd --index-output NEW.idx\n\
+    --old-to-new OLD.map --new-to-old NEW.map (--random [--seed N] | --by-feature FILE | --from-mapping FILE)\n\
   indexsail forward-inspect --index INDEX.fwd [--document N] [--limit N]\n\
   indexsail lexicon --index INDEX.fwd [--id N | --field NAME --term TERM | --offset N --limit N]\n\
   indexsail search --index INDEX.idx --query TEXT [OPTIONS]\n\
@@ -64,6 +70,13 @@ BATCH OPTIONS:\n\
   --verify                 Compare the selected strategy against exhaustive exactly\n\
   --field/--operator/...   Same ranking controls as search\n\
 \n\
+REORDER OPTIONS:\n\
+  --random [--seed N]      Portable seeded shuffle (default seed: 0)\n\
+  --by-feature FILE        One UTF-8 feature line per original document ID\n\
+  --from-mapping FILE      Two columns: original ID, new ID\n\
+  --old-to-new FILE        Write original-to-new two-column map\n\
+  --new-to-old FILE        Write new-to-original two-column map\n\
+\n\
 CIFF OPTIONS:\n\
   --ascii                  Use ASCII-compatible query analysis instead of Unicode\n\
   --operator and|or        Boolean term semantics (default: or)\n\
@@ -91,6 +104,7 @@ where
         "shard-index" => command_shard_index(&remaining, &mut output),
         "forward-build" => command_forward_build(&remaining, &mut output),
         "forward-invert" => command_forward_invert(&remaining, &mut output),
+        "reorder" => command_reorder(&remaining, &mut output),
         "forward-inspect" => command_forward_inspect(&remaining, &mut output),
         "lexicon" => command_lexicon(&remaining, &mut output),
         "search" => command_search(&remaining, &mut output),
@@ -500,6 +514,127 @@ fn command_forward_invert(arguments: &[String], output: &mut impl Write) -> Resu
         input,
         destination
     )?;
+    Ok(())
+}
+
+fn command_reorder(arguments: &[String], output: &mut impl Write) -> Result<()> {
+    let parsed = ParsedOptions::parse(
+        arguments,
+        &["--random"],
+        &[
+            "--input",
+            "--forward-output",
+            "--index-output",
+            "--old-to-new",
+            "--new-to-old",
+            "--seed",
+            "--by-feature",
+            "--from-mapping",
+        ],
+    )?;
+    let source = Path::new(parsed.required_one("--input")?);
+    let forward_output = Path::new(parsed.required_one("--forward-output")?);
+    let index_output = Path::new(parsed.required_one("--index-output")?);
+    let old_to_new_output = Path::new(parsed.required_one("--old-to-new")?);
+    let new_to_old_output = Path::new(parsed.required_one("--new-to-old")?);
+    let feature_source = parsed.optional_one("--by-feature")?.map(Path::new);
+    let mapping_source = parsed.optional_one("--from-mapping")?.map(Path::new);
+    let seed = parsed.optional_one("--seed")?;
+    let methods = usize::from(parsed.flag("--random"))
+        + usize::from(feature_source.is_some())
+        + usize::from(mapping_source.is_some());
+    if methods != 1 {
+        return Err(Error::InvalidArgument(
+            "choose exactly one of --random, --by-feature, or --from-mapping".into(),
+        ));
+    }
+    if seed.is_some() && !parsed.flag("--random") {
+        return Err(Error::InvalidArgument(
+            "--seed is only valid with --random".into(),
+        ));
+    }
+
+    validate_reorder_paths(
+        [Some(source), feature_source, mapping_source],
+        [
+            forward_output,
+            index_output,
+            old_to_new_output,
+            new_to_old_output,
+        ],
+    )?;
+
+    let source_bytes = std::fs::metadata(source)?.len();
+    if source_bytes > MAX_REORDER_FORWARD_BYTES + 28 {
+        return Err(Error::InvalidArgument(format!(
+            "reorder forward source exceeds {MAX_REORDER_FORWARD_BYTES} payload byte limit"
+        )));
+    }
+    let forward = ForwardIndex::load(source)?;
+    let count = forward.documents().len();
+    let (method, mapping) = if parsed.flag("--random") {
+        let seed = seed.unwrap_or("0").parse::<u64>().map_err(|_| {
+            Error::InvalidArgument("--seed must be an unsigned 64-bit integer".into())
+        })?;
+        (
+            format!("random seed={seed}"),
+            DocIdMap::random(count, seed)?,
+        )
+    } else if let Some(path) = feature_source {
+        (
+            "by-feature".to_owned(),
+            DocIdMap::by_feature(count, std::fs::File::open(path)?)?,
+        )
+    } else {
+        let path = mapping_source.expect("exactly one method was selected");
+        (
+            "from-mapping".to_owned(),
+            DocIdMap::from_mapping_reader(count, std::fs::File::open(path)?)?,
+        )
+    };
+    let reordered = forward.reordered(&mapping)?;
+    let inverted = reordered.invert()?;
+    let mut write_forward = |file: &mut std::fs::File| reordered.write_to(file);
+    let mut write_index = |file: &mut std::fs::File| inverted.write_to(file);
+    let mut write_old_to_new = |file: &mut std::fs::File| mapping.write_old_to_new(file);
+    let mut write_new_to_old = |file: &mut std::fs::File| mapping.write_new_to_old(file);
+    atomic_write_many_with(&mut [
+        (forward_output, &mut write_forward),
+        (index_output, &mut write_index),
+        (old_to_new_output, &mut write_old_to_new),
+        (new_to_old_output, &mut write_new_to_old),
+    ])?;
+    writeln!(
+        output,
+        "reordered documents={count} method={method} forward={} index={} old_to_new={} new_to_old={}",
+        forward_output.display(),
+        index_output.display(),
+        old_to_new_output.display(),
+        new_to_old_output.display(),
+    )?;
+    Ok(())
+}
+
+fn validate_reorder_paths(inputs: [Option<&Path>; 3], outputs: [&Path; 4]) -> Result<()> {
+    for destination in outputs {
+        prevalidate_output_path(destination)?;
+        for input in inputs.into_iter().flatten() {
+            if paths_conflict(input, destination)? {
+                return Err(Error::InvalidArgument(
+                    "reorder input and output paths must be distinct".into(),
+                ));
+            }
+        }
+    }
+    for left in 0..outputs.len() {
+        for right in left + 1..outputs.len() {
+            if paths_conflict(outputs[left], outputs[right])? {
+                return Err(Error::InvalidArgument(
+                    "reorder output paths must be distinct".into(),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1488,6 +1623,230 @@ mod tests {
     #[test]
     fn unknown_command_is_rejected() {
         assert!(execute(["unknown"], Vec::new()).is_err());
+    }
+
+    #[test]
+    fn reorder_cli_rebuilds_both_indexes_and_writes_inverse_maps() {
+        let collection = temp_path("tsv");
+        let source = temp_path("fwd");
+        let new_forward = temp_path("fwd");
+        let new_index = temp_path("idx");
+        let old_map = temp_path("map");
+        let new_map = temp_path("map");
+        let features = temp_path("features");
+        std::fs::write(
+            &collection,
+            "id\tbody\nA\tblue sea\nB\tred wind\nC\tblue wind\n",
+        )
+        .unwrap();
+        std::fs::write(&features, "z\na\nm\n").unwrap();
+        execute(
+            [
+                "forward-build",
+                "--input",
+                collection.to_str().unwrap(),
+                "--output",
+                source.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let command = [
+            "reorder",
+            "--input",
+            source.to_str().unwrap(),
+            "--forward-output",
+            new_forward.to_str().unwrap(),
+            "--index-output",
+            new_index.to_str().unwrap(),
+            "--old-to-new",
+            old_map.to_str().unwrap(),
+            "--new-to-old",
+            new_map.to_str().unwrap(),
+            "--by-feature",
+            features.to_str().unwrap(),
+        ];
+        execute(command, Vec::new()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&old_map).unwrap(),
+            "0 2\n1 0\n2 1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&new_map).unwrap(),
+            "0 1\n1 2\n2 0\n"
+        );
+        let reordered = ForwardIndex::load(&new_forward).unwrap();
+        assert_eq!(reordered.documents()[0].document().external_id(), "B");
+        assert_eq!(reordered.documents()[1].document().external_id(), "C");
+        assert_eq!(reordered.documents()[2].document().external_id(), "A");
+        let index = InvertedIndex::load(&new_index).unwrap();
+        assert_eq!(index.documents()[0].external_id(), "B");
+        let mut search_output = Vec::new();
+        execute(
+            [
+                "search",
+                "--index",
+                new_index.to_str().unwrap(),
+                "--query",
+                "blue",
+            ],
+            &mut search_output,
+        )
+        .unwrap();
+        let search_output = String::from_utf8(search_output).unwrap();
+        assert!(search_output.contains('A'));
+        assert!(search_output.contains('C'));
+
+        for path in [
+            collection,
+            source,
+            new_forward,
+            new_index,
+            old_map,
+            new_map,
+            features,
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn reorder_cli_custom_and_seeded_random_are_repeatable() {
+        let source = temp_path("fwd");
+        let new_forward = temp_path("fwd");
+        let new_index = temp_path("idx");
+        let old_map = temp_path("map");
+        let new_map = temp_path("map");
+        let custom = temp_path("map");
+        ForwardIndex::from_documents(
+            Analyzer::default(),
+            [
+                Document::from_fields("A", [("body", "blue")]).unwrap(),
+                Document::from_fields("B", [("body", "red")]).unwrap(),
+                Document::from_fields("C", [("body", "green")]).unwrap(),
+            ],
+        )
+        .unwrap()
+        .save(&source)
+        .unwrap();
+        let command = [
+            "reorder",
+            "--input",
+            source.to_str().unwrap(),
+            "--forward-output",
+            new_forward.to_str().unwrap(),
+            "--index-output",
+            new_index.to_str().unwrap(),
+            "--old-to-new",
+            old_map.to_str().unwrap(),
+            "--new-to-old",
+            new_map.to_str().unwrap(),
+        ];
+        std::fs::write(&custom, b"2 1\n0 2\n1 0\n").unwrap();
+        let mut mapped = command.to_vec();
+        mapped.extend(["--from-mapping", custom.to_str().unwrap()]);
+        execute(mapped, Vec::new()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&old_map).unwrap(),
+            "0 2\n1 0\n2 1\n"
+        );
+        let mut random = command.to_vec();
+        random.extend(["--random", "--seed", "7"]);
+        execute(random.clone(), Vec::new()).unwrap();
+        let first = [
+            std::fs::read(&new_forward).unwrap(),
+            std::fs::read(&new_index).unwrap(),
+            std::fs::read(&old_map).unwrap(),
+            std::fs::read(&new_map).unwrap(),
+        ];
+        execute(random, Vec::new()).unwrap();
+        assert_eq!(
+            first,
+            [
+                std::fs::read(&new_forward).unwrap(),
+                std::fs::read(&new_index).unwrap(),
+                std::fs::read(&old_map).unwrap(),
+                std::fs::read(&new_map).unwrap(),
+            ]
+        );
+        for path in [source, new_forward, new_index, old_map, new_map, custom] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn reorder_rejects_aliases_and_bad_methods_before_changing_outputs() {
+        let collection = temp_path("tsv");
+        let source = temp_path("fwd");
+        let new_forward = temp_path("fwd");
+        let new_index = temp_path("idx");
+        let old_map = temp_path("map");
+        let new_map = temp_path("map");
+        let custom = temp_path("map");
+        std::fs::write(&collection, "id\tbody\nA\tblue\nB\tred\n").unwrap();
+        execute(
+            [
+                "forward-build",
+                "--input",
+                collection.to_str().unwrap(),
+                "--output",
+                source.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        std::fs::write(&new_forward, b"old-forward").unwrap();
+        std::fs::write(&new_index, b"old-index").unwrap();
+        std::fs::write(&old_map, b"old-map").unwrap();
+        std::fs::write(&new_map, b"old-inverse").unwrap();
+        std::fs::write(&custom, b"0 0\n1 0\n").unwrap();
+        let prefix = [
+            "reorder",
+            "--input",
+            source.to_str().unwrap(),
+            "--forward-output",
+            new_forward.to_str().unwrap(),
+            "--index-output",
+            new_index.to_str().unwrap(),
+            "--old-to-new",
+            old_map.to_str().unwrap(),
+            "--new-to-old",
+            new_map.to_str().unwrap(),
+        ];
+        let mut invalid = prefix.to_vec();
+        invalid.extend(["--from-mapping", custom.to_str().unwrap()]);
+        assert!(execute(invalid, Vec::new()).is_err());
+        assert_eq!(std::fs::read(&new_forward).unwrap(), b"old-forward");
+        assert_eq!(std::fs::read(&new_index).unwrap(), b"old-index");
+        assert_eq!(std::fs::read(&old_map).unwrap(), b"old-map");
+        assert_eq!(std::fs::read(&new_map).unwrap(), b"old-inverse");
+
+        let mut alias = prefix.to_vec();
+        alias[4] = source.to_str().unwrap();
+        alias.push("--random");
+        assert!(
+            execute(alias, Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("distinct")
+        );
+        let mut double_method = prefix.to_vec();
+        double_method.extend(["--random", "--by-feature", custom.to_str().unwrap()]);
+        assert!(execute(double_method, Vec::new()).is_err());
+        let mut bad_seed = prefix.to_vec();
+        bad_seed.extend(["--random", "--seed", "-1"]);
+        assert!(execute(bad_seed, Vec::new()).is_err());
+        for path in [
+            collection,
+            source,
+            new_forward,
+            new_index,
+            old_map,
+            new_map,
+            custom,
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
