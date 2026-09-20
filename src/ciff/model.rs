@@ -459,6 +459,11 @@ impl RetrievalBackend for CiffRetrieval<'_> {
                 ));
             }
         }
+        if options.scoring != crate::search::ScoringModel::Bm25 {
+            return Err(Error::InvalidArgument(
+                "CIFF retrieval currently supports BM25 only".into(),
+            ));
+        }
         self.index.search_terms(
             &terms,
             CiffSearchOptions {
@@ -1060,10 +1065,26 @@ mod tests {
                 pruning: PruningStrategy::Exhaustive,
                 explain: false,
                 bm25: Bm25Params::default(),
+                scoring: crate::search::ScoringModel::Bm25,
             },
         )
         .unwrap();
         assert_eq!(via_backend.hits, repeated.hits);
+        let rejected = RetrievalBackend::search(
+            &backend,
+            &query,
+            SearchOptions {
+                scoring: crate::search::ScoringModel::Dph,
+                pruning: PruningStrategy::Exhaustive,
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            rejected
+                .to_string()
+                .contains("CIFF retrieval currently supports BM25 only")
+        );
 
         let report = evaluate_batch(
             &backend,

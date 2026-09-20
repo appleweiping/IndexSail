@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::index::InvertedIndex;
 use crate::query::{BooleanOperator, SearchQuery};
 use crate::search::{
-    Bm25Params, PruningStrategy, SearchHit, SearchOptions, SearchOutcome, SearchStats,
+    Bm25Params, PruningStrategy, ScoringModel, SearchHit, SearchOptions, SearchOutcome, SearchStats,
 };
 use crate::shard::ShardedIndex;
 use crate::trec::{Qrels, Topic};
@@ -48,6 +48,7 @@ pub struct BatchConfig {
     pub field: Option<String>,
     pub operator: BooleanOperator,
     pub bm25: Bm25Params,
+    pub scoring: ScoringModel,
 }
 
 impl Default for BatchConfig {
@@ -59,6 +60,7 @@ impl Default for BatchConfig {
             field: None,
             operator: BooleanOperator::Or,
             bm25: Bm25Params::default(),
+            scoring: ScoringModel::Bm25,
         }
     }
 }
@@ -120,6 +122,19 @@ pub fn evaluate_batch<B: RetrievalBackend + ?Sized>(
         ));
     }
     config.bm25.validate()?;
+    SearchOptions {
+        top_k: config.top_k,
+        pruning: config.pruning,
+        explain: false,
+        bm25: config.bm25,
+        scoring: config.scoring,
+    }
+    .validate()?;
+    if config.scoring == ScoringModel::Dph && config.verify_exact {
+        return Err(Error::InvalidArgument(
+            "DPH cannot use --verify until another exact executor is available".into(),
+        ));
+    }
     let mut topic_ids = BTreeSet::new();
     if let Some(topic) = topics.iter().find(|topic| {
         topic.id.trim().is_empty()
@@ -145,6 +160,7 @@ pub fn evaluate_batch<B: RetrievalBackend + ?Sized>(
             pruning: config.pruning,
             explain: false,
             bm25: config.bm25,
+            scoring: config.scoring,
         };
         let started = Instant::now();
         let outcome = index.search(&query, options)?;
@@ -227,7 +243,15 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
         BooleanOperator::Or => "or",
     };
     writeln!(writer, "{{")?;
-    writeln!(writer, "  \"schema_version\": 1,")?;
+    let schema_version = if report.config.scoring == ScoringModel::Dph {
+        2
+    } else {
+        1
+    };
+    writeln!(writer, "  \"schema_version\": {schema_version},")?;
+    if report.config.scoring == ScoringModel::Dph {
+        writeln!(writer, "  \"scorer\": \"dph\",")?;
+    }
     writeln!(writer, "  \"strategy\": \"{strategy}\",")?;
     writeln!(writer, "  \"operator\": \"{operator}\",")?;
     writeln!(writer, "  \"top_k\": {},", report.config.top_k)?;
@@ -451,6 +475,19 @@ fn valid_run_token(value: &str) -> bool {
 
 fn validate_finite_report(report: &BatchReport) -> Result<()> {
     report.config.bm25.validate()?;
+    SearchOptions {
+        top_k: report.config.top_k,
+        pruning: report.config.pruning,
+        explain: false,
+        bm25: report.config.bm25,
+        scoring: report.config.scoring,
+    }
+    .validate()?;
+    if report.config.scoring == ScoringModel::Dph && report.config.verify_exact {
+        return Err(Error::InvalidArgument(
+            "DPH cannot report exact cross-executor verification".into(),
+        ));
+    }
     let finite_metrics = |metrics: QueryMetrics| {
         metrics.average_precision.is_finite()
             && metrics.reciprocal_rank.is_finite()

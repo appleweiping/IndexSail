@@ -5,7 +5,7 @@
 [![MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
 IndexSail is an information-retrieval experiment toolkit in safe Rust. It builds a
-field-aware positional index, ranks with BM25, executes exact exhaustive, WAND, block-max WAND, or MaxScore top-k
+field-aware positional index, ranks with BM25 or DPH, executes exact exhaustive, WAND, block-max WAND, or MaxScore top-k
 queries, and runs
 reproducible TREC-style experiments from collection ingestion through metrics and run files. A collection can also
 be partitioned into independently searchable physical shards while using collection-wide statistics and an exact,
@@ -385,6 +385,34 @@ Exact field filters compare stored strings without analysis.
 
 Top-k order is always score descending and then internal insertion ID ascending. The same heap rule is used
 by both executors, including at an equal-score WAND threshold.
+
+### DPH scoring (exhaustive only)
+
+Native `search`, `shard-search`, `batch`, and `shard-batch` accept `--scorer dph`. DPH uses the collection-wide
+number of term **occurrences** (`cf`), not document frequency (`df`), and the average length of the term's field:
+
+```text
+f = tf / field_length
+DPH = ((1 - f)^2 / (tf + 1)) *
+      (tf * log2((tf * average_field_length / field_length) * (N / cf))
+       + 0.5 * log2(2 * pi * tf * (1 - f)))
+```
+
+At `tf == field_length`, the continuous limit is zero; IndexSail returns zero instead of a NaN. Negative finite
+impacts are retained, not clipped. Scores are calculated in `f64` and therefore are not claimed bit-identical to
+PISA's `float` implementation. Sharded DPH aggregates `cf`, average field lengths, and document count across the
+whole collection before scoring each physical shard. Explanations show `cf` for DPH; default BM25 output stays
+unchanged. An unfielded term sums its field-specific DPH contributions.
+
+```bash
+indexsail search --index corpus.idx --query "local search" --scorer dph --explain
+indexsail batch --index corpus.idx --topics topics.tsv --run dph.run --scorer dph
+```
+
+DPH may produce negative impacts, so `--strategy` defaults to `full` for DPH and WAND, block-max WAND, and
+MaxScore are rejected. BM25 `--k1`/`--b`, batch `--verify`, CIFF retrieval, and the pruning benchmark are not
+available for DPH. DPH JSON batch reports use schema version 2 and include `"scorer": "dph"`; default BM25 reports
+retain schema version 1. This is one scorer family, not full PISA scorer or score-byte parity.
 
 ## Exact WAND
 

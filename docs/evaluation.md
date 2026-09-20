@@ -105,6 +105,11 @@ With `--verify`, the configured executor is timed first. The alternative executo
 query, cutoff, field, operator, and BM25 parameters. Topic result lengths, internal document IDs, rank order,
 and IEEE-754 score bits must all match. A difference aborts the batch and no successful report is claimed.
 
+DPH currently has only one certified exact executor, exhaustive search. `batch` and `shard-batch` accept
+`--scorer dph` and default to exhaustive; they reject `--verify`, BM25 `--k1`/`--b`, and pruning strategies.
+Signed finite DPH scores are valid TREC run values. Their JSON reports use schema version 2 and include
+`"scorer": "dph"`, while unchanged BM25 reports remain schema version 1.
+
 Verification time is recorded separately and is not included in `total_search_micros`.
 
 ### Sharded batches

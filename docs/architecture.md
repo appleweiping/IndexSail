@@ -11,7 +11,7 @@
 | `reorder` | Bounded, validated old/new ID permutations for native forward-index rebuilding |
 | `index` | Builder, immutable document table, field lengths, dictionary, positional postings |
 | `query` | Typed terms, `AND`/`OR`, phrase constraints, and exact-field filters |
-| `search` | BM25 scorers, exhaustive/WAND/block-max WAND/MaxScore execution, stable heap, explanations and counters |
+| `search` | BM25/DPH scorers, exhaustive/WAND/block-max WAND/MaxScore execution, stable heap, explanations and counters; DPH is exhaustive-only |
 | `shard` | Round-robin physical partitioning, global statistics, exact merge, v1 sharded container |
 | `ciff` | CIFF v1 model, bounded protobuf framing, d-gap validation, canonical export and portable BM25 |
 | `codec` | Posting gaps, base-128 variable bytes, codec statistics, payload checksum |

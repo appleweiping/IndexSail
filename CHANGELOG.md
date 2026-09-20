@@ -4,6 +4,13 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+- Added one native and sharded DPH scorer family with collection-wide term-occurrence
+  statistics, independently fixed numerical oracles, signed finite impacts,
+  fielded/unfielded explanations, CLI and batch reports. DPH uses exhaustive
+  execution only because nonnegative pruning bounds are not established;
+  CIFF and the pruning benchmark remain BM25-only. The `tf == length` limit
+  is explicitly zero, and no PISA float-bit or whole-scorer parity is claimed.
+
 - Added deterministic recursive graph-bisection document reordering over a
   field-qualified document-term graph, with bounded scratch reuse, exact
   bidirectional maps, query-equivalence oracles, and a release-mode CI smoke.

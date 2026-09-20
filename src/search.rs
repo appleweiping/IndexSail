@@ -36,6 +36,18 @@ impl Bm25Params {
     }
 }
 
+/// Term-impact model used by native and sharded search.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScoringModel {
+    #[default]
+    Bm25,
+    /// Parameter-free divergence-from-randomness DPH.
+    ///
+    /// DPH impacts can be negative. Only exhaustive execution is currently
+    /// proved correct for this model; pruning strategies reject it explicitly.
+    Dph,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PruningStrategy {
     Exhaustive,
@@ -67,6 +79,7 @@ pub struct SearchOptions {
     pub pruning: PruningStrategy,
     pub explain: bool,
     pub bm25: Bm25Params,
+    pub scoring: ScoringModel,
 }
 
 impl Default for SearchOptions {
@@ -76,6 +89,7 @@ impl Default for SearchOptions {
             pruning: PruningStrategy::Wand,
             explain: false,
             bm25: Bm25Params::default(),
+            scoring: ScoringModel::Bm25,
         }
     }
 }
@@ -88,6 +102,18 @@ impl SearchOptions {
             ));
         }
         self.bm25.validate()?;
+        if self.scoring == ScoringModel::Dph {
+            if self.pruning != PruningStrategy::Exhaustive {
+                return Err(Error::InvalidArgument(
+                    "DPH requires exhaustive search; nonnegative pruning bounds are not established".into(),
+                ));
+            }
+            if self.bm25 != Bm25Params::default() {
+                return Err(Error::InvalidArgument(
+                    "BM25 k1 and b parameters do not apply to DPH".into(),
+                ));
+            }
+        }
         Ok(self)
     }
 }
@@ -98,8 +124,11 @@ pub struct TermContribution {
     pub field: String,
     pub term_frequency: u32,
     pub document_frequency: usize,
+    /// Collection-wide term occurrences for DPH; absent for BM25.
+    pub collection_term_frequency: Option<u64>,
     pub document_length: u32,
     pub average_document_length: f64,
+    /// BM25 IDF diagnostic; not a factor in DPH scoring.
     pub inverse_document_frequency: f64,
     pub boost: f64,
     pub score: f64,
@@ -156,6 +185,39 @@ struct PreparedTerm {
 struct ScoredPosting {
     doc_id: InternalDocId,
     score: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScoreContext {
+    model: ScoringModel,
+    document_frequency: usize,
+    document_count: usize,
+    collection_term_frequency: Option<u64>,
+    average_length: f64,
+    bm25: Bm25Params,
+}
+
+impl ScoreContext {
+    fn score(self, term_frequency: u32, document_length: u32) -> f64 {
+        match self.model {
+            ScoringModel::Bm25 => bm25_score(
+                term_frequency,
+                self.document_frequency,
+                self.document_count,
+                document_length,
+                self.average_length,
+                self.bm25,
+            ),
+            ScoringModel::Dph => dph_score(
+                term_frequency,
+                self.document_count,
+                self.collection_term_frequency
+                    .expect("DPH statistics were computed"),
+                document_length,
+                self.average_length,
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -456,6 +518,7 @@ impl InvertedIndex {
                 self.build_term_scorer(
                     ordinal,
                     term,
+                    options.scoring,
                     options.bm25,
                     options.pruning == PruningStrategy::BlockMaxWand,
                     statistics,
@@ -497,13 +560,20 @@ impl InvertedIndex {
                 stats: preparation_stats,
             });
         }
+        // Explanation metadata is prepared once per query. Recounting an
+        // entire posting list for every returned hit would turn a large
+        // explained top-k request into O(k * collection frequency) work.
+        let explanation_occurrences = (options.explain && options.scoring == ScoringModel::Dph)
+            .then(|| self.collect_explanation_occurrences(&prepared_terms, statistics));
 
         let (top_k, mut stats) = match options.pruning {
             PruningStrategy::Exhaustive => self.search_exhaustive(query, &scorers, options.top_k),
-            PruningStrategy::Wand => self.search_wand(query, scorers, options.top_k, false),
-            PruningStrategy::BlockMaxWand => self.search_wand(query, scorers, options.top_k, true),
+            PruningStrategy::Wand => Ok(self.search_wand(query, scorers, options.top_k, false)),
+            PruningStrategy::BlockMaxWand => {
+                Ok(self.search_wand(query, scorers, options.top_k, true))
+            }
             PruningStrategy::MaxScore => self.search_max_score(query, scorers, options.top_k),
-        };
+        }?;
         stats.block_max_bounds_loaded = preparation_stats.block_max_bounds_loaded;
         stats.block_max_postings_covered = preparation_stats.block_max_postings_covered;
         stats.block_max_postings_scanned = preparation_stats.block_max_postings_scanned;
@@ -523,9 +593,11 @@ impl InvertedIndex {
                         self.explain(
                             entry.doc_id,
                             &prepared_terms,
+                            options.scoring,
                             options.bm25,
                             query,
                             statistics,
+                            explanation_occurrences.as_ref(),
                         )
                     }),
                 }
@@ -566,10 +638,43 @@ impl InvertedIndex {
             .collect())
     }
 
+    fn collect_explanation_occurrences(
+        &self,
+        terms: &[PreparedTerm],
+        statistics: Option<&GlobalStatistics>,
+    ) -> BTreeMap<String, BTreeMap<String, u64>> {
+        let mut occurrences = BTreeMap::<String, BTreeMap<String, u64>>::new();
+        for term in terms {
+            let fields: Vec<&str> = match term.field.as_deref() {
+                Some(field) => vec![field],
+                None => self.fields().into_iter().collect(),
+            };
+            for field in fields {
+                if let Some(postings) = self.postings(field, &term.normalized) {
+                    let count = statistics.map_or_else(
+                        || {
+                            postings
+                                .iter()
+                                .map(|posting| u64::from(posting.term_frequency))
+                                .sum()
+                        },
+                        |statistics| statistics.term_occurrences(field, &term.normalized),
+                    );
+                    occurrences
+                        .entry(field.to_owned())
+                        .or_default()
+                        .insert(term.normalized.clone(), count);
+                }
+            }
+        }
+        occurrences
+    }
+
     fn build_term_scorer(
         &self,
         ordinal: usize,
         term: &PreparedTerm,
+        scoring: ScoringModel,
         params: Bm25Params,
         load_block_max: bool,
         statistics: Option<&GlobalStatistics>,
@@ -593,18 +698,34 @@ impl InvertedIndex {
                 || self.average_field_length(field),
                 |statistics| statistics.average_field_length(field),
             );
+            let collection_term_frequency = if scoring == ScoringModel::Dph {
+                Some(statistics.map_or_else(
+                    || {
+                        postings
+                            .iter()
+                            .map(|posting| u64::from(posting.term_frequency))
+                            .sum()
+                    },
+                    |statistics| statistics.term_occurrences(field, &term.normalized),
+                ))
+            } else {
+                None
+            };
+            let score_context = ScoreContext {
+                model: scoring,
+                document_frequency,
+                document_count,
+                collection_term_frequency,
+                average_length,
+                bm25: params,
+            };
             for posting in postings {
-                let contribution = bm25_score(
-                    posting.term_frequency,
-                    document_frequency,
-                    document_count,
-                    self.field_length(posting.doc_id, field),
-                    average_length,
-                    params,
-                ) * term.boost;
+                let document_length = self.field_length(posting.doc_id, field);
+                let contribution =
+                    score_context.score(posting.term_frequency, document_length) * term.boost;
                 if !contribution.is_finite() {
                     return Err(Error::InvalidArgument(format!(
-                        "BM25 score for term '{}' is not finite; reduce boost or k1",
+                        "score for term '{}' is not finite; reduce its boost or model parameters",
                         term.normalized
                     )));
                 }
@@ -612,7 +733,7 @@ impl InvertedIndex {
                 *score += contribution;
                 if !score.is_finite() {
                     return Err(Error::InvalidArgument(format!(
-                        "combined BM25 score for term '{}' is not finite",
+                        "combined score for term '{}' is not finite",
                         term.normalized
                     )));
                 }
@@ -625,52 +746,7 @@ impl InvertedIndex {
         let upper_bound =
             conservative_next_up(entries.iter().map(|entry| entry.score).fold(0.0, f64::max));
         let (block_max, precomputed_block_bounds_loaded, postings_scanned_for_block_bounds) =
-            if entries.is_empty() || !load_block_max {
-                (Vec::new(), 0, 0)
-            } else {
-                let key = BlockMaxKey {
-                    field: term.field.clone(),
-                    term: term.normalized.clone(),
-                };
-                let stored = self.block_max.get(&key).ok_or_else(|| {
-                    Error::CorruptIndex(format!(
-                        "missing block-max metadata for term '{}'",
-                        term.normalized
-                    ))
-                })?;
-                if stored.posting_count != entries.len() {
-                    return Err(Error::CorruptIndex(format!(
-                        "block-max posting count differs for term '{}'",
-                        term.normalized
-                    )));
-                }
-                // Default, unit-boost queries use tight persisted bounds. All other
-                // valid options derive conservative bounds from their exact scores.
-                let defaults = Bm25Params::default();
-                let use_tight_bounds = statistics.is_none()
-                    && params.k1.to_bits() == defaults.k1.to_bits()
-                    && params.b.to_bits() == defaults.b.to_bits()
-                    && term.boost.to_bits() == 1.0_f64.to_bits();
-                if use_tight_bounds {
-                    (
-                        stored
-                            .default_bounds
-                            .iter()
-                            .map(|bits| f64::from_bits(*bits))
-                            .collect(),
-                        stored.default_bounds.len(),
-                        0,
-                    )
-                } else {
-                    // The public API accepts every finite positive k1 and boost.
-                    // No fixed ULP allowance can turn a parameter-independent
-                    // floating-point formula into a proof over that full range.
-                    // The exact scores are already materialized, so custom
-                    // requests derive outward-rounded bounds directly and report
-                    // the work instead of risking an unsafe pruning bound.
-                    (conservative_block_bounds(&entries), 0, entries.len())
-                }
-            };
+            self.term_block_bounds(term, &entries, scoring, params, load_block_max, statistics)?;
         Ok(TermScorer {
             ordinal,
             entries,
@@ -681,12 +757,66 @@ impl InvertedIndex {
         })
     }
 
+    fn term_block_bounds(
+        &self,
+        term: &PreparedTerm,
+        entries: &[ScoredPosting],
+        scoring: ScoringModel,
+        params: Bm25Params,
+        load_block_max: bool,
+        statistics: Option<&GlobalStatistics>,
+    ) -> Result<(Vec<f64>, usize, usize)> {
+        if entries.is_empty() || !load_block_max {
+            return Ok((Vec::new(), 0, 0));
+        }
+        let key = BlockMaxKey {
+            field: term.field.clone(),
+            term: term.normalized.clone(),
+        };
+        let stored = self.block_max.get(&key).ok_or_else(|| {
+            Error::CorruptIndex(format!(
+                "missing block-max metadata for term '{}'",
+                term.normalized
+            ))
+        })?;
+        if stored.posting_count != entries.len() {
+            return Err(Error::CorruptIndex(format!(
+                "block-max posting count differs for term '{}'",
+                term.normalized
+            )));
+        }
+        // Default, unit-boost BM25 queries use tight persisted bounds. All
+        // other supported requests derive bounds from their exact scores.
+        let defaults = Bm25Params::default();
+        let use_tight_bounds = scoring == ScoringModel::Bm25
+            && statistics.is_none()
+            && params.k1.to_bits() == defaults.k1.to_bits()
+            && params.b.to_bits() == defaults.b.to_bits()
+            && term.boost.to_bits() == 1.0_f64.to_bits();
+        if use_tight_bounds {
+            Ok((
+                stored
+                    .default_bounds
+                    .iter()
+                    .map(|bits| f64::from_bits(*bits))
+                    .collect(),
+                stored.default_bounds.len(),
+                0,
+            ))
+        } else {
+            // No fixed ULP allowance proves a parameter-independent bound
+            // over every finite positive k1 and boost. Exact scores already
+            // exist, so round their block maxima outward instead.
+            Ok((conservative_block_bounds(entries), 0, entries.len()))
+        }
+    }
+
     fn search_exhaustive(
         &self,
         query: &SearchQuery,
         scorers: &[TermScorer],
         top_k: usize,
-    ) -> (TopK, SearchStats) {
+    ) -> Result<(TopK, SearchStats)> {
         let mut candidates = BTreeSet::new();
         match query.operator() {
             BooleanOperator::Or => {
@@ -711,15 +841,20 @@ impl InvertedIndex {
         let mut stats = SearchStats::default();
         for doc_id in candidates {
             stats.evaluated_candidates += 1;
-            let score = scorers
+            let score: f64 = scorers
                 .iter()
                 .filter_map(|scorer| score_at(&scorer.entries, doc_id))
                 .sum();
             if self.matches_constraints(doc_id, query) {
+                if !score.is_finite() {
+                    return Err(Error::InvalidArgument(
+                        "combined candidate score is not finite; reduce query boosts".into(),
+                    ));
+                }
                 heap.consider(HeapEntry { doc_id, score });
             }
         }
-        (heap, stats)
+        Ok((heap, stats))
     }
 
     /// `WAND`, optionally refined by per-block maximum impacts.
@@ -819,7 +954,7 @@ impl InvertedIndex {
         query: &SearchQuery,
         scorers: Vec<TermScorer>,
         top_k: usize,
-    ) -> (TopK, SearchStats) {
+    ) -> Result<(TopK, SearchStats)> {
         if query.operator() == BooleanOperator::And {
             return self.search_exhaustive(query, &scorers, top_k);
         }
@@ -918,7 +1053,7 @@ impl InvertedIndex {
                 }
             }
         }
-        (heap, stats)
+        Ok((heap, stats))
     }
 
     fn matches_constraints(&self, doc_id: InternalDocId, query: &SearchQuery) -> bool {
@@ -973,12 +1108,16 @@ impl InvertedIndex {
         &self,
         doc_id: InternalDocId,
         terms: &[PreparedTerm],
+        scoring: ScoringModel,
         params: Bm25Params,
         query: &SearchQuery,
         statistics: Option<&GlobalStatistics>,
+        explanation_occurrences: Option<&BTreeMap<String, BTreeMap<String, u64>>>,
     ) -> Explanation {
         let mut contributions = Vec::new();
+        let mut total_score = 0.0;
         for term in terms {
+            let mut term_score = 0.0;
             let fields: Vec<&str> = match term.field.as_deref() {
                 Some(field) => vec![field],
                 None => self.fields().into_iter().collect(),
@@ -1000,30 +1139,47 @@ impl InvertedIndex {
                     || self.average_field_length(field),
                     |statistics| statistics.average_field_length(field),
                 );
+                let collection_term_frequency = if scoring == ScoringModel::Dph {
+                    Some(
+                        *explanation_occurrences
+                            .expect("DPH explanation statistics were prepared")
+                            .get(field)
+                            .and_then(|terms| terms.get(&term.normalized))
+                            .expect("a scored DPH term has an occurrence count"),
+                    )
+                } else {
+                    None
+                };
                 let inverse_document_frequency = bm25_idf(document_count, document_frequency);
-                let score = bm25_score(
-                    posting.term_frequency,
+                let document_length = self.field_length(doc_id, field);
+                let score = ScoreContext {
+                    model: scoring,
                     document_frequency,
                     document_count,
-                    self.field_length(doc_id, field),
-                    average_document_length,
-                    params,
-                ) * term.boost;
+                    collection_term_frequency,
+                    average_length: average_document_length,
+                    bm25: params,
+                }
+                .score(posting.term_frequency, document_length)
+                    * term.boost;
+                term_score += score;
                 contributions.push(TermContribution {
                     term: term.normalized.clone(),
                     field: field.to_owned(),
                     term_frequency: posting.term_frequency,
                     document_frequency,
-                    document_length: self.field_length(doc_id, field),
+                    collection_term_frequency,
+                    document_length,
                     average_document_length,
                     inverse_document_frequency,
                     boost: term.boost,
                     score,
                 });
             }
+            total_score += term_score;
         }
         Explanation {
-            total_score: contributions.iter().map(|term| term.score).sum(),
+            total_score,
             terms: contributions,
             phrase_filters_matched: query.phrases().len(),
             exact_filters_matched: query.filters().len(),
@@ -1110,6 +1266,40 @@ fn bm25_score(
     bm25_idf(document_count, document_frequency) * frequency * (params.k1 + 1.0) / denominator
 }
 
+/// DPH in the interior of its domain, with the continuous zero limit at
+/// `term_frequency == document_length`. The collection frequency is the sum of
+/// occurrences, not the number of matching documents. Signed impacts are
+/// preserved: clipping them would change DPH ranking semantics.
+#[allow(clippy::cast_precision_loss)]
+fn dph_score(
+    term_frequency: u32,
+    document_count: usize,
+    collection_term_frequency: u64,
+    document_length: u32,
+    average_document_length: f64,
+) -> f64 {
+    if term_frequency == 0
+        || document_count == 0
+        || collection_term_frequency == 0
+        || document_length == 0
+        || average_document_length <= 0.0
+        || term_frequency == document_length
+    {
+        return 0.0;
+    }
+    let frequency = f64::from(term_frequency);
+    let relative_frequency = frequency / f64::from(document_length);
+    let complement = 1.0 - relative_frequency;
+    let normalization = complement * complement / (frequency + 1.0);
+    let collection_surprise = frequency
+        * libm::log2(
+            (frequency * average_document_length / f64::from(document_length))
+                * (document_count as f64 / collection_term_frequency as f64),
+        );
+    let binomial_correction = 0.5 * libm::log2(2.0 * std::f64::consts::PI * frequency * complement);
+    normalization * (collection_surprise + binomial_correction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,6 +1307,154 @@ mod tests {
     use crate::document::Document;
     use crate::index::IndexBuilder;
     use crate::query::{FieldFilter, PhraseFilter, QueryTerm};
+
+    #[test]
+    fn dph_matches_independent_numeric_oracles_and_preserves_signed_impacts() {
+        // From the DPH equation: f=tf/dl, normalizer=(1-f)^2/(tf+1),
+        // information=tf*log2((tf*avg/dl)*(N/cf)) + log2(2*pi*tf*(1-f))/2.
+        // The fixed decimal values were calculated independently from these
+        // inputs, not by calling the production scorer.
+        assert!((dph_score(1, 4, 3, 3, 4.5) - 0.451_837_069_861_240_4).abs() < 1e-13);
+        assert!((dph_score(1, 4, 16, 4, 4.0) + 0.247_998_005_129_042_58).abs() < 1e-13);
+        assert_eq!(dph_score(2, 4, 5, 2, 3.0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(dph_score(0, 4, 5, 2, 3.0).to_bits(), 0.0_f64.to_bits());
+        // Empty collection statistics and a zero-sized field must not feed
+        // undefined logarithms into a ranking or explanation.
+        for value in [
+            dph_score(1, 0, 3, 3, 4.5),
+            dph_score(1, 4, 0, 3, 4.5),
+            dph_score(1, 4, 3, 0, 4.5),
+            dph_score(1, 4, 3, 3, 0.0),
+        ] {
+            assert_eq!(value.to_bits(), 0.0_f64.to_bits());
+        }
+    }
+
+    #[test]
+    fn dph_exhaustive_fielded_and_unfielded_scores_match_explanations() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for (id, title, body) in [
+            ("d0", "x sea", "x y y y"),
+            ("d1", "sea blue", "x x x x"),
+            ("d2", "x blue", "x x x x"),
+            ("d3", "blue blue", "x x x x"),
+        ] {
+            builder
+                .add_document(
+                    Document::from_fields(id, [("title", title), ("body", body)]).unwrap(),
+                )
+                .unwrap();
+        }
+        let index = builder.finish();
+        let options = SearchOptions {
+            top_k: 4,
+            pruning: PruningStrategy::Exhaustive,
+            explain: true,
+            scoring: ScoringModel::Dph,
+            ..SearchOptions::default()
+        };
+        let body_query = SearchQuery::from_text(index.analyzer(), "x", Some("body")).unwrap();
+        let fielded = index.search(&body_query, options).unwrap();
+        assert_eq!(fielded.hits.len(), 4);
+        assert_eq!(fielded.hits[3].external_id, "d0");
+        assert!((fielded.hits[3].score + 0.163_746_675_856_224_77).abs() < 1e-13);
+        for hit in &fielded.hits {
+            let explanation = hit.explanation.as_ref().unwrap();
+            assert_eq!(explanation.terms.len(), 1);
+            assert_eq!(explanation.terms[0].collection_term_frequency, Some(13));
+            assert!((explanation.total_score - hit.score).abs() < 1e-13);
+        }
+
+        let unfielded_query = SearchQuery::from_text(index.analyzer(), "x", None).unwrap();
+        let unfielded = index.search(&unfielded_query, options).unwrap();
+        for hit in &unfielded.hits {
+            let explanation = hit.explanation.as_ref().unwrap();
+            for term in &explanation.terms {
+                assert_eq!(
+                    term.collection_term_frequency,
+                    Some(if term.field == "body" { 13 } else { 2 })
+                );
+            }
+            let hand_sum: f64 = explanation.terms.iter().map(|term| term.score).sum();
+            assert!((hand_sum - hit.score).abs() < 1e-13);
+            assert!((explanation.total_score - hit.score).abs() < 1e-13);
+        }
+    }
+
+    #[test]
+    fn dph_rejects_uncertified_pruning_and_nonfinite_combined_scores() {
+        for pruning in [
+            PruningStrategy::Wand,
+            PruningStrategy::BlockMaxWand,
+            PruningStrategy::MaxScore,
+        ] {
+            let error = SearchOptions {
+                pruning,
+                scoring: ScoringModel::Dph,
+                ..SearchOptions::default()
+            }
+            .validate()
+            .unwrap_err();
+            assert!(error.to_string().contains("requires exhaustive"));
+        }
+        assert!(
+            SearchOptions {
+                pruning: PruningStrategy::Exhaustive,
+                scoring: ScoringModel::Dph,
+                bm25: Bm25Params { k1: 2.0, b: 0.75 },
+                ..SearchOptions::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("do not apply")
+        );
+
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        builder
+            .add_document(
+                Document::from_fields("d0", [("body", "a b c x x"), ("kind", "excluded")]).unwrap(),
+            )
+            .unwrap();
+        builder
+            .add_document(
+                Document::from_fields("d1", [("body", "z"), ("kind", "allowed")]).unwrap(),
+            )
+            .unwrap();
+        let index = builder.finish();
+        let query = SearchQuery::from_terms(
+            ["a", "b", "c"]
+                .map(|term| QueryTerm::new(term, Some("body".into()), f64::MAX).unwrap())
+                .to_vec(),
+        )
+        .unwrap();
+        let error = index
+            .search(
+                &query,
+                SearchOptions {
+                    pruning: PruningStrategy::Exhaustive,
+                    scoring: ScoringModel::Dph,
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("combined candidate score is not finite")
+        );
+        let filtered = index
+            .search(
+                &query.with_filter(FieldFilter::exact("kind", "allowed").unwrap()),
+                SearchOptions {
+                    pruning: PruningStrategy::Exhaustive,
+                    scoring: ScoringModel::Dph,
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(filtered.hits, Vec::<SearchHit>::new());
+    }
 
     fn test_index() -> InvertedIndex {
         let documents = [
@@ -1155,6 +1493,7 @@ mod tests {
                     pruning: strategy,
                     explain: false,
                     bm25: Bm25Params::default(),
+                    scoring: ScoringModel::Bm25,
                 },
             )
             .unwrap()
@@ -1666,6 +2005,7 @@ mod tests {
                     pruning: strategy,
                     explain: false,
                     bm25: Bm25Params::default(),
+                    scoring: ScoringModel::Bm25,
                 },
             )
             .unwrap()
@@ -1793,7 +2133,14 @@ mod tests {
             boost: 1.0,
         };
         let scorer = index
-            .build_term_scorer(0, &term, Bm25Params::default(), true, None)
+            .build_term_scorer(
+                0,
+                &term,
+                ScoringModel::Bm25,
+                Bm25Params::default(),
+                true,
+                None,
+            )
             .unwrap();
         assert!(scorer.entries.len() > BLOCK_POSTINGS, "corpus too small");
         assert_eq!(
@@ -1857,7 +2204,7 @@ mod tests {
                     boost,
                 };
                 let scorer = index
-                    .build_term_scorer(0, &term, params, true, None)
+                    .build_term_scorer(0, &term, ScoringModel::Bm25, params, true, None)
                     .unwrap();
                 assert_eq!(scorer.precomputed_block_bounds_loaded, 0);
                 assert_eq!(
@@ -1895,6 +2242,7 @@ mod tests {
             pruning,
             explain: false,
             bm25: params,
+            scoring: ScoringModel::Bm25,
         };
 
         let exhaustive = index
@@ -1924,6 +2272,7 @@ mod tests {
                     field: None,
                     boost: 1.0,
                 },
+                ScoringModel::Bm25,
                 Bm25Params::default(),
                 true,
                 None,
@@ -1956,6 +2305,7 @@ mod tests {
                     field: None,
                     boost: 1.0,
                 },
+                ScoringModel::Bm25,
                 Bm25Params::default(),
                 true,
                 None,

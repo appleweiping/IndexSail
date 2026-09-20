@@ -51,8 +51,8 @@ pub use index::{IndexBuilder, IndexStats, InvertedIndex, Posting};
 pub use query::{BooleanOperator, FieldFilter, PhraseFilter, QueryTerm, SearchQuery};
 pub use reorder::{BisectionOptions, DocIdMap, MAX_REORDER_DOCUMENTS};
 pub use search::{
-    Bm25Params, Explanation, PruningStrategy, SearchHit, SearchOptions, SearchOutcome, SearchStats,
-    TermContribution,
+    Bm25Params, Explanation, PruningStrategy, ScoringModel, SearchHit, SearchOptions,
+    SearchOutcome, SearchStats, TermContribution,
 };
 pub use shard::{
     PhysicalShardStats, SHARDED_PERSISTENCE_FORMAT_VERSION, ShardedIndex, ShardedIndexBuilder,

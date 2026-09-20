@@ -1,9 +1,9 @@
-//! Deterministic collection sharding with collection-wide BM25 statistics.
+//! Deterministic collection sharding with collection-wide scoring statistics.
 //!
 //! Each physical shard owns an ordinary [`InvertedIndex`]. Documents are
 //! assigned round-robin in global insertion order, so the mapping between a
 //! global document id and `(shard, local id)` is arithmetic and wire-stable.
-//! Query execution uses document frequencies, field totals, and document
+//! Query execution uses document and term-occurrence frequencies, field totals, and document
 //! count aggregated across every shard before independently searching each
 //! shard. The coordinator then merges the shard-local top-k lists using the
 //! same score/doc-id ordering as a monolithic index.
@@ -34,14 +34,20 @@ const READ_CHUNK_BYTES: usize = 8 * 1024;
 pub(crate) struct GlobalStatistics {
     document_count: usize,
     field_totals: BTreeMap<String, u64>,
-    document_frequencies: BTreeMap<TermKey, usize>,
+    terms: BTreeMap<TermKey, GlobalTermStatistics>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GlobalTermStatistics {
+    document_frequency: usize,
+    occurrences: u64,
 }
 
 impl GlobalStatistics {
     fn from_shards(shards: &[InvertedIndex]) -> Result<Self> {
         let mut document_count = 0_usize;
         let mut field_totals = BTreeMap::<String, u64>::new();
-        let mut document_frequencies = BTreeMap::<TermKey, usize>::new();
+        let mut terms = BTreeMap::<TermKey, GlobalTermStatistics>::new();
         for shard in shards {
             document_count = document_count
                 .checked_add(shard.documents.len())
@@ -53,10 +59,21 @@ impl GlobalStatistics {
                     .ok_or_else(|| Error::CorruptIndex("global field total overflow".into()))?;
             }
             for (term, postings) in &shard.postings {
-                let frequency = document_frequencies.entry(term.clone()).or_default();
-                *frequency = frequency.checked_add(postings.len()).ok_or_else(|| {
-                    Error::CorruptIndex("global document frequency overflow".into())
-                })?;
+                let statistics = terms.entry(term.clone()).or_default();
+                statistics.document_frequency = statistics
+                    .document_frequency
+                    .checked_add(postings.len())
+                    .ok_or_else(|| {
+                        Error::CorruptIndex("global document frequency overflow".into())
+                    })?;
+                for posting in postings {
+                    statistics.occurrences = statistics
+                        .occurrences
+                        .checked_add(u64::from(posting.term_frequency))
+                        .ok_or_else(|| {
+                            Error::CorruptIndex("global term occurrence count overflow".into())
+                        })?;
+                }
             }
         }
         if document_count > u32::MAX as usize {
@@ -67,7 +84,7 @@ impl GlobalStatistics {
         Ok(Self {
             document_count,
             field_totals,
-            document_frequencies,
+            terms,
         })
     }
 
@@ -76,13 +93,21 @@ impl GlobalStatistics {
     }
 
     pub(crate) fn document_frequency(&self, field: &str, term: &str) -> usize {
-        self.document_frequencies
+        self.terms
             .get(&TermKey {
                 field: field.to_owned(),
                 term: term.to_owned(),
             })
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |statistics| statistics.document_frequency)
+    }
+
+    pub(crate) fn term_occurrences(&self, field: &str, term: &str) -> u64 {
+        self.terms
+            .get(&TermKey {
+                field: field.to_owned(),
+                term: term.to_owned(),
+            })
+            .map_or(0, |statistics| statistics.occurrences)
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -228,7 +253,7 @@ impl ShardedIndex {
         IndexStats {
             documents: self.document_count(),
             fields: self.global.field_totals.len(),
-            terms: self.global.document_frequencies.len(),
+            terms: self.global.terms.len(),
             postings: self.shards.iter().map(|shard| shard.stats().postings).sum(),
             tokens: self.global.field_totals.values().sum(),
         }
@@ -862,6 +887,7 @@ mod tests {
             pruning: PruningStrategy::BlockMaxWand,
             explain: true,
             bm25: Bm25Params { k1: 2.1, b: 0.35 },
+            scoring: crate::search::ScoringModel::Bm25,
         };
         let oracle = monolithic
             .search(
@@ -965,6 +991,67 @@ mod tests {
             let term = &hit.explanation.as_ref().unwrap().terms[0];
             assert_eq!(term.document_frequency, 2);
             assert!((term.average_document_length - 2.0).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn dph_uses_collection_term_occurrences_across_shards_and_survives_persistence() {
+        let mut monolithic = IndexBuilder::new(Analyzer::default());
+        let mut builder = ShardedIndexBuilder::new(Analyzer::default(), 2).unwrap();
+        for (id, title, body) in [
+            ("d0", "x sea", "x y y y"),
+            ("d1", "sea blue", "x x x x"),
+            ("d2", "x blue", "x x x x"),
+            ("d3", "blue blue", "x x x x"),
+        ] {
+            let document = Document::from_fields(id, [("title", title), ("body", body)]).unwrap();
+            monolithic.add_document(document.clone()).unwrap();
+            builder.add_document(document).unwrap();
+        }
+        let monolithic = monolithic.finish();
+        let sharded = builder.finish();
+        assert_eq!(sharded.global.term_occurrences("body", "x"), 13);
+        assert_eq!(sharded.global.term_occurrences("title", "x"), 2);
+        let options = SearchOptions {
+            top_k: 4,
+            pruning: PruningStrategy::Exhaustive,
+            explain: true,
+            scoring: crate::search::ScoringModel::Dph,
+            ..SearchOptions::default()
+        };
+        let mut encoded = Vec::new();
+        sharded.write_to(&mut encoded).unwrap();
+        let restored = ShardedIndex::read_from(Cursor::new(encoded)).unwrap();
+        for field in [Some("body"), None] {
+            let query = SearchQuery::from_text(monolithic.analyzer(), "x", field).unwrap();
+            let expected = monolithic.search(&query, options).unwrap();
+            for actual in [
+                sharded.search(&query, options).unwrap(),
+                restored.search(&query, options).unwrap(),
+            ] {
+                assert_eq!(
+                    actual
+                        .hits
+                        .iter()
+                        .map(|hit| hit.external_id.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .hits
+                        .iter()
+                        .map(|hit| hit.external_id.as_str())
+                        .collect::<Vec<_>>()
+                );
+                for (left, right) in actual.hits.iter().zip(&expected.hits) {
+                    assert_eq!(left.score.to_bits(), right.score.to_bits());
+                    let explanation = left.explanation.as_ref().unwrap();
+                    assert!((explanation.total_score - left.score).abs() < 1e-13);
+                    assert!(
+                        (explanation.terms.iter().map(|term| term.score).sum::<f64>() - left.score)
+                            .abs()
+                            < 1e-13
+                    );
+                }
+            }
         }
     }
 
