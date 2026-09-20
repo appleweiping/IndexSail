@@ -5,7 +5,7 @@
 [![MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
 IndexSail is an information-retrieval experiment toolkit in safe Rust. It builds a
-field-aware positional index, ranks with BM25 or DPH, executes exact exhaustive, WAND, block-max WAND, or MaxScore top-k
+field-aware positional index, ranks with BM25, DPH, PL2, or QLD, executes exact exhaustive, WAND, block-max WAND, or MaxScore top-k
 queries, and runs
 reproducible TREC-style experiments from collection ingestion through metrics and run files. A collection can also
 be partitioned into independently searchable physical shards while using collection-wide statistics and an exact,
@@ -442,6 +442,35 @@ PL2 defaults to exhaustive `full`; WAND, block-max WAND, and MaxScore are reject
 not yet been established. BM25 `--k1`/`--b`, batch `--verify`, CIFF retrieval, and the pruning benchmark remain
 BM25-only. JSON batch reports use schema version 2 with `"scorer": "pl2"` and `"pl2_c"`; default BM25 stays
 schema version 1. This is one additional scorer family, not full PISA scorer parity.
+
+### QLD scoring (exhaustive only)
+
+Native `search`, `shard-search`, `batch`, and `shard-batch` accept `--scorer qld`
+with a finite positive Dirichlet smoothing `--qld-mu` (default `1000`). For a
+field's document length `dl`, total collection length `cl`, term occurrences
+`cf`, and document term frequency `tf`, the nonnegative term impact is:
+
+```text
+QLD = max(0, ln(mu / (dl + mu)) + ln(1 + tf * cl / (mu * cf)))
+```
+
+This follows the frozen PISA QLD term expression and its zero clamp, while
+using `f64` instead of PISA's `float`. Each field has its own `cl`, `cf`, and
+`dl`; an unfielded term sums contributions across fields. Sharded search uses
+global field totals and occurrence counts, preserving native scores and ties
+after save/load. Explanations show `cf` and `collection_len`; batch JSON uses
+schema 2 with `"scorer": "qld"` and `"qld_mu"`. A non-finite score is rejected
+before ranking.
+
+```bash
+indexsail search --index corpus.idx --query "local search" --scorer qld --qld-mu 100 --explain
+indexsail batch --index corpus.idx --topics topics.tsv --run qld.run --report qld.json --scorer qld
+```
+
+QLD defaults to exhaustive `full`; WAND, block-max WAND, and MaxScore are
+rejected until a safe bound is proved. BM25 `--k1`/`--b`, batch `--verify`,
+CIFF retrieval, and the pruning benchmark remain BM25-only. This is not full
+PISA scorer parity or a claim of floating-point bit equivalence.
 
 ## Exact WAND
 

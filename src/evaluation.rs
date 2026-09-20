@@ -132,7 +132,8 @@ pub fn evaluate_batch<B: RetrievalBackend + ?Sized>(
     .validate()?;
     if config.scoring != ScoringModel::Bm25 && config.verify_exact {
         return Err(Error::InvalidArgument(
-            "DPH and PL2 cannot use --verify until another exact executor is available".into(),
+            "DPH, PL2, and QLD cannot use --verify until another exact executor is available"
+                .into(),
         ));
     }
     let mut topic_ids = BTreeSet::new();
@@ -255,6 +256,10 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
         ScoringModel::Pl2 { c } => {
             writeln!(writer, "  \"scorer\": \"pl2\",")?;
             writeln!(writer, "  \"pl2_c\": {c},")?;
+        }
+        ScoringModel::Qld { mu } => {
+            writeln!(writer, "  \"scorer\": \"qld\",")?;
+            writeln!(writer, "  \"qld_mu\": {mu},")?;
         }
     }
     writeln!(writer, "  \"strategy\": \"{strategy}\",")?;
@@ -490,7 +495,7 @@ fn validate_finite_report(report: &BatchReport) -> Result<()> {
     .validate()?;
     if report.config.scoring != ScoringModel::Bm25 && report.config.verify_exact {
         return Err(Error::InvalidArgument(
-            "DPH and PL2 cannot report exact cross-executor verification".into(),
+            "DPH, PL2, and QLD cannot report exact cross-executor verification".into(),
         ));
     }
     let finite_metrics = |metrics: QueryMetrics| {
@@ -896,6 +901,56 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("--verify")
+        );
+    }
+
+    #[test]
+    fn qld_batch_report_is_versioned_and_invalid_mu_publishes_nothing() {
+        let (index, topics, _) = fixture();
+        let config = BatchConfig {
+            field: Some("body".into()),
+            pruning: PruningStrategy::Exhaustive,
+            scoring: ScoringModel::Qld { mu: 2.0 },
+            ..BatchConfig::default()
+        };
+        let report = evaluate_batch(&index, &topics, None, config.clone()).unwrap();
+        let mut bytes = Vec::new();
+        write_json_report(&report, &mut bytes).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["scorer"], "qld");
+        assert_eq!(json["qld_mu"], 2.0);
+        for mu in [0.0, f64::NAN, f64::INFINITY] {
+            let mut invalid = report.clone();
+            invalid.config.scoring = ScoringModel::Qld { mu };
+            let mut output = Vec::new();
+            assert!(write_json_report(&invalid, &mut output).is_err());
+            assert!(output.is_empty());
+            assert!(
+                evaluate_batch(
+                    &index,
+                    &topics,
+                    None,
+                    BatchConfig {
+                        scoring: ScoringModel::Qld { mu },
+                        ..config.clone()
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            evaluate_batch(
+                &index,
+                &topics,
+                None,
+                BatchConfig {
+                    scoring: ScoringModel::Qld { mu: 2.0 },
+                    verify_exact: true,
+                    ..config
+                }
+            )
+            .is_err()
         );
     }
 

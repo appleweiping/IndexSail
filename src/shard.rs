@@ -110,6 +110,10 @@ impl GlobalStatistics {
             .map_or(0, |statistics| statistics.occurrences)
     }
 
+    pub(crate) fn field_total(&self, field: &str) -> u64 {
+        self.field_totals.get(field).copied().unwrap_or(0)
+    }
+
     #[allow(clippy::cast_precision_loss)]
     pub(crate) fn average_field_length(&self, field: &str) -> f64 {
         if self.document_count == 0 {
@@ -1097,6 +1101,51 @@ mod tests {
                         assert_eq!(left.score.to_bits(), right.score.to_bits());
                         assert_eq!(left.explanation, right.explanation);
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qld_uses_global_field_length_and_occurrences_after_round_trip() {
+        let mut native = IndexBuilder::new(Analyzer::default());
+        let mut builder = ShardedIndexBuilder::new(Analyzer::default(), 3).unwrap();
+        for (id, title, body) in [
+            ("d0", "x sea", "x y y y"),
+            ("d1", "sea blue", "x x x x"),
+            ("d2", "x blue", "x x x x"),
+            ("d3", "blue blue", "x x x x"),
+        ] {
+            let document = Document::from_fields(id, [("title", title), ("body", body)]).unwrap();
+            native.add_document(document.clone()).unwrap();
+            builder.add_document(document).unwrap();
+        }
+        let native = native.finish();
+        let sharded = builder.finish();
+        assert_eq!(sharded.global.field_total("body"), 16);
+        assert_eq!(sharded.global.field_total("title"), 8);
+        assert_eq!(sharded.global.term_occurrences("body", "x"), 13);
+        let options = SearchOptions {
+            top_k: 4,
+            pruning: PruningStrategy::Exhaustive,
+            explain: true,
+            scoring: crate::search::ScoringModel::Qld { mu: 1.0 },
+            ..SearchOptions::default()
+        };
+        let mut encoded = Vec::new();
+        sharded.write_to(&mut encoded).unwrap();
+        let restored = ShardedIndex::read_from(Cursor::new(encoded)).unwrap();
+        for field in [Some("body"), None] {
+            let query = SearchQuery::from_text(native.analyzer(), "x", field).unwrap();
+            let expected = native.search(&query, options).unwrap();
+            for actual in [
+                sharded.search(&query, options).unwrap(),
+                restored.search(&query, options).unwrap(),
+            ] {
+                for (left, right) in actual.hits.iter().zip(&expected.hits) {
+                    assert_eq!(left.external_id, right.external_id);
+                    assert_eq!(left.score.to_bits(), right.score.to_bits());
+                    assert_eq!(left.explanation, right.explanation);
                 }
             }
         }

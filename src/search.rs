@@ -49,11 +49,14 @@ pub enum ScoringModel {
     /// Divergence-from-randomness PL2 with positive normalization parameter c.
     /// Exhaustive execution is required until safe pruning bounds are proved.
     Pl2 { c: f64 },
+    /// Dirichlet-smoothed query likelihood with positive smoothing parameter mu.
+    /// The frozen PISA term impact is clamped at zero; only exhaustive execution is exposed.
+    Qld { mu: f64 },
 }
 
 impl ScoringModel {
     const fn uses_collection_frequency(self) -> bool {
-        matches!(self, Self::Dph | Self::Pl2 { .. })
+        matches!(self, Self::Dph | Self::Pl2 { .. } | Self::Qld { .. })
     }
 }
 
@@ -118,12 +121,20 @@ impl SearchOptions {
                 ));
             }
         }
+        if let ScoringModel::Qld { mu } = self.scoring {
+            if !mu.is_finite() || mu <= 0.0 {
+                return Err(Error::InvalidArgument(
+                    "QLD mu must be finite and greater than zero".into(),
+                ));
+            }
+        }
         if self.scoring.uses_collection_frequency() {
             if self.pruning != PruningStrategy::Exhaustive {
-                let name = if self.scoring == ScoringModel::Dph {
-                    "DPH"
-                } else {
-                    "PL2"
+                let name = match self.scoring {
+                    ScoringModel::Dph => "DPH",
+                    ScoringModel::Pl2 { .. } => "PL2",
+                    ScoringModel::Qld { .. } => "QLD",
+                    ScoringModel::Bm25 => unreachable!("BM25 does not use collection frequency"),
                 };
                 return Err(Error::InvalidArgument(format!(
                     "{name} requires exhaustive search; pruning bounds are not established"
@@ -131,7 +142,7 @@ impl SearchOptions {
             }
             if self.bm25 != Bm25Params::default() {
                 return Err(Error::InvalidArgument(
-                    "BM25 k1 and b parameters do not apply to DPH or PL2".into(),
+                    "BM25 k1 and b parameters do not apply to DPH, PL2, or QLD".into(),
                 ));
             }
         }
@@ -145,11 +156,13 @@ pub struct TermContribution {
     pub field: String,
     pub term_frequency: u32,
     pub document_frequency: usize,
-    /// Collection-wide term occurrences for DPH and PL2; absent for BM25.
+    /// Collection-wide term occurrences for DPH, PL2, and QLD; absent for BM25.
     pub collection_term_frequency: Option<u64>,
+    /// Collection-wide field token count for QLD; absent for other models.
+    pub collection_length: Option<u64>,
     pub document_length: u32,
     pub average_document_length: f64,
-    /// BM25 IDF diagnostic; not a factor in DPH scoring.
+    /// BM25 IDF diagnostic; not a factor in DPH, PL2, or QLD scoring.
     pub inverse_document_frequency: f64,
     pub boost: f64,
     pub score: f64,
@@ -214,6 +227,7 @@ struct ScoreContext {
     document_frequency: usize,
     document_count: usize,
     collection_term_frequency: Option<u64>,
+    collection_length: Option<u64>,
     average_length: f64,
     bm25: Bm25Params,
 }
@@ -245,6 +259,15 @@ impl ScoreContext {
                 document_length,
                 self.average_length,
                 c,
+            ),
+            ScoringModel::Qld { mu } => qld_score(
+                term_frequency,
+                document_length,
+                self.collection_length
+                    .expect("QLD collection length was computed"),
+                self.collection_term_frequency
+                    .expect("QLD term occurrences were computed"),
+                mu,
             ),
         }
     }
@@ -742,11 +765,20 @@ impl InvertedIndex {
             } else {
                 None
             };
+            let collection_length = if matches!(scoring, ScoringModel::Qld { .. }) {
+                Some(statistics.map_or_else(
+                    || self.field_totals.get(field).copied().unwrap_or(0),
+                    |statistics| statistics.field_total(field),
+                ))
+            } else {
+                None
+            };
             let score_context = ScoreContext {
                 model: scoring,
                 document_frequency,
                 document_count,
                 collection_term_frequency,
+                collection_length,
                 average_length,
                 bm25: params,
             };
@@ -1181,6 +1213,14 @@ impl InvertedIndex {
                 } else {
                     None
                 };
+                let collection_length = if matches!(scoring, ScoringModel::Qld { .. }) {
+                    Some(statistics.map_or_else(
+                        || self.field_totals.get(field).copied().unwrap_or(0),
+                        |statistics| statistics.field_total(field),
+                    ))
+                } else {
+                    None
+                };
                 let inverse_document_frequency = bm25_idf(document_count, document_frequency);
                 let document_length = self.field_length(doc_id, field);
                 let score = ScoreContext {
@@ -1188,6 +1228,7 @@ impl InvertedIndex {
                     document_frequency,
                     document_count,
                     collection_term_frequency,
+                    collection_length,
                     average_length: average_document_length,
                     bm25: params,
                 }
@@ -1200,6 +1241,7 @@ impl InvertedIndex {
                     term_frequency: posting.term_frequency,
                     document_frequency,
                     collection_term_frequency,
+                    collection_length,
                     document_length,
                     average_document_length,
                     inverse_document_frequency,
@@ -1363,6 +1405,41 @@ fn pl2_score(
         / (normalized_frequency + 1.0)
 }
 
+/// PISA-style Dirichlet query likelihood impact for one term and one field.
+/// The nonnegative clamp is part of the frozen scorer's behavior. A zero
+/// length or missing occurrence count has no posting impact.
+#[allow(clippy::cast_precision_loss)]
+fn qld_score(
+    term_frequency: u32,
+    document_length: u32,
+    collection_length: u64,
+    collection_term_frequency: u64,
+    mu: f64,
+) -> f64 {
+    if term_frequency == 0
+        || document_length == 0
+        || collection_length == 0
+        || collection_term_frequency == 0
+    {
+        return 0.0;
+    }
+    // Combine the two logarithms algebraically before evaluating them. The
+    // direct PISA expression has an avoidable 0 * infinity edge for tiny mu,
+    // which would silently clamp a genuinely positive impact to zero.
+    let numerator = log_sum_exp_two(
+        libm::log(mu) + libm::log(collection_term_frequency as f64),
+        libm::log(f64::from(term_frequency)) + libm::log(collection_length as f64),
+    );
+    let denominator = log_sum_exp_two(libm::log(mu), libm::log(f64::from(document_length)));
+    (numerator - libm::log(collection_term_frequency as f64) - denominator).max(0.0)
+}
+
+fn log_sum_exp_two(left: f64, right: f64) -> f64 {
+    let high = left.max(right);
+    let low = left.min(right);
+    high + libm::log1p(libm::exp(low - high))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1370,6 +1447,116 @@ mod tests {
     use crate::document::Document;
     use crate::index::IndexBuilder;
     use crate::query::{FieldFilter, PhraseFilter, QueryTerm};
+
+    #[test]
+    fn qld_matches_independent_log_oracles_and_zero_clamp() {
+        // With tf=3, dl=5, collection length=20, cf=5, mu=2:
+        // ln(2/7) + ln(1 + 3*20/(2*5)) = ln(2/7) + ln(7) = ln(2).
+        assert!((qld_score(3, 5, 20, 5, 2.0) - std::f64::consts::LN_2).abs() < 1e-14);
+        assert!((qld_score(2, 4, 16, 3, 10.0) - 0.389_464_766_761_723_3).abs() < 1e-14);
+        assert_eq!(qld_score(1, 3, 9, 8, 1.0).to_bits(), 0.0_f64.to_bits());
+        // The PISA expression's intermediate terms would be -inf and +inf;
+        // the mathematical limit is ln((tf * cl) / (dl * cf)) = ln(5).
+        assert!((qld_score(1, 2, 10, 1, f64::from_bits(1)) - libm::log(5.0)).abs() < 1e-13);
+        assert!((qld_score(3, 5, 20, 5, 1e-300) - libm::log(2.4)).abs() < 1e-13);
+        assert!(qld_score(1, 1, u64::MAX, u64::MAX, f64::MAX).is_finite());
+        for value in [
+            qld_score(0, 5, 20, 5, 2.0),
+            qld_score(3, 0, 20, 5, 2.0),
+            qld_score(3, 5, 0, 5, 2.0),
+            qld_score(3, 5, 20, 0, 2.0),
+        ] {
+            assert_eq!(value.to_bits(), 0.0_f64.to_bits());
+        }
+    }
+
+    #[test]
+    fn qld_exhaustive_uses_field_collection_counts_and_explanations() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for (id, title, body) in [
+            ("d0", "x sea", "x y y y"),
+            ("d1", "sea blue", "x x x x"),
+            ("d2", "x blue", "x x x x"),
+            ("d3", "blue blue", "x x x x"),
+        ] {
+            builder
+                .add_document(
+                    Document::from_fields(id, [("title", title), ("body", body)]).unwrap(),
+                )
+                .unwrap();
+        }
+        let index = builder.finish();
+        let options = SearchOptions {
+            top_k: 4,
+            pruning: PruningStrategy::Exhaustive,
+            explain: true,
+            scoring: ScoringModel::Qld { mu: 1.0 },
+            ..SearchOptions::default()
+        };
+        let query = SearchQuery::from_text(index.analyzer(), "x", None).unwrap();
+        let hits = index.search(&query, options).unwrap().hits;
+        assert_eq!(hits.len(), 4);
+        for hit in hits {
+            let explanation = hit.explanation.unwrap();
+            assert_eq!(explanation.total_score.to_bits(), hit.score.to_bits());
+            for term in explanation.terms {
+                let (length, count) = if term.field == "body" {
+                    (16, 13)
+                } else {
+                    (8, 2)
+                };
+                assert_eq!(term.collection_length, Some(length));
+                assert_eq!(term.collection_term_frequency, Some(count));
+                assert!(term.score >= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn qld_rejects_invalid_parameters_and_uncertified_pruning() {
+        for mu in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                SearchOptions {
+                    scoring: ScoringModel::Qld { mu },
+                    pruning: PruningStrategy::Exhaustive,
+                    ..SearchOptions::default()
+                }
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("QLD mu")
+            );
+        }
+        for pruning in [
+            PruningStrategy::Wand,
+            PruningStrategy::BlockMaxWand,
+            PruningStrategy::MaxScore,
+        ] {
+            assert!(
+                SearchOptions {
+                    scoring: ScoringModel::Qld { mu: 1000.0 },
+                    pruning,
+                    ..SearchOptions::default()
+                }
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("QLD requires exhaustive")
+            );
+        }
+        assert!(
+            SearchOptions {
+                scoring: ScoringModel::Qld { mu: 1.0 },
+                pruning: PruningStrategy::Exhaustive,
+                bm25: Bm25Params { k1: 2.0, b: 0.75 },
+                ..SearchOptions::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("do not apply")
+        );
+    }
 
     #[test]
     fn pl2_matches_independent_numeric_oracles_and_signed_impacts() {

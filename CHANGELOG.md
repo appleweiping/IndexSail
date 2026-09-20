@@ -6,6 +6,13 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 _No changes yet._
 
+## [0.11.0] - 2026-09-19
+
+- Added native and sharded QLD Dirichlet term impacts with a bounded positive
+  smoothing parameter, field-global collection statistics, exact exhaustive
+  scores, CLI/batch report schema 2, and independent log/clamp oracles. This
+  does not establish whole-PISA scorer parity or safe QLD pruning bounds.
+
 ## [0.10.0] - 2026-09-19
 
 - Added native and sharded PL2 DFR scoring with caller-declared positive `c`,

@@ -58,8 +58,9 @@ SEARCH OPTIONS:\n\
   --top-k N                Number of hits (default: 10)\n\
   --strategy wand|block-max-wand|maxscore|full\n\
                             Exact WAND, block-max WAND, MaxScore, or exhaustive evaluation\n\
-  --scorer bm25|dph|pl2    Term-impact model (default: bm25; DPH/PL2 require full)\n\
+  --scorer bm25|dph|pl2|qld  Term-impact model (default: bm25; non-BM25 requires full)\n\
   --pl2-c NUMBER           PL2 normalization c (default: 1; positive and finite)\n\
+  --qld-mu NUMBER          QLD Dirichlet smoothing mu (default: 1000; positive and finite)\n\
   --k1 NUMBER --b NUMBER   BM25 parameters\n\
   --explain                Print per-term score contributions\n\
 \n\
@@ -888,6 +889,7 @@ fn parse_search_arguments(arguments: &[String]) -> Result<ParsedOptions> {
             "--strategy",
             "--scorer",
             "--pl2-c",
+            "--qld-mu",
             "--k1",
             "--b",
         ],
@@ -934,7 +936,7 @@ fn build_search_request(
         && (parsed.optional_one("--k1")?.is_some() || parsed.optional_one("--b")?.is_some())
     {
         return Err(Error::InvalidArgument(
-            "--k1 and --b apply to BM25, not DPH or PL2".into(),
+            "--k1 and --b apply to BM25, not DPH, PL2, or QLD".into(),
         ));
     }
     let default_strategy = if scoring == ScoringModel::Bm25 {
@@ -1020,6 +1022,20 @@ fn write_search_output<'a>(
                         term.boost,
                         term.score
                     )?,
+                    ScoringModel::Qld { .. } => writeln!(
+                        output,
+                        "  term={} field={} tf={} cf={} collection_len={} len={} boost={:.3} score={:.6}",
+                        term.term,
+                        term.field,
+                        term.term_frequency,
+                        term.collection_term_frequency
+                            .expect("QLD explanation has collection frequency"),
+                        term.collection_length
+                            .expect("QLD explanation has collection length"),
+                        term.document_length,
+                        term.boost,
+                        term.score
+                    )?,
                 }
             }
         }
@@ -1038,6 +1054,7 @@ fn write_search_output<'a>(
         ScoringModel::Bm25 => {}
         ScoringModel::Dph => writeln!(output, "scorer=dph")?,
         ScoringModel::Pl2 { c } => writeln!(output, "scorer=pl2 c={c}")?,
+        ScoringModel::Qld { mu } => writeln!(output, "scorer=qld mu={mu}")?,
     }
     Ok(())
 }
@@ -1070,6 +1087,7 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
             "--strategy",
             "--scorer",
             "--pl2-c",
+            "--qld-mu",
             "--k1",
             "--b",
         ],
@@ -1105,7 +1123,7 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
         && (parsed.optional_one("--k1")?.is_some() || parsed.optional_one("--b")?.is_some())
     {
         return Err(Error::InvalidArgument(
-            "--k1 and --b apply to BM25, not DPH or PL2".into(),
+            "--k1 and --b apply to BM25, not DPH, PL2, or QLD".into(),
         ));
     }
     let default_strategy = if scoring == ScoringModel::Bm25 {
@@ -1425,7 +1443,7 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
     )?;
     if parse_scoring(parsed.optional_one("--scorer")?)? != ScoringModel::Bm25 {
         return Err(Error::InvalidArgument(
-            "the pruning benchmark currently supports BM25 only; DPH/PL2 have no certified pruning bounds"
+            "the pruning benchmark currently supports BM25 only; DPH/PL2/QLD have no certified pruning bounds"
                 .into(),
         ));
     }
@@ -1576,22 +1594,33 @@ fn parse_scoring(value: Option<&str>) -> Result<ScoringModel> {
         "bm25" => Ok(ScoringModel::Bm25),
         "dph" => Ok(ScoringModel::Dph),
         "pl2" => Ok(ScoringModel::Pl2 { c: 1.0 }),
+        "qld" => Ok(ScoringModel::Qld { mu: 1000.0 }),
         value => Err(Error::InvalidArgument(format!(
-            "unknown scorer '{value}', expected bm25, dph, or pl2"
+            "unknown scorer '{value}', expected bm25, dph, pl2, or qld"
         ))),
     }
 }
 
 fn parse_native_scoring(parsed: &ParsedOptions) -> Result<ScoringModel> {
     let scoring = parse_scoring(parsed.optional_one("--scorer")?)?;
-    match (scoring, parsed.optional_one("--pl2-c")?) {
-        (ScoringModel::Pl2 { .. }, parameter) => Ok(ScoringModel::Pl2 {
+    match (
+        scoring,
+        parsed.optional_one("--pl2-c")?,
+        parsed.optional_one("--qld-mu")?,
+    ) {
+        (ScoringModel::Pl2 { .. }, parameter, None) => Ok(ScoringModel::Pl2 {
             c: parse_optional(parameter, 1.0_f64, "pl2-c")?,
         }),
-        (other, None) => Ok(other),
-        (_, Some(_)) => Err(Error::InvalidArgument(
+        (ScoringModel::Qld { .. }, None, parameter) => Ok(ScoringModel::Qld {
+            mu: parse_optional(parameter, 1000.0_f64, "qld-mu")?,
+        }),
+        (_, Some(_), _) => Err(Error::InvalidArgument(
             "--pl2-c requires --scorer pl2".into(),
         )),
+        (_, _, Some(_)) => Err(Error::InvalidArgument(
+            "--qld-mu requires --scorer qld".into(),
+        )),
+        (other, None, None) => Ok(other),
     }
 }
 
@@ -1767,6 +1796,125 @@ mod tests {
             String::from_utf8(output).unwrap(),
             format!("indexsail {}\n", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn qld_cli_search_and_batch_report_are_explicit_and_bounded() {
+        let corpus = temp_path("qld.tsv");
+        let index = temp_path("qld.idx");
+        let topics = temp_path("qld.topics");
+        let run = temp_path("qld.run");
+        let report = temp_path("qld.json");
+        std::fs::write(
+            &corpus,
+            "id\ttitle\tbody\nD0\tx sea\tx y y y\nD1\tsea blue\tx x x x\n",
+        )
+        .unwrap();
+        std::fs::write(&topics, "1\tx\n").unwrap();
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                index.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        execute(
+            [
+                "search",
+                "--index",
+                index.to_str().unwrap(),
+                "--query",
+                "x",
+                "--field",
+                "body",
+                "--scorer",
+                "qld",
+                "--qld-mu",
+                "2",
+                "--explain",
+            ],
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("scorer=qld mu=2"));
+        assert!(output.contains("collection_len=8"));
+        assert!(output.contains("cf=5"));
+        execute(
+            [
+                "batch",
+                "--index",
+                index.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--report",
+                report.to_str().unwrap(),
+                "--scorer",
+                "qld",
+                "--qld-mu",
+                "2",
+                "--field",
+                "body",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let report_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(report_json["schema_version"], 2);
+        assert_eq!(report_json["scorer"], "qld");
+        assert_eq!(report_json["qld_mu"], 2.0);
+        let prior_run = std::fs::read(&run).unwrap();
+        for extras in [
+            vec!["--qld-mu", "0"],
+            vec!["--qld-mu", "NaN"],
+            vec!["--strategy", "wand"],
+            vec!["--pl2-c", "1"],
+            vec!["--k1", "1.2"],
+        ] {
+            let mut args = vec![
+                "batch",
+                "--index",
+                index.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--scorer",
+                "qld",
+            ];
+            args.extend(extras);
+            assert!(execute(args, Vec::new()).is_err());
+            assert_eq!(std::fs::read(&run).unwrap(), prior_run);
+        }
+        assert!(
+            execute(
+                [
+                    "search",
+                    "--index",
+                    index.to_str().unwrap(),
+                    "--query",
+                    "x",
+                    "--qld-mu",
+                    "2"
+                ],
+                Vec::new(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("requires --scorer qld")
+        );
+        for path in [&corpus, &index, &topics, &run, &report] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
