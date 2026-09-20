@@ -1563,6 +1563,22 @@ mod tests {
     }
 
     #[test]
+    fn individually_finite_duplicate_boosts_cannot_overflow_the_combined_term() {
+        let index = test_index();
+        let query = SearchQuery::from_terms(vec![
+            QueryTerm::new("search", None, f64::MAX).unwrap(),
+            QueryTerm::new("search", None, f64::MAX).unwrap(),
+        ])
+        .unwrap();
+        let error = index.search(&query, SearchOptions::default()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("combined term boost exceeds finite range")
+        );
+    }
+
+    #[test]
     fn custom_term_boost_changes_ranking() {
         let index = test_index();
         let query = SearchQuery::from_terms(vec![

@@ -2005,6 +2005,23 @@ mod tests {
     }
 
     #[test]
+    fn option_parser_rejects_duplicate_flags_missing_values_and_positionals() {
+        for (arguments, expected) in [
+            (vec!["--ascii", "--ascii"], "more than once"),
+            (vec!["--input"], "requires a value"),
+            (vec!["unexpected"], "unknown option"),
+        ] {
+            let error = ParsedOptions::parse(
+                &arguments.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                &["--ascii"],
+                &["--input"],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn repeated_filters_are_allowed() {
         let parsed = ParsedOptions::parse(
             &[
