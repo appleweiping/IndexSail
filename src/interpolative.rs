@@ -84,7 +84,7 @@ impl BitReader<'_> {
                 "truncated interpolative codeword".into(),
             ));
         }
-        let value = u64::from(self.bytes[self.position as usize / 8] >> (self.position % 8) & 1);
+        let value = u64::from((self.bytes[self.position as usize / 8] >> (self.position % 8)) & 1);
         self.position += 1;
         Ok(value)
     }
@@ -92,7 +92,7 @@ impl BitReader<'_> {
     fn fixed(&mut self, width: u32) -> Result<u64> {
         let mut value = 0_u64;
         for _ in 0..width {
-            value = value << 1 | self.bit()?;
+            value = (value << 1) | self.bit()?;
         }
         Ok(value)
     }

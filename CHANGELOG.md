@@ -6,6 +6,13 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 _No changes yet._
 
+## [0.14.1] - 2026-09-20
+
+- Fixed two Rust 1.85 Clippy precedence diagnostics in the opt-in v5
+  interpolative decoder without changing its bytes or behavior. The minimum-
+  toolchain CI job now runs strict Clippy, matching the release gate. The
+  v0.14.0 tag failed its release workflow; v0.14.1 supersedes that tag.
+
 ## [0.14.0] - 2026-09-20
 
 - Added an opt-in version-5 interpolative document-ID persistence codec with
