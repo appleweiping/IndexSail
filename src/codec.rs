@@ -8,6 +8,7 @@
 use crate::elias_fano;
 use crate::error::{Error, Result};
 use crate::index::Posting;
+use crate::interpolative;
 
 const MAX_POSITIONS_PER_POSTING: usize = 20_000_000;
 
@@ -166,6 +167,20 @@ pub(crate) fn decode_postings(bytes: &[u8], posting_count: usize) -> Result<Vec<
 /// Version 4 block: `u32` Elias–Fano byte length, canonical Elias–Fano
 /// document IDs, then varbyte frequency and position gaps per document.
 pub(crate) fn encode_elias_fano_postings(postings: &[Posting]) -> Result<Vec<u8>> {
+    encode_monotone_postings(postings, elias_fano::encode, "Elias–Fano")
+}
+
+/// Version 5 block: `u32` interpolative byte length, canonical interpolative
+/// document IDs, then unchanged varbyte frequency and position gaps.
+pub(crate) fn encode_interpolative_postings(postings: &[Posting]) -> Result<Vec<u8>> {
+    encode_monotone_postings(postings, interpolative::encode, "interpolative")
+}
+
+fn encode_monotone_postings(
+    postings: &[Posting],
+    encode_docs: fn(&[u32]) -> Result<Vec<u8>>,
+    label: &str,
+) -> Result<Vec<u8>> {
     let mut docs = Vec::new();
     docs.try_reserve_exact(postings.len())
         .map_err(|_| Error::InvalidArgument("posting IDs cannot be allocated safely".into()))?;
@@ -179,15 +194,15 @@ pub(crate) fn encode_elias_fano_postings(postings: &[Posting]) -> Result<Vec<u8>
         validate_position_count(posting.positions.len())?;
         docs.push(posting.doc_id);
     }
-    let encoded_docs = elias_fano::encode(&docs)?;
-    let encoded_docs_len = u32::try_from(encoded_docs.len())
-        .map_err(|_| Error::InvalidArgument("Elias–Fano document block exceeds u32".into()))?;
+    let doc_block = encode_docs(&docs)?;
+    let encoded_docs_len = u32::try_from(doc_block.len())
+        .map_err(|_| Error::InvalidArgument(format!("{label} document block exceeds u32")))?;
     let mut output = Vec::new();
     output
-        .try_reserve_exact(4 + encoded_docs.len())
+        .try_reserve_exact(4 + doc_block.len())
         .map_err(|_| Error::InvalidArgument("posting block cannot be allocated safely".into()))?;
     output.extend_from_slice(&encoded_docs_len.to_le_bytes());
-    output.extend_from_slice(&encoded_docs);
+    output.extend_from_slice(&doc_block);
     for posting in postings {
         encode_u32(posting.term_frequency, &mut output);
         let mut previous_position: Option<u32> = None;
@@ -211,23 +226,39 @@ pub(crate) fn decode_elias_fano_postings(
     bytes: &[u8],
     posting_count: usize,
 ) -> Result<Vec<Posting>> {
+    decode_monotone_postings(bytes, posting_count, elias_fano::decode, "Elias–Fano")
+}
+
+pub(crate) fn decode_interpolative_postings(
+    bytes: &[u8],
+    posting_count: usize,
+) -> Result<Vec<Posting>> {
+    decode_monotone_postings(bytes, posting_count, interpolative::decode, "interpolative")
+}
+
+fn decode_monotone_postings(
+    bytes: &[u8],
+    posting_count: usize,
+    decode_docs: fn(&[u8], usize) -> Result<Vec<u32>>,
+    label: &str,
+) -> Result<Vec<Posting>> {
     let encoded_docs_len = u32::from_le_bytes(
         bytes
             .get(..4)
-            .ok_or_else(|| Error::CorruptIndex("truncated Elias–Fano posting header".into()))?
+            .ok_or_else(|| Error::CorruptIndex(format!("truncated {label} posting header")))?
             .try_into()
-            .map_err(|_| Error::CorruptIndex("truncated Elias–Fano posting header".into()))?,
+            .map_err(|_| Error::CorruptIndex(format!("truncated {label} posting header")))?,
     ) as usize;
     let docs_end = 4_usize
         .checked_add(encoded_docs_len)
         .filter(|end| *end <= bytes.len())
-        .ok_or_else(|| Error::CorruptIndex("truncated Elias–Fano document block".into()))?;
+        .ok_or_else(|| Error::CorruptIndex(format!("truncated {label} document block")))?;
     if posting_count > (bytes.len() - docs_end) / 2 {
-        return Err(Error::CorruptIndex(
-            "postings cannot fit in Elias–Fano block".into(),
-        ));
+        return Err(Error::CorruptIndex(format!(
+            "postings cannot fit in {label} block"
+        )));
     }
-    let docs = elias_fano::decode(&bytes[4..docs_end], posting_count)?;
+    let docs = decode_docs(&bytes[4..docs_end], posting_count)?;
     let mut postings = Vec::new();
     postings
         .try_reserve_exact(posting_count)
@@ -275,9 +306,9 @@ pub(crate) fn decode_elias_fano_postings(
         });
     }
     if cursor != bytes.len() {
-        return Err(Error::CorruptIndex(
-            "trailing bytes in Elias–Fano posting block".into(),
-        ));
+        return Err(Error::CorruptIndex(format!(
+            "trailing bytes in {label} posting block"
+        )));
     }
     Ok(postings)
 }
@@ -420,6 +451,58 @@ mod tests {
         assert!(elias_fano.len() < varbyte.len());
         assert_eq!(
             decode_elias_fano_postings(&elias_fano, 1_000).unwrap(),
+            postings
+        );
+    }
+
+    #[test]
+    fn interpolative_posting_codec_round_trips_and_rejects_boundary_corruption() {
+        let original = vec![
+            posting(0, &[0, 127]),
+            posting(4, &[3, 128, 65_535]),
+            posting(u32::MAX, &[u32::MAX - 1]),
+        ];
+        let block = encode_interpolative_postings(&original).unwrap();
+        assert_eq!(decode_interpolative_postings(&block, 3).unwrap(), original);
+        assert!(decode_interpolative_postings(&block[..3], 3).is_err());
+        assert!(decode_interpolative_postings(&block[..block.len() - 1], 3).is_err());
+        assert!(decode_interpolative_postings(&block, 2).is_err());
+        let mut trailing = block.clone();
+        trailing.push(0);
+        assert!(decode_interpolative_postings(&trailing, 3).is_err());
+        let mut bad_length = block.clone();
+        bad_length[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_interpolative_postings(&bad_length, 3).is_err());
+        let mut bad_frequency = block.clone();
+        let docs_len = u32::from_le_bytes(block[..4].try_into().unwrap()) as usize;
+        bad_frequency[4 + docs_len] = 0;
+        assert!(decode_interpolative_postings(&bad_frequency, 3).is_err());
+        assert!(encode_interpolative_postings(&[posting(2, &[0]), posting(2, &[1])]).is_err());
+        assert!(encode_interpolative_postings(&[posting(2, &[1, 1])]).is_err());
+    }
+
+    #[test]
+    fn interpolative_dense_document_ids_reduce_posting_bytes() {
+        let postings = (0..1_000)
+            .map(|doc_id| posting(doc_id, &[0]))
+            .collect::<Vec<_>>();
+        let varbyte = encode_postings(&postings).unwrap();
+        let interpolative = encode_interpolative_postings(&postings).unwrap();
+        assert!(interpolative.len() < varbyte.len());
+        assert_eq!(
+            decode_interpolative_postings(&interpolative, 1_000).unwrap(),
+            postings
+        );
+    }
+
+    #[test]
+    fn interpolative_header_can_expand_a_sparse_posting_list() {
+        let postings = [posting(0, &[0]), posting(u32::MAX, &[1])];
+        let varbyte = encode_postings(&postings).unwrap();
+        let interpolation = encode_interpolative_postings(&postings).unwrap();
+        assert!(interpolation.len() > varbyte.len());
+        assert_eq!(
+            decode_interpolative_postings(&interpolation, 2).unwrap(),
             postings
         );
     }

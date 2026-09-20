@@ -15,8 +15,9 @@
 | `shard` | Round-robin physical partitioning, global statistics, exact merge, v1 sharded container |
 | `ciff` | CIFF v1 model, bounded protobuf framing, d-gap validation, canonical export and portable BM25 |
 | `codec` | Posting gaps, base-128 variable bytes, codec statistics, payload checksum |
-| `persistence` | default v3 and opt-in v4 writers, v1–v4 readers, checksums, bounds and structural validation |
+| `persistence` | default v3 and opt-in v4/v5 writers, v1–v5 readers, checksums, bounds and structural validation |
 | `elias_fano` | canonical monotone `u32` bit codec for v4 posting document IDs |
+| `interpolative` | canonical recursive median bit codec for v5 posting document IDs |
 | `trec` | TREC collection subset, topic, and qrels adapters |
 | `evaluation` | Generic monolithic/sharded batch execution, executor oracle, metrics, run and JSON writers |
 | `benchmark` | Seeded workload, monolithic/sharded exhaustive oracle, checksum and JSON report |
@@ -50,7 +51,7 @@ sequenceDiagram
     I->>P: deterministic logical snapshot
     P->>P: delta/varbyte posting blocks
     P->>P: persist block bounds + checksum payload
-    P-->>U: default version 3 or opt-in version 4 index file
+    P-->>U: default version 3 or opt-in version 4/5 index file
     opt physical sharding
         I->>S: documents in global insertion order
         S->>S: global_id modulo shard_count
@@ -307,7 +308,48 @@ block-bound invariant checks as v3. The checksum is accidental-corruption detect
 The version-4 index is an IndexSail-specific layout, not PISA wire format. Elias–Fano iteration occurs while
 loading, and the ordinary in-memory `Vec<Posting>` search path is unchanged; no compressed-query latency or
 memory claim is made. Dense long lists can use fewer bytes, while small/sparse lists can expand from header
-overhead. No automatic codec selection or additional PISA codec families are claimed.
+overhead. No automatic codec selection is claimed.
+
+## Opt-in interpolative format version 5
+
+`index --codec interpolative` writes `IDXSAL05` and version `5`. The v3 default and v4 Elias–Fano
+bytes are unchanged. Version 5 keeps the v3/v4 outer payload length, non-cryptographic checksum,
+documents, dictionary, varbyte frequency/position gaps, and validated block-max table. Each
+dictionary posting block is:
+
+```text
+u32      interpolative document-sequence byte length
+bytes    canonical interpolative document-sequence encoding
+repeat posting count:
+  varbyte u32  positive term frequency
+  repeat term frequency: varbyte u32 positive position gap
+```
+
+The sequence bytes begin with a little-endian `u32 last_id`, then a little-endian `u32 bit_count`,
+then exactly `ceil(bit_count/8)` packed bytes. The last ID is not repeated in the bitstream. For
+each nonempty segment, let `n` be its item count, `m=floor(n/2)`, and `r=n-m-1`. Given exclusive
+integer lower and upper neighbors, its median must lie in
+`[lower+m+1, upper-r-1]`. Encode its zero-based offset in that interval, then recurse into the
+left segment followed by the right. The initial segment excludes `last_id`, has exclusive lower
+neighbor `-1` and upper neighbor `last_id`. For interval size `R`, set
+`w=floor(log2(R))` and `c=2^(w+1)-R`. Offsets below `c` use a `w`-bit unsigned codeword;
+other offsets use a `(w+1)`-bit unsigned codeword for `offset+c`. Codewords are written
+most-significant bit first, while successive stream bits occupy bytes least-significant bit
+first. Unused high bits in the final byte are zero. A dense sequence such as `[0,1,2]` needs
+no median bits: its full sequence is `02 00 00 00 00 00 00 00`.
+
+The reader bounds list length at 20 million, checks `count <= last_id+1`, caps declared bits at
+`32*(count-1)`, requires exact byte length and zero padding, and must consume exactly the
+declared bits. The enclosing 512-MiB posting-block and 4-GiB payload limits remain active. After
+decoding, the same document/position and block-max invariants as v3 are checked. Every new
+ordinary `save`/`write_to` still produces v3; the sharded writer still embeds v3, while its
+reader accepts mixed v1–v5 embedded snapshots.
+
+This is an IndexSail-specific wire format, not byte-compatible with PISA's interpolative codec.
+It is decoded into ordinary in-memory postings before querying: no compressed iterator, latency,
+or memory reduction is claimed for search. Dense lists may save bytes, but small or sparse lists
+may expand due to the eight-byte sequence header and four-byte block prefix. This is a second
+codec family, not the whole PISA compression suite or an automatic codec selector.
 
 ## Legacy version 1 and 2 reads
 
@@ -337,7 +379,7 @@ EOF required
 ```
 
 The current sharded writer embeds format-v3 indexes. Each embedded reader independently accepts and validates
-IndexSail v1, v2, v3, or v4, after which the container validates equal analyzers, the canonical round-robin
+IndexSail v1, v2, v3, v4, or v5, after which the container validates equal analyzers, the canonical round-robin
 population, collection-wide external-ID uniqueness, and the recomputed global count/statistics. The loaded
 index retains each observed embedded version so diagnostics do not mislabel mixed legacy containers. Container
 and embedded checksums detect accidental corruption but are not authentication. Both container and individual

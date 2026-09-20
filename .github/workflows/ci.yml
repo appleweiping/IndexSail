@@ -95,6 +95,16 @@ jobs:
           grep -q 'format=IndexSail-v4' target/ci-ef-inspect.txt
           grep -q 'posting_codec=elias-fano-docids+varbyte-positions' target/ci-ef-inspect.txt
           test -s target/ci-ef-report.json
+      - name: Interpolative persisted index lifecycle and ranking parity
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo run --locked --release -- index --input examples/collection.trec --output target/ci-interpolative.idx --format trec --codec interpolative
+          cargo run --locked --release -- inspect --index target/ci-interpolative.idx > target/ci-interpolative-inspect.txt
+          cargo run --locked --release -- batch --index target/ci-interpolative.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-interpolative.run --report target/ci-interpolative-report.json --field body --top-k 10 --strategy block-max-wand --verify
+          diff -u target/ci-ef-reference.run target/ci-interpolative.run
+          grep -q 'format=IndexSail-v5' target/ci-interpolative-inspect.txt
+          grep -q 'posting_codec=interpolative-docids+varbyte-positions' target/ci-interpolative-inspect.txt
+          test -s target/ci-interpolative-report.json
       - name: Forward index and JSONL collection lifecycle smoke test
         if: matrix.os == 'ubuntu-latest'
         run: |

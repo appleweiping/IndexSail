@@ -33,7 +33,7 @@ experiments small enough to fit in one process.
 | Interchange | Bounded CIFF v1 import/export, d-gap decoding, direct BM25 and TREC batch evaluation |
 | Metrics | MAP@k, MRR@k, nDCG@k, Recall@k, latency, candidates, advances and skips |
 | Verification | Optional per-query bit-exact executor/exhaustive comparison |
-| Storage | Checksummed default v3 varbyte or opt-in v4 Elias–Fano document-ID format; v1–v4 reads and v1 sharded container |
+| Storage | Checksummed default v3 varbyte or opt-in v4 Elias–Fano / v5 interpolative document-ID formats; v1–v5 reads and v1 sharded container |
 | Operations | CLI, library API, Linux/Windows CI, strict Clippy, rustfmt and release tests |
 
 IndexSail pins its direct runtime dependencies exactly. The pure-Rust `libm` implementation provides
@@ -49,7 +49,7 @@ flowchart LR
     B --> F[Canonical forward index and lexicon]
     F --> C
     B --> C[Field-aware positional index]
-    C --> D[v3 varbyte or opt-in v4 Elias–Fano doc IDs + checksum + block bounds]
+    C --> D[v3 varbyte or opt-in v4 Elias–Fano / v5 interpolative doc IDs + checksum + block bounds]
     C --> S[Round-robin physical shards]
     C --> I[Canonical CIFF v1 export]
     S --> G[Collection-wide N DF and field totals]
@@ -128,9 +128,10 @@ cargo run --release -- inspect \
 `inspect` reports collection statistics, persisted file size, and fixed-width versus encoded posting
 bytes. It can also display one normalized posting list.
 
-For an opt-in Elias–Fano document-ID snapshot, add `--codec elias-fano` to `index`. The default
-`--codec varbyte` keeps version-3 output. Both files can be searched, inspected, and evaluated
-with the same commands; the v4 reader fully decodes postings before search. The sharded writer
+For opt-in Elias–Fano or interpolative document-ID snapshots, add `--codec elias-fano` or
+`--codec interpolative` to `index`. The default `--codec varbyte` keeps version-3 output. All
+three files can be searched, inspected, and evaluated with the same commands; both opt-in
+readers fully decode postings before search. The sharded writer
 still embeds v3 shards. `inspect` reports the actual posting codec and its encoded-byte ratio for
 each monolithic file; dictionary strings, document text, and block bounds are outside that ratio.
 
@@ -615,6 +616,13 @@ and the declared maximum before building the searchable index. This is a persist
 compressed-query iterator or a claim of PISA wire compatibility; all postings are still materialized.
 Tiny or sparse lists may become larger due to the per-list header. It is one compression family, not
 the whole PISA compression suite.
+
+Opt-in version 5 instead uses independently specified recursive interpolative coding. Each
+median document ID is represented by a canonical truncated-binary codeword inside the range
+left by its known neighbors and rank; the final ID is stored explicitly. Its compactness is
+data-dependent: dense monotone lists can be especially small, while very sparse or short
+lists may exceed v3 because of the per-list header. Version 5 is likewise an IndexSail-owned
+wire format, not PISA byte-compatible, and does not add compressed-query execution.
 
 The posting codec compresses postings only. Stored field text, dictionary strings, and block bounds remain
 uncompressed, and search loads the entire index into memory. A cross-platform standard-library mmap API does

@@ -24,6 +24,7 @@ pub mod error;
 pub mod evaluation;
 pub mod forward;
 pub mod index;
+mod interpolative;
 pub mod persistence;
 pub mod query;
 pub mod reorder;
@@ -50,7 +51,9 @@ pub use forward::{
     FORWARD_FORMAT_VERSION, ForwardDocument, ForwardIndex, ForwardStats, ForwardTerm, TermId,
 };
 pub use index::{IndexBuilder, IndexStats, InvertedIndex, Posting};
-pub use persistence::{ELIAS_FANO_FORMAT_VERSION, PostingStorageCodec};
+pub use persistence::{
+    ELIAS_FANO_FORMAT_VERSION, INTERPOLATIVE_FORMAT_VERSION, PostingStorageCodec,
+};
 pub use query::{BooleanOperator, FieldFilter, PhraseFilter, QueryTerm, SearchQuery};
 pub use reorder::{BisectionOptions, DocIdMap, MAX_REORDER_DOCUMENTS};
 pub use search::{

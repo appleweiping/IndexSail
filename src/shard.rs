@@ -1297,11 +1297,18 @@ mod tests {
         one_document("v4", "gamma newest")
             .write_to_with_codec(&mut v4, crate::persistence::PostingStorageCodec::EliasFano)
             .unwrap();
+        let mut v5 = Vec::new();
+        one_document("v5", "delta newest")
+            .write_to_with_codec(
+                &mut v5,
+                crate::persistence::PostingStorageCodec::Interpolative,
+            )
+            .unwrap();
 
-        let embedded = [v1, v2, v3, v4];
+        let embedded = [v1, v2, v3, v4, v5];
         let mut payload = Vec::new();
-        write_u32(&mut payload, 4).unwrap();
-        write_u64(&mut payload, 4).unwrap();
+        write_u32(&mut payload, 5).unwrap();
+        write_u64(&mut payload, 5).unwrap();
         for bytes in &embedded {
             write_u64(&mut payload, bytes.len() as u64).unwrap();
             payload.extend_from_slice(bytes);
@@ -1314,11 +1321,12 @@ mod tests {
         container.extend_from_slice(&payload);
 
         let restored = ShardedIndex::read_from(Cursor::new(container)).unwrap();
-        assert_eq!(restored.embedded_format_versions(), [1, 2, 3, 4]);
+        assert_eq!(restored.embedded_format_versions(), [1, 2, 3, 4, 5]);
         assert_eq!(restored.document(0).unwrap().external_id(), "v1");
         assert_eq!(restored.document(1).unwrap().external_id(), "v2");
         assert_eq!(restored.document(2).unwrap().external_id(), "v3");
         assert_eq!(restored.document(3).unwrap().external_id(), "v4");
+        assert_eq!(restored.document(4).unwrap().external_id(), "v5");
         let query = SearchQuery::from_text(restored.analyzer(), "alpha", Some("body")).unwrap();
         assert_eq!(
             restored
@@ -1338,6 +1346,15 @@ mod tests {
                 .hits[0]
                 .external_id,
             "v4"
+        );
+        let v5_query = SearchQuery::from_text(restored.analyzer(), "delta", Some("body")).unwrap();
+        assert_eq!(
+            restored
+                .search(&v5_query, SearchOptions::default())
+                .unwrap()
+                .hits[0]
+                .external_id,
+            "v5"
         );
     }
 

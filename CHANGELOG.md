@@ -6,6 +6,15 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 _No changes yet._
 
+## [0.14.0] - 2026-09-20
+
+- Added an opt-in version-5 interpolative document-ID persistence codec with
+  independently specified truncated-binary median bitstream, strict shape and
+  corruption checks, CLI/inspector support, mixed v1–v5 reads, and exact
+  ranking parity. Version 3 remains the default. This is an IndexSail-owned
+  format and a second codec family, not PISA byte compatibility or its full
+  compression suite.
+
 ## [0.13.0] - 2026-09-20
 
 - Added an opt-in version-4 native index snapshot with canonical Elias–Fano

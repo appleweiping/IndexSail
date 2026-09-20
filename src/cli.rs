@@ -19,7 +19,7 @@ use crate::forward::ForwardIndex;
 use crate::index::{InternalDocId, InvertedIndex};
 use crate::persistence::{
     PostingStorageCodec, block_max_metadata_encoded_bytes, elias_fano_posting_encoded_bytes,
-    persisted_format_version,
+    interpolative_posting_encoded_bytes, persisted_format_version,
 };
 use crate::query::{BooleanOperator, FieldFilter, PhraseFilter, SearchQuery};
 use crate::reorder::{BisectionOptions, DocIdMap, MAX_REORDER_FORWARD_BYTES};
@@ -32,7 +32,7 @@ IndexSail — compact local BM25 search\n\
 \n\
 USAGE:\n\
   indexsail --version\n\
-  indexsail index --input COLLECTION --output INDEX.idx [--format tsv|trec|jsonl] [--ascii] [--codec varbyte|elias-fano]\n\
+  indexsail index --input COLLECTION --output INDEX.idx [--format tsv|trec|jsonl] [--ascii] [--codec varbyte|elias-fano|interpolative]\n\
   indexsail shard-index --input COLLECTION --output SHARDS.idx --shards N [--format tsv|trec|jsonl] [--ascii]\n\
   indexsail forward-build --input COLLECTION --output INDEX.fwd [--format tsv|trec|jsonl] [--ascii]\n\
   indexsail forward-invert --input INDEX.fwd --output INDEX.idx\n\
@@ -424,9 +424,10 @@ fn command_index(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let codec = match parsed.optional_one("--codec")?.unwrap_or("varbyte") {
         "varbyte" => PostingStorageCodec::VarByte,
         "elias-fano" => PostingStorageCodec::EliasFano,
+        "interpolative" => PostingStorageCodec::Interpolative,
         other => {
             return Err(Error::InvalidArgument(format!(
-                "unsupported posting codec '{other}'; expected varbyte or elias-fano"
+                "unsupported posting codec '{other}'; expected varbyte, elias-fano, or interpolative"
             )));
         }
     };
@@ -1277,6 +1278,9 @@ fn command_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> 
     let codec_label = if format_version == crate::persistence::ELIAS_FANO_FORMAT_VERSION {
         codec.encoded_bytes = elias_fano_posting_encoded_bytes(&index)?;
         "elias-fano-docids+varbyte-positions"
+    } else if format_version == crate::persistence::INTERPOLATIVE_FORMAT_VERSION {
+        codec.encoded_bytes = interpolative_posting_encoded_bytes(&index)?;
+        "interpolative-docids+varbyte-positions"
     } else {
         "delta-varbyte"
     };
@@ -1862,16 +1866,21 @@ mod tests {
     }
 
     #[test]
-    fn index_cli_opt_in_elias_fano_round_trips_with_identical_results() {
+    fn index_cli_opt_in_monotone_codecs_round_trip_with_identical_results() {
         let collection = temp_path("elias-fano.tsv");
         let varbyte = temp_path("varbyte.idx");
         let elias_fano = temp_path("elias-fano.idx");
+        let interpolative = temp_path("interpolative.idx");
         std::fs::write(
             &collection,
             "id\tbody\nD1\tlocal retrieval search\nD2\tsearch ranking\nD3\tlocal search\n",
         )
         .unwrap();
-        for (path, codec) in [(&varbyte, "varbyte"), (&elias_fano, "elias-fano")] {
+        for (path, codec) in [
+            (&varbyte, "varbyte"),
+            (&elias_fano, "elias-fano"),
+            (&interpolative, "interpolative"),
+        ] {
             execute(
                 [
                     "index",
@@ -1888,9 +1897,15 @@ mod tests {
         }
         assert_eq!(persisted_format_version(&varbyte).unwrap(), 3);
         assert_eq!(persisted_format_version(&elias_fano).unwrap(), 4);
+        assert_eq!(persisted_format_version(&interpolative).unwrap(), 5);
         let mut old = Vec::new();
-        let mut new = Vec::new();
-        for (path, output) in [(&varbyte, &mut old), (&elias_fano, &mut new)] {
+        let mut ef = Vec::new();
+        let mut interpolation = Vec::new();
+        for (path, output) in [
+            (&varbyte, &mut old),
+            (&elias_fano, &mut ef),
+            (&interpolative, &mut interpolation),
+        ] {
             execute(
                 [
                     "search",
@@ -1905,7 +1920,17 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(old, new);
+        assert_eq!(old, ef);
+        assert_eq!(old, interpolation);
+        let mut inspection = Vec::new();
+        execute(
+            ["inspect", "--index", interpolative.to_str().unwrap()],
+            &mut inspection,
+        )
+        .unwrap();
+        let inspection = String::from_utf8(inspection).unwrap();
+        assert!(inspection.contains("format=IndexSail-v5"));
+        assert!(inspection.contains("posting_codec=interpolative-docids+varbyte-positions"));
         let error = execute(
             [
                 "index",
@@ -1921,7 +1946,7 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("unsupported posting codec"));
         assert_eq!(persisted_format_version(&elias_fano).unwrap(), 4);
-        for path in [collection, varbyte, elias_fano] {
+        for path in [collection, varbyte, elias_fano, interpolative] {
             std::fs::remove_file(path).unwrap();
         }
     }
