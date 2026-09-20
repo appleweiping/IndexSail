@@ -2303,12 +2303,28 @@ mod tests {
         let mut bad_seed = prefix.to_vec();
         bad_seed.extend(["--random", "--seed", "-1"]);
         assert!(execute(bad_seed, Vec::new()).is_err());
+        let mut misplaced_seed = prefix.to_vec();
+        misplaced_seed.extend(["--bp", "--seed", "1"]);
+        assert!(
+            execute(misplaced_seed, Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("--seed is only valid with --random")
+        );
         let mut bad_depth = prefix.to_vec();
         bad_depth.extend(["--bp", "--depth", "0"]);
         assert!(execute(bad_depth, Vec::new()).is_err());
         let mut misplaced_depth = prefix.to_vec();
         misplaced_depth.extend(["--random", "--depth", "2"]);
         assert!(execute(misplaced_depth, Vec::new()).is_err());
+        let mut misplaced_iterations = prefix.to_vec();
+        misplaced_iterations.extend(["--random", "--iterations", "2"]);
+        assert!(
+            execute(misplaced_iterations, Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("--depth and --iterations are only valid with --bp")
+        );
         for path in [
             collection,
             source,
@@ -2468,7 +2484,11 @@ mod tests {
             "<DOC>\n<DOCNO>D1</DOCNO>\n<TITLE>Rust</TITLE>\n<TEXT>local search ranking</TEXT>\n</DOC>\n<DOC>\n<DOCNO>D2</DOCNO>\n<TEXT>power grid model</TEXT>\n</DOC>\n",
         )
         .unwrap();
-        std::fs::write(&topics, "1\tlocal search\n2\tgrid\n").unwrap();
+        std::fs::write(
+            &topics,
+            "<top>\n<num> Number: 1\n<title> local search\n</top>\n<top>\n<num> Number: 2\n<title> grid\n</top>\n",
+        )
+        .unwrap();
         std::fs::write(&qrels, "1 0 D1 2\n2 0 D2 1\n").unwrap();
 
         execute(
@@ -2807,6 +2827,38 @@ mod tests {
         assert!(inspect_output.contains("description=CLI fixture "));
         assert!(inspect_output.contains("term=local df=2 cf=2"));
         assert!(inspect_output.contains("doc=D1 internal=0 tf=1"));
+
+        let mut absent = Vec::new();
+        execute(
+            [
+                "ciff-inspect",
+                "--index",
+                ciff.to_str().unwrap(),
+                "--term",
+                "absent",
+            ],
+            &mut absent,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(absent)
+                .unwrap()
+                .contains("term=absent df=0 cf=0")
+        );
+        for invalid in ["", "local\n"] {
+            let error = execute(
+                [
+                    "ciff-inspect",
+                    "--index",
+                    ciff.to_str().unwrap(),
+                    "--term",
+                    invalid,
+                ],
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("no control characters"));
+        }
 
         let mut search_output = Vec::new();
         execute(
@@ -3494,6 +3546,61 @@ mod tests {
     }
 
     #[test]
+    fn index_build_and_inversion_reject_hard_linked_output_without_mutating_source() {
+        let source = temp_path("hard-linked-collection.tsv");
+        let alias = temp_path("hard-linked-output.idx");
+        let original = b"id\tbody\nD1\tsearch\n";
+        std::fs::write(&source, original).unwrap();
+        std::fs::hard_link(&source, &alias).unwrap();
+        let input = source.to_str().unwrap();
+        let output = alias.to_str().unwrap();
+
+        for command in ["index", "shard-index", "forward-build"] {
+            let mut arguments = vec![command, "--input", input, "--output", output];
+            if command == "shard-index" {
+                arguments.extend(["--shards", "2"]);
+            }
+            let error = execute(arguments, Vec::new()).unwrap_err();
+            assert!(
+                error.to_string().contains("must be distinct"),
+                "{command}: {error}"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+            assert_eq!(std::fs::read(&alias).unwrap(), original);
+        }
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_file(source).unwrap();
+
+        let forward_source = temp_path("hard-linked-forward.fwd");
+        let forward_alias = temp_path("hard-linked-inverted.idx");
+        ForwardIndex::from_documents(
+            Analyzer::default(),
+            [Document::from_fields("D1", [("body", "search")]).unwrap()],
+        )
+        .unwrap()
+        .save(&forward_source)
+        .unwrap();
+        let original_forward = std::fs::read(&forward_source).unwrap();
+        std::fs::hard_link(&forward_source, &forward_alias).unwrap();
+        let error = execute(
+            [
+                "forward-invert",
+                "--input",
+                forward_source.to_str().unwrap(),
+                "--output",
+                forward_alias.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be distinct"));
+        assert_eq!(std::fs::read(&forward_source).unwrap(), original_forward);
+        assert_eq!(std::fs::read(&forward_alias).unwrap(), original_forward);
+        std::fs::remove_file(forward_alias).unwrap();
+        std::fs::remove_file(forward_source).unwrap();
+    }
+
+    #[test]
     fn lexicon_rejects_ambiguous_selectors_and_invalid_page_bounds() {
         let forward_path = temp_path("lexicon-invalid.fwd");
         ForwardIndex::from_documents(
@@ -3506,6 +3613,9 @@ mod tests {
         let path = forward_path.to_str().unwrap();
         let cases: &[(&[&str], &str)] = &[
             (&["--id", "0", "--limit", "1"], "cannot be combined"),
+            (&["--id", "0", "--field", "body"], "cannot be combined"),
+            (&["--id", "0", "--term", "blue"], "cannot be combined"),
+            (&["--id", "0", "--offset", "0"], "cannot be combined"),
             (&["--id", "not-a-number"], "not an unsigned integer"),
             (&["--id", "9999"], "does not exist"),
             (&["--field", "body"], "must be supplied together"),
@@ -3517,6 +3627,10 @@ mod tests {
             (&["--field", "body", "--term", "absent"], "does not exist"),
             (
                 &["--field", "body", "--term", "blue", "--offset", "0"],
+                "cannot be combined",
+            ),
+            (
+                &["--field", "body", "--term", "blue", "--limit", "1"],
                 "cannot be combined",
             ),
             (&["--limit", "0"], "between 1 and 1000"),

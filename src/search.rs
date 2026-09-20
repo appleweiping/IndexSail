@@ -1456,6 +1456,91 @@ mod tests {
         assert_eq!(filtered.hits, Vec::<SearchHit>::new());
     }
 
+    #[test]
+    fn dph_rejects_cross_field_overflow_before_ranking() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for index in 0..16 {
+            let text = if index == 0 {
+                "rare sea blue"
+            } else {
+                "other sea blue"
+            };
+            builder
+                .add_document(
+                    Document::from_fields(format!("d{index}"), [("title", text), ("body", text)])
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let index = builder.finish();
+        let single_field_impact = dph_score(1, 16, 1, 3, 3.0);
+        assert!(single_field_impact > 1.0);
+        let boost = f64::MAX * 0.7;
+        assert!((single_field_impact * boost).is_finite());
+        let query =
+            SearchQuery::from_terms(vec![QueryTerm::new("rare", None, boost).unwrap()]).unwrap();
+        let error = index
+            .search(
+                &query,
+                SearchOptions {
+                    pruning: PruningStrategy::Exhaustive,
+                    scoring: ScoringModel::Dph,
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("combined score for term 'rare' is not finite")
+        );
+    }
+
+    #[test]
+    fn block_max_rejects_a_corrupt_posting_count_and_rescans_b_only_customization() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for (id, body) in [("d0", "x x sea"), ("d1", "x blue"), ("d2", "sea blue")] {
+            builder
+                .add_document(Document::from_fields(id, [("body", body)]).unwrap())
+                .unwrap();
+        }
+        let mut index = builder.finish();
+        let query = SearchQuery::from_text(index.analyzer(), "x sea", Some("body")).unwrap();
+        let customized = SearchOptions {
+            pruning: PruningStrategy::BlockMaxWand,
+            bm25: Bm25Params { k1: 1.2, b: 0.2 },
+            ..SearchOptions::default()
+        };
+        let expected = index
+            .search(
+                &query,
+                SearchOptions {
+                    pruning: PruningStrategy::Exhaustive,
+                    ..customized
+                },
+            )
+            .unwrap();
+        let actual = index.search(&query, customized).unwrap();
+        assert_eq!(actual.hits, expected.hits);
+        assert_eq!(actual.stats.block_max_bounds_loaded, 0);
+        assert!(actual.stats.block_max_postings_scanned > 0);
+
+        index
+            .block_max
+            .get_mut(&BlockMaxKey {
+                field: Some("body".into()),
+                term: "x".into(),
+            })
+            .unwrap()
+            .posting_count += 1;
+        let error = index.search(&query, customized).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("block-max posting count differs")
+        );
+    }
+
     fn test_index() -> InvertedIndex {
         let documents = [
             ("a", "Rust search", "fast local search engine", "guide"),

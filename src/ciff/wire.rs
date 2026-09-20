@@ -341,6 +341,42 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn streaming_frame_distinguishes_reader_failure_from_truncation() {
+        struct FailingAfterPrefix {
+            prefix: Cursor<&'static [u8]>,
+        }
+
+        impl Read for FailingAfterPrefix {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.prefix.position() < self.prefix.get_ref().len() as u64 {
+                    self.prefix.read(bytes)
+                } else {
+                    Err(std::io::ErrorKind::PermissionDenied.into())
+                }
+            }
+        }
+
+        for prefix in [&[][..], &[2, b'a'][..]] {
+            let error = read_delimited(
+                &mut FailingAfterPrefix {
+                    prefix: Cursor::new(prefix),
+                },
+                8,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied)
+            );
+        }
+        assert!(
+            read_delimited(&mut Cursor::new([2, b'a']), 8)
+                .unwrap_err()
+                .to_string()
+                .contains("truncated CIFF frame")
+        );
+    }
+
+    #[test]
     fn varint_boundaries_round_trip() {
         for value in [
             0,

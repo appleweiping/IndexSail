@@ -815,6 +815,19 @@ mod tests {
         let report = evaluate_batch(&index, &topics[..1], None, BatchConfig::default()).unwrap();
         assert!(write_trec_run(&report, "bad tag", Vec::new()).is_err());
 
+        let mut impossible_verification = report.clone();
+        impossible_verification.config.scoring = ScoringModel::Dph;
+        impossible_verification.config.pruning = PruningStrategy::Exhaustive;
+        impossible_verification.config.verify_exact = true;
+        let mut bytes = Vec::new();
+        let error = write_json_report(&impossible_verification, &mut bytes).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot report exact cross-executor verification")
+        );
+        assert_eq!(bytes, Vec::<u8>::new());
+
         let mut invalid = report.clone();
         invalid.queries[0].hits[0].external_id = "two words".into();
         assert!(write_trec_run(&invalid, "valid", Vec::new()).is_err());
@@ -998,7 +1011,13 @@ mod tests {
     fn run_writer_validates_all_tokens_duplicates_cutoff_and_finite_scores() {
         let (index, topics, _) = fixture();
         let report = evaluate_batch(&index, &topics[..1], None, BatchConfig::default()).unwrap();
-        for tag in ["", "two words", "line\nbreak", &"x".repeat(65)] {
+        for tag in [
+            "",
+            "two words",
+            "line\nbreak",
+            "binary\u{1}tag",
+            &"x".repeat(65),
+        ] {
             assert!(write_trec_run(&report, tag, Vec::new()).is_err());
         }
         let mut invalid = report.clone();
@@ -1006,6 +1025,18 @@ mod tests {
         assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
         let mut invalid = report.clone();
         invalid.queries[0].topic_id = "bad\tid".into();
+        assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
+        let mut invalid = report.clone();
+        invalid.queries[0].topic_id = "bad\u{1}id".into();
+        assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
+        let mut invalid = report.clone();
+        invalid.queries[0].topic_id.clear();
+        assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
+        let mut invalid = report.clone();
+        invalid.queries[0].hits[0].external_id = "bad\u{1}id".into();
+        assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
+        let mut invalid = report.clone();
+        invalid.queries[0].hits[0].external_id.clear();
         assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
         let mut invalid = report.clone();
         invalid.config.top_k = 0;

@@ -1634,4 +1634,49 @@ mod tests {
                 .contains("combined CIFF query-term weight")
         );
     }
+
+    #[test]
+    fn large_finite_term_weights_cannot_overflow_ciff_candidate_scores() {
+        let mut native = IndexBuilder::new(Analyzer::default());
+        native
+            .add_document(Document::from_fields("d0", [("body", "rare blue")]).unwrap())
+            .unwrap();
+        for number in 1..16 {
+            native
+                .add_document(
+                    Document::from_fields(format!("d{number}"), [("body", "common")]).unwrap(),
+                )
+                .unwrap();
+        }
+        let index = CiffIndex::from_native(&native.finish(), "score overflow").unwrap();
+        // N=16, df=1, dl=2, avgdl=17/16: textbook BM25 gives about 1.78
+        // per rare term. Each MAX/3-weighted impact is finite and > MAX/2,
+        // while their sum on d0 is not representable.
+        let one_term = BTreeMap::from([("rare".to_owned(), f64::MAX / 3.0)]);
+        let first = index
+            .search_terms(&one_term, CiffSearchOptions::default())
+            .unwrap();
+        assert_eq!(first.hits[0].external_id, "d0");
+        assert!(first.hits[0].score.is_finite());
+        assert!(first.hits[0].score > f64::MAX / 2.0);
+
+        let two_terms = BTreeMap::from([
+            ("rare".to_owned(), f64::MAX / 3.0),
+            ("blue".to_owned(), f64::MAX / 3.0),
+        ]);
+        let error = index
+            .search_terms(&two_terms, CiffSearchOptions::default())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("accumulated BM25 score is not finite")
+        );
+
+        let one_overflowing_term = BTreeMap::from([("rare".to_owned(), f64::MAX)]);
+        let error = index
+            .search_terms(&one_overflowing_term, CiffSearchOptions::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("produced a non-finite score"));
+    }
 }

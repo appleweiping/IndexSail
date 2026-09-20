@@ -596,6 +596,77 @@ mod tests {
     }
 
     #[test]
+    fn persisted_parts_reject_document_count_field_set_and_frequency_disagreement() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        builder
+            .add_document(document("d0", "sea", "blue blue"))
+            .unwrap();
+        builder.add_document(document("d1", "sky", "blue")).unwrap();
+        let original = builder.finish();
+        let validate = |documents, lengths, postings| {
+            InvertedIndex::from_parts(original.analyzer, documents, lengths, postings)
+        };
+
+        let error = validate(
+            original.documents.clone(),
+            original.field_lengths[..1].to_vec(),
+            original.postings.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("document and field-length counts differ")
+        );
+
+        let mut duplicate = original.documents.clone();
+        duplicate[1] = document("d0", "sky", "blue");
+        let error = validate(
+            duplicate,
+            original.field_lengths.clone(),
+            original.postings.clone(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate external id"));
+
+        let mut missing_field = original.field_lengths.clone();
+        missing_field[0].remove("title");
+        let mut postings_without_title = original.postings.clone();
+        postings_without_title.retain(|key, _| key.field != "title");
+        let error = validate(
+            original.documents.clone(),
+            missing_field,
+            postings_without_title,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stored field lengths do not match")
+        );
+
+        let mut wrong_frequency = original.postings.clone();
+        wrong_frequency
+            .get_mut(&TermKey {
+                field: "body".into(),
+                term: "blue".into(),
+            })
+            .unwrap()[0]
+            .term_frequency = 1;
+        let error = validate(
+            original.documents.clone(),
+            original.field_lengths.clone(),
+            wrong_frequency,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("term frequency does not match positions")
+        );
+    }
+
+    #[test]
     fn persisted_parts_reject_unsorted_posting_documents() {
         let documents = vec![
             Document::from_fields("a", [("body", "term")]).unwrap(),

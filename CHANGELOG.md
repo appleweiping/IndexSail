@@ -4,6 +4,10 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [0.9.0] - 2026-09-19
+
 - Added one native and sharded DPH scorer family with collection-wide term-occurrence
   statistics, independently fixed numerical oracles, signed finite impacts,
   fielded/unfielded explanations, CLI and batch reports. DPH uses exhaustive
@@ -18,10 +22,12 @@ Notable changes are recorded here. Versions follow semantic versioning.
   that disagree with stored analyzed text; corrected TREC qrels physical-line
   diagnostics and expanded adversarial tests across persistence, CIFF, forward
   indexes, atomic outputs, sharding, search, and the CLI.
-- Added a fail-closed source-branch JSON verifier and parser-contract CI tests.
-  The verifier currently reports 83.79% on this development slice, below its
-  90% threshold; the CI workflow does not yet enforce the actual coverage
-  threshold, and this entry does not claim that gate has passed.
+- Promoted the fail-closed 90% source-branch gate to a pinned nightly Ubuntu
+  CI job while retaining the stable Linux/Windows matrix. Added substantive
+  adversarial cases for corrupted data, search/evaluation edge conditions,
+  and atomic output safety, plus a shared bit-exact benchmark ranking guard.
+  Local final-tree coverage measured 1,257/1,392 = 90.30% on Ubuntu and
+  1,254/1,390 = 90.22% on Windows. A tag requires the same-SHA remote gate.
 
 ## [0.8.0] - 2026-09-19
 

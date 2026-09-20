@@ -127,6 +127,15 @@ mod tests {
         for field in ["", "two words", "标题", "a/b"] {
             assert!(validate_field_name(field).is_err(), "accepted {field:?}");
         }
+        let at_limit = "a".repeat(128);
+        assert!(validate_field_name(&at_limit).is_ok());
+        let over_limit = "a".repeat(129);
+        assert!(
+            validate_field_name(&over_limit)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds 128 bytes")
+        );
     }
 
     #[test]

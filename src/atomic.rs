@@ -576,6 +576,10 @@ mod tests {
         std::fs::write(&target, b"original").unwrap();
         atomic_write_many(&[]).unwrap();
         atomic_write_many_with(&mut []).unwrap();
+        let stage = directory.join("already-removed-stage.idx");
+        std::fs::write(&stage, b"partial").unwrap();
+        remove_if_exists(&stage).unwrap();
+        remove_if_exists(&stage).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         std::fs::remove_dir_all(directory).unwrap();
@@ -650,6 +654,68 @@ mod tests {
         assert!(error.to_string().contains("not a regular file"));
         assert!(target.is_dir());
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rollback_reports_raced_directory_replacements_and_continues_cleanup() {
+        let directory = temp_dir("rollback-raced-directory");
+        let target = directory.join("target.idx");
+        let backup = directory.join("backup.idx");
+        let temporary = directory.join("stage.idx");
+        // Model another process replacing paths with directories after the
+        // transaction created its staging and backup entries. A failed unlink
+        // must be reported, while rollback still attempts its other entries.
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(&backup, b"old").unwrap();
+        std::fs::create_dir(&temporary).unwrap();
+        let mut output = StagedOutput {
+            target: target.clone(),
+            temporary: Some(temporary.clone()),
+            file: None,
+            backup: Some(backup.clone()),
+            installed: true,
+        };
+        assert!(output.rollback().is_err());
+        assert!(target.is_dir());
+        assert!(temporary.is_dir());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+
+        // A second, not-yet-installed output must likewise attempt both
+        // cleanup paths even if its backup path has been replaced.
+        let mut uninstalled = StagedOutput {
+            target: directory.join("absent.idx"),
+            temporary: Some(temporary.clone()),
+            file: None,
+            backup: Some(target.clone()),
+            installed: false,
+        };
+        assert!(uninstalled.rollback().is_err());
+        assert!(target.is_dir());
+        assert!(temporary.is_dir());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transaction_reports_both_primary_and_rollback_failure_after_path_race() {
+        let directory = temp_dir("rollback-double-failure");
+        let target = directory.join("target.idx");
+        let temporary = directory.join("stage.idx");
+        // Both entries were regular files when staged, then an external actor
+        // replaced them with directories. The primary validation failure and
+        // failed stage cleanup must both be visible to the caller.
+        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(&temporary).unwrap();
+        let staged = StagedOutput {
+            target,
+            temporary: Some(temporary.clone()),
+            file: None,
+            backup: None,
+            installed: false,
+        };
+        let error = OutputTransaction::new(vec![staged]).commit().unwrap_err();
+        assert!(error.to_string().contains("rollback also failed"));
+        assert!(temporary.is_dir());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

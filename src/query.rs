@@ -224,6 +224,12 @@ mod tests {
 
     #[test]
     fn empty_query_is_rejected() {
+        assert!(
+            QueryTerm::new(" \t ", None, 1.0)
+                .unwrap_err()
+                .to_string()
+                .contains("query term must not be empty")
+        );
         assert!(SearchQuery::from_text(Analyzer::default(), "--", None).is_err());
         assert!(SearchQuery::from_terms(Vec::new()).is_err());
     }

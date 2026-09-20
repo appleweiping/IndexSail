@@ -936,6 +936,36 @@ mod tests {
             InvertedIndex::read_from(Cursor::new(unknown)),
             Err(Error::UnsupportedVersion(999))
         ));
+
+        // The version field is validated in each legacy decoder as well as
+        // in v3; a familiar magic must not make an incompatible payload safe.
+        for magic in [MAGIC_V1, MAGIC_V2] {
+            let mut incompatible = Vec::new();
+            incompatible.extend_from_slice(magic);
+            write_u32(&mut incompatible, 999).unwrap();
+            assert!(matches!(
+                InvertedIndex::read_from(Cursor::new(incompatible)),
+                Err(Error::UnsupportedVersion(999))
+            ));
+        }
+
+        // Reject a hostile length before trying to allocate or read a 4 GiB
+        // block, regardless of which checksummed format was advertised.
+        for (magic, version) in [
+            (MAGIC_V2, CHECKSUMMED_POSTINGS_VERSION),
+            (MAGIC_V3, PERSISTENCE_FORMAT_VERSION),
+        ] {
+            let mut excessive = Vec::new();
+            excessive.extend_from_slice(magic);
+            write_u32(&mut excessive, version).unwrap();
+            write_u64(&mut excessive, MAX_INDEX_PAYLOAD_BYTES + 1).unwrap();
+            assert!(
+                InvertedIndex::read_from(Cursor::new(excessive))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds safety limit")
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Release process
 
-A push of a semantic-version tag such as `v0.8.0` invokes the release
+A push of a semantic-version tag such as `v0.9.0` invokes the release
 workflow. The workflow refuses a tag that differs from `Cargo.toml`, runs the
 release-mode test suite with the minimum supported Rust toolchain, builds
 Linux and Windows binaries, and creates the source `.crate` from the committed
@@ -11,7 +11,8 @@ explicit-mapping reordering workflow. Its release predates the subsequent
 recursive-graph-bisection work, and does not close the broader PISA reordering
 roadmap item.
 
-The development branch also has a fail-closed source-branch report checker.
+The CI workflow also enforces the fail-closed source-branch report checker
+in its pinned Ubuntu nightly job, separate from stable compiler tests.
 With `cargo-llvm-cov` 0.9.1 and Rust nightly 2026-09-18 plus
 `llvm-tools-preview`, run:
 
@@ -21,9 +22,9 @@ python scripts/check_branch_coverage.py target/branch.json
 ```
 
 The checker requires at least 90% actual covered/total source branches and
-rejects incomplete/malformed reports. This threshold is not yet a CI gate;
-the current development worktree remains below it and must not be described
-as a release-quality pass on that universal criterion.
+rejects incomplete/malformed reports. Verify that the same source SHA passes
+the remote `branch-coverage` job before signing a release tag; a local pass
+alone is not release evidence.
 
 The GitHub Release contains platform archives, the source crate, a CycloneDX
 1.5 SBOM, and `SHA256SUMS`. The SBOM is generated from locked Cargo metadata
@@ -37,7 +38,7 @@ Verify a downloaded file with:
 
 ```bash
 sha256sum --check SHA256SUMS
-gh attestation verify indexsail-v0.8.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify indexsail-v0.9.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo appleweiping/IndexSail
 ```
 

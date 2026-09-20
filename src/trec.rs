@@ -693,6 +693,14 @@ mod tests {
         assert!(parse_qrels_with_limits(Cursor::new("1 0 D 1\n"), 0, 20).is_err());
         assert!(parse_qrels_with_limits(Cursor::new("1 0 D 1\n"), 20, 0).is_err());
         assert!(parse_qrels(Cursor::new("# only comments\n\n")).is_err());
+        for input in ["1\u{1} 0 D 1\n", "1 0 D\u{1} 1\n"] {
+            assert!(
+                parse_qrels(Cursor::new(input))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported characters")
+            );
+        }
 
         let qrels = parse_qrels(Cursor::new("# comment\n1 0 A 0\n1 0 B -1\n2 0 C 31\n")).unwrap();
         assert_eq!(qrels.relevant_count("1"), 0);

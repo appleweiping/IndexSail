@@ -295,6 +295,56 @@ mod tests {
     }
 
     #[test]
+    fn malformed_frequency_and_zero_gaps_are_rejected_at_the_codec_boundary() {
+        assert!(
+            encode_postings(&[Posting {
+                doc_id: 0,
+                term_frequency: 0,
+                positions: Vec::new(),
+            }])
+            .unwrap_err()
+            .to_string()
+            .contains("term frequency does not match positions")
+        );
+        assert!(
+            encode_postings(&[Posting {
+                doc_id: 0,
+                term_frequency: 2,
+                positions: vec![0],
+            }])
+            .unwrap_err()
+            .to_string()
+            .contains("term frequency does not match positions")
+        );
+        for (block, reason) in [
+            ([0, 1, 1], "document gap must be positive"),
+            ([1, 0, 1], "term frequency must be positive"),
+            ([1, 1, 0], "position gap must be positive"),
+        ] {
+            assert!(
+                decode_postings(&block, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(reason)
+            );
+        }
+        assert_eq!(
+            PostingCodecStats::default().ratio().to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            PostingCodecStats {
+                uncompressed_bytes: 8,
+                encoded_bytes: 2,
+                ..PostingCodecStats::default()
+            }
+            .ratio()
+            .to_bits(),
+            0.25_f64.to_bits()
+        );
+    }
+
+    #[test]
     fn encoder_and_decoder_share_the_position_count_limit() {
         assert!(validate_position_count(MAX_POSITIONS_PER_POSTING).is_ok());
         assert!(validate_position_count(MAX_POSITIONS_PER_POSTING + 1).is_err());

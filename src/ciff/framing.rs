@@ -984,6 +984,48 @@ mod tests {
     }
 
     #[test]
+    fn checked_ciff_frame_writer_detects_underwrite_overwrite_and_zero_fields() {
+        let limits = CiffLimits::default();
+        let mut underwritten = Vec::new();
+        let error = write_sized_frame(&mut underwritten, 3, limits, |writer| {
+            writer.write_all(b"ab")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("left 1 unwritten bytes"));
+
+        let mut overwritten = Vec::new();
+        let error = write_sized_frame(&mut overwritten, 1, limits, |writer| {
+            writer.write_all(b"ab")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded its checked frame size")
+        );
+
+        let mut omitted = Vec::new();
+        write_varint_field(&mut omitted, 1, 0).unwrap();
+        write_fixed64_field(&mut omitted, 2, 0).unwrap();
+        write_bytes_field(&mut omitted, 3, b"").unwrap();
+        assert_eq!(omitted, Vec::<u8>::new());
+        let mut size = 0;
+        add_varint_field_len(&mut size, 1, 0).unwrap();
+        add_bytes_field_len(&mut size, 2, 0).unwrap();
+        assert_eq!(size, 0);
+
+        let mut exact = Vec::new();
+        write_sized_frame(&mut exact, 1, limits, |writer| {
+            writer.write_all(b"z")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(exact, [1, b'z']);
+    }
+
+    #[test]
     fn oversized_posting_frame_is_rejected_before_encoder_allocation() {
         let postings = (0..50_000)
             .map(|document_id| CiffPosting {

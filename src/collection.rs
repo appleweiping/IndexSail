@@ -689,6 +689,58 @@ mod tests {
     }
 
     #[test]
+    fn collection_rejects_same_length_in_place_mutation_during_callback() {
+        let path = temp_path("same-length-mutation.jsonl");
+        let original = b"{\"id\":\"a\",\"fields\":{\"body\":\"x\"}}\n";
+        let replacement = b"{\"id\":\"a\",\"fields\":{\"body\":\"y\"}}\n";
+        assert_eq!(original.len(), replacement.len());
+        std::fs::write(&path, original).unwrap();
+        let error = visit_collection(
+            &path,
+            CollectionFormat::Jsonl,
+            CollectionLimits::default(),
+            |_| {
+                std::fs::write(&path, replacement)?;
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)?
+                    .set_modified(
+                        std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+                    )?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("collection changed while it was being read")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn collection_does_not_treat_a_directory_as_an_empty_input_file() {
+        let path = temp_path("directory-as-collection");
+        std::fs::create_dir(&path).unwrap();
+        let mut visited = false;
+        let error = visit_collection(
+            &path,
+            CollectionFormat::Tsv,
+            CollectionLimits::default(),
+            |_| {
+                visited = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!visited);
+        assert!(matches!(error, Error::InvalidArgument(_) | Error::Io(_)));
+        std::fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
     fn collection_enforces_its_byte_ceiling_against_an_append() {
         let path = temp_path("append-over-limit.jsonl");
         let bytes = b"{\"id\":\"a\",\"fields\":{\"body\":\"x\"}}\n";
@@ -800,6 +852,16 @@ mod tests {
         ] {
             assert!(limits.validate().is_err());
         }
+    }
+
+    #[test]
+    fn zero_budget_input_reader_probes_one_byte_without_unbounded_allocation() {
+        let mut reader = InputLimitReader::new(Cursor::new(b"abc"), 0);
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(reader.bytes_read(), 0);
+        let error = reader.read(&mut [0; 32]).unwrap_err();
+        assert!(error.to_string().contains("exceeds 0 byte limit"));
+        assert_eq!(reader.bytes_read(), 1);
     }
 
     #[test]

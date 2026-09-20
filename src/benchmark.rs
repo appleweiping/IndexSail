@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::index::IndexBuilder;
 use crate::persistence::block_max_metadata_encoded_bytes;
 use crate::query::{BooleanOperator, SearchQuery};
-use crate::search::{PruningStrategy, SearchOptions, SearchStats};
+use crate::search::{PruningStrategy, SearchHit, SearchOptions, SearchStats};
 use crate::shard::ShardedIndex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,15 +148,11 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
             },
         )?;
         add_stats(&mut wand_stats, outcome.stats);
-        if outcome.hits.len() != exhaustive.len()
-            || outcome.hits.iter().zip(exhaustive).any(|(left, right)| {
-                left.doc_id != right.doc_id || left.score.to_bits() != right.score.to_bits()
-            })
-        {
-            return Err(Error::CorruptIndex(
-                "WAND benchmark results differ from exhaustive results".into(),
-            ));
-        }
+        verify_same_rank_and_score(
+            &outcome.hits,
+            exhaustive,
+            "WAND benchmark results differ from exhaustive results",
+        )?;
         for hit in &outcome.hits {
             checksum ^= u64::from(hit.doc_id);
             checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
@@ -181,15 +177,11 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
             },
         )?;
         add_stats(&mut block_max_stats, outcome.stats);
-        if outcome.hits.len() != exhaustive.len()
-            || outcome.hits.iter().zip(exhaustive).any(|(left, right)| {
-                left.doc_id != right.doc_id || left.score.to_bits() != right.score.to_bits()
-            })
-        {
-            return Err(Error::CorruptIndex(
-                "block-max WAND benchmark results differ from exhaustive results".into(),
-            ));
-        }
+        verify_same_rank_and_score(
+            &outcome.hits,
+            exhaustive,
+            "block-max WAND benchmark results differ from exhaustive results",
+        )?;
     }
     let block_max_time = block_max_started.elapsed();
 
@@ -205,15 +197,11 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
             },
         )?;
         add_stats(&mut maxscore_stats, outcome.stats);
-        if outcome.hits.len() != exhaustive.len()
-            || outcome.hits.iter().zip(exhaustive).any(|(left, right)| {
-                left.doc_id != right.doc_id || left.score.to_bits() != right.score.to_bits()
-            })
-        {
-            return Err(Error::CorruptIndex(
-                "MaxScore benchmark results differ from exhaustive results".into(),
-            ));
-        }
+        verify_same_rank_and_score(
+            &outcome.hits,
+            exhaustive,
+            "MaxScore benchmark results differ from exhaustive results",
+        )?;
     }
     let maxscore_time = maxscore_started.elapsed();
 
@@ -233,15 +221,11 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
             },
         )?;
         add_stats(&mut sharded_stats, outcome.stats);
-        if outcome.hits.len() != exhaustive.len()
-            || outcome.hits.iter().zip(exhaustive).any(|(left, right)| {
-                left.doc_id != right.doc_id || left.score.to_bits() != right.score.to_bits()
-            })
-        {
-            return Err(Error::CorruptIndex(
-                "sharded benchmark results differ from monolithic exhaustive results".into(),
-            ));
-        }
+        verify_same_rank_and_score(
+            &outcome.hits,
+            exhaustive,
+            "sharded benchmark results differ from monolithic exhaustive results",
+        )?;
         for hit in &outcome.hits {
             sharded_checksum ^= u64::from(hit.doc_id);
             sharded_checksum = sharded_checksum.wrapping_mul(0x0000_0100_0000_01b3);
@@ -299,6 +283,24 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         block_max_blocks,
         sharded_index_bytes,
     })
+}
+
+/// The four benchmark executors share one bit-exact ranking contract. Keep
+/// length, document ID, and score-bit checks together so a new executor
+/// cannot silently weaken one comparison while leaving the others intact.
+fn verify_same_rank_and_score(
+    actual: &[SearchHit],
+    expected: &[SearchHit],
+    mismatch: &'static str,
+) -> Result<()> {
+    if actual.len() != expected.len()
+        || actual.iter().zip(expected).any(|(left, right)| {
+            left.doc_id != right.doc_id || left.score.to_bits() != right.score.to_bits()
+        })
+    {
+        return Err(Error::CorruptIndex(mismatch.into()));
+    }
+    Ok(())
 }
 
 /// Write a stable machine-readable benchmark report. Durations remain
@@ -464,6 +466,46 @@ impl Lcg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benchmark_exactness_guard_rejects_length_id_and_score_bit_mismatches() {
+        let baseline = SearchHit {
+            doc_id: 7,
+            external_id: "d7".into(),
+            score: 1.0,
+            explanation: None,
+        };
+        let expected = [baseline.clone()];
+        let mismatch = "benchmark mismatch oracle";
+        assert!(verify_same_rank_and_score(&expected, &expected, mismatch).is_ok());
+        for actual in [
+            Vec::new(),
+            vec![SearchHit {
+                doc_id: 8,
+                ..baseline.clone()
+            }],
+            vec![SearchHit {
+                score: f64::from_bits(1.0_f64.to_bits() + 1),
+                ..baseline.clone()
+            }],
+        ] {
+            assert!(matches!(
+                verify_same_rank_and_score(&actual, &expected, mismatch),
+                Err(Error::CorruptIndex(message)) if message == mismatch
+            ));
+        }
+        // Numeric equality is insufficient: exact benchmark parity also
+        // distinguishes the IEEE-754 bits of positive and negative zero.
+        let zero = [SearchHit {
+            score: 0.0,
+            ..baseline.clone()
+        }];
+        let negative_zero = [SearchHit {
+            score: -0.0,
+            ..baseline
+        }];
+        assert!(verify_same_rank_and_score(&zero, &negative_zero, mismatch).is_err());
+    }
 
     #[test]
     fn benchmark_is_reproducible_by_checksum() {
