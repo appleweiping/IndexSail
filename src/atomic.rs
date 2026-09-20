@@ -545,6 +545,107 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn path_validation_rejects_missing_parent_and_non_file_destination() {
+        let directory = temp_dir("invalid-paths");
+        assert!(prevalidate_output_path(Path::new("")).is_err());
+        let missing_parent = directory.join("missing").join("output.idx");
+        assert!(atomic_write(&missing_parent, b"new").is_err());
+        assert!(!missing_parent.exists());
+
+        let target_directory = directory.join("output.idx");
+        std::fs::create_dir(&target_directory).unwrap();
+        let error = atomic_write(&target_directory, b"new").unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(target_directory.is_dir());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn empty_transactions_leave_existing_outputs_untouched() {
+        let directory = temp_dir("empty-transaction");
+        let target = directory.join("output.idx");
+        std::fs::write(&target, b"original").unwrap();
+        atomic_write_many(&[]).unwrap();
+        atomic_write_many_with(&mut []).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn aliasing_outputs_are_rejected_before_any_destination_changes() {
+        let directory = temp_dir("aliases");
+        let target = directory.join("output.idx");
+        let alias = directory.join("alias.idx");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::hard_link(&target, &alias).unwrap();
+        assert!(atomic_write_many(&[(&target, b"first"), (&alias, b"second")]).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"old");
+
+        let absent = directory.join("absent.idx");
+        let equivalent = directory.join(".").join("absent.idx");
+        assert!(atomic_write_many(&[(&absent, b"first"), (&equivalent, b"second")]).is_err());
+        assert!(!absent.exists());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_later_streaming_serializer_discards_all_stages() {
+        let directory = temp_dir("stream-error");
+        let existing = directory.join("existing.idx");
+        let new = directory.join("new.idx");
+        std::fs::write(&existing, b"original").unwrap();
+        let mut first = |file: &mut File| {
+            file.write_all(b"replacement")?;
+            Ok(())
+        };
+        let mut second = |file: &mut File| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("second serializer failed").into())
+        };
+        let error = atomic_write_many_with(&mut [(&existing, &mut first), (&new, &mut second)])
+            .unwrap_err();
+        assert!(error.to_string().contains("second serializer failed"));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"original");
+        assert!(!new.exists());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn commit_failure_after_new_output_removes_it_and_restores_old_output() {
+        let directory = temp_dir("new-output-rollback");
+        let new = directory.join("new.idx");
+        let existing = directory.join("existing.idx");
+        std::fs::write(&existing, b"original").unwrap();
+        inject_error_after_install_for_test(2);
+        assert!(atomic_write_many(&[(&new, b"new"), (&existing, b"replacement")]).is_err());
+        assert!(!new.exists());
+        assert_eq!(std::fs::read(&existing).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn destination_becoming_a_directory_during_serialization_is_not_replaced() {
+        let directory = temp_dir("raced-directory");
+        let target = directory.join("output.idx");
+        let error = atomic_write_with(&target, |file| {
+            file.write_all(b"replacement")?;
+            std::fs::create_dir(&target)?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn symbolic_link_output_is_rejected_without_touching_referent() {

@@ -1433,7 +1433,7 @@ mod tests {
         let hit = &outcome.hits[0];
         let explanation = hit.explanation.as_ref().unwrap();
         assert!((explanation.total_score - hit.score).abs() < 1e-12);
-        assert!(!explanation.terms.is_empty());
+        assert_ne!(explanation.terms, Vec::<TermContribution>::new());
         assert!(explanation.terms.iter().all(|term| term.score > 0.0));
     }
 
@@ -1444,15 +1444,13 @@ mod tests {
             .unwrap()
             .with_operator(BooleanOperator::And);
         let or_query = SearchQuery::from_text(index.analyzer(), "rust zzzmissing", None).unwrap();
-        assert!(
-            search(&index, and_query, PruningStrategy::Wand)
-                .hits
-                .is_empty()
+        assert_eq!(
+            search(&index, and_query, PruningStrategy::Wand).hits,
+            Vec::<SearchHit>::new()
         );
-        assert!(
-            !search(&index, or_query, PruningStrategy::Wand)
-                .hits
-                .is_empty()
+        assert_ne!(
+            search(&index, or_query, PruningStrategy::Wand).hits,
+            Vec::<SearchHit>::new()
         );
     }
 

@@ -627,6 +627,10 @@ mod tests {
     use crate::query::{QueryTerm, SearchQuery};
     use crate::search::{Bm25Params, PruningStrategy, SearchOptions};
 
+    fn wire_count(value: usize) -> u32 {
+        u32::try_from(value).unwrap()
+    }
+
     fn sample_index(mode: AnalysisMode) -> InvertedIndex {
         let mut builder = IndexBuilder::new(Analyzer::new(mode));
         builder
@@ -963,6 +967,322 @@ mod tests {
             InvertedIndex::read_from(Cursor::new(data)),
             Err(Error::CorruptIndex(message)) if message.contains("truncated index payload")
         ));
+    }
+
+    #[test]
+    fn format_headers_reject_mismatched_versions_and_oversized_payloads() {
+        for (magic, version) in [
+            (*MAGIC_V1, LEGACY_VERSION),
+            (*MAGIC_V2, CHECKSUMMED_POSTINGS_VERSION),
+            (*MAGIC_V3, PERSISTENCE_FORMAT_VERSION),
+        ] {
+            assert_eq!(format_version_from_header(magic, version).unwrap(), version);
+            assert!(matches!(
+                format_version_from_header(magic, 99),
+                Err(Error::UnsupportedVersion(99))
+            ));
+        }
+        assert!(
+            format_version_from_header(*b"NOTINDEX", 3)
+                .unwrap_err()
+                .to_string()
+                .contains("signature")
+        );
+        for (magic, expected) in [
+            (*MAGIC_V1, LEGACY_VERSION),
+            (*MAGIC_V2, CHECKSUMMED_POSTINGS_VERSION),
+            (*MAGIC_V3, PERSISTENCE_FORMAT_VERSION),
+        ] {
+            let mut data = Vec::new();
+            data.extend_from_slice(&magic);
+            write_u32(&mut data, expected + 1).unwrap();
+            assert!(matches!(
+                InvertedIndex::read_from(data.as_slice()),
+                Err(Error::UnsupportedVersion(_))
+            ));
+        }
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC_V3);
+        write_u32(&mut data, PERSISTENCE_FORMAT_VERSION).unwrap();
+        write_u64(&mut data, MAX_INDEX_PAYLOAD_BYTES + 1).unwrap();
+        assert!(
+            InvertedIndex::read_from(data.as_slice())
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds safety limit")
+        );
+    }
+
+    #[test]
+    fn malformed_block_max_metadata_rejects_scope_count_and_bound() {
+        let make = |block_size: u32,
+                    scope: u8,
+                    postings: u32,
+                    blocks: u32,
+                    bounds: &[u64],
+                    copies: u32| {
+            let mut bytes = Vec::new();
+            write_u32(&mut bytes, block_size).unwrap();
+            write_u32(&mut bytes, copies).unwrap();
+            for _ in 0..copies {
+                write_u8(&mut bytes, scope).unwrap();
+                write_string(&mut bytes, "term").unwrap();
+                write_u32(&mut bytes, postings).unwrap();
+                write_u32(&mut bytes, blocks).unwrap();
+                for &bound in bounds {
+                    write_u64(&mut bytes, bound).unwrap();
+                }
+            }
+            bytes
+        };
+        let valid = make(
+            wire_count(BLOCK_POSTINGS),
+            0,
+            1,
+            1,
+            &[1.25_f64.to_bits()],
+            1,
+        );
+        let decoded = read_block_max_metadata(&mut Cursor::new(valid.as_slice())).unwrap();
+        assert_eq!(
+            decoded.values().next().unwrap().default_bounds,
+            [1.25_f64.to_bits()]
+        );
+        for (bad, message) in [
+            (make(1, 0, 1, 1, &[1.0_f64.to_bits()], 1), "block size"),
+            (
+                make(wire_count(BLOCK_POSTINGS), 2, 1, 1, &[1.0_f64.to_bits()], 1),
+                "field scope",
+            ),
+            (
+                make(wire_count(BLOCK_POSTINGS), 0, 1, 0, &[], 1),
+                "block count",
+            ),
+            (
+                make(
+                    wire_count(BLOCK_POSTINGS),
+                    0,
+                    1,
+                    1,
+                    &[f64::NAN.to_bits()],
+                    1,
+                ),
+                "finite and non-negative",
+            ),
+            (
+                make(
+                    wire_count(BLOCK_POSTINGS),
+                    0,
+                    1,
+                    1,
+                    &[(-1.0_f64).to_bits()],
+                    1,
+                ),
+                "finite and non-negative",
+            ),
+            (
+                make(wire_count(BLOCK_POSTINGS), 0, 0, 0, &[], 2),
+                "duplicate block-max key",
+            ),
+        ] {
+            let error = read_block_max_metadata(&mut Cursor::new(bad.as_slice())).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        let mut too_many = Vec::new();
+        write_u32(&mut too_many, wire_count(BLOCK_POSTINGS)).unwrap();
+        write_u32(&mut too_many, wire_count(MAX_BLOCK_MAX_STREAMS + 1)).unwrap();
+        assert!(
+            read_block_max_metadata(&mut Cursor::new(too_many.as_slice()))
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds safety limit")
+        );
+    }
+
+    #[test]
+    fn malformed_document_and_primitive_records_fail_before_allocation() {
+        assert!(
+            read_documents(&mut Cursor::new([255_u8]))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown analyzer mode")
+        );
+        let mut bytes = Vec::new();
+        write_u8(&mut bytes, AnalysisMode::Unicode.wire_value()).unwrap();
+        write_u32(&mut bytes, 1).unwrap();
+        write_string(&mut bytes, "doc").unwrap();
+        write_u32(&mut bytes, 1).unwrap();
+        write_string(&mut bytes, "body").unwrap();
+        write_string(&mut bytes, "red").unwrap();
+        write_u32(&mut bytes, 2).unwrap();
+        for _ in 0..2 {
+            write_string(&mut bytes, "body").unwrap();
+            write_u32(&mut bytes, 1).unwrap();
+        }
+        assert!(
+            read_documents(&mut bytes.as_slice())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate field length")
+        );
+        let mut invalid_utf8 = Vec::new();
+        write_u32(&mut invalid_utf8, 1).unwrap();
+        invalid_utf8.push(255);
+        assert!(
+            read_string(&mut invalid_utf8.as_slice())
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
+        let mut oversized = Vec::new();
+        write_u32(&mut oversized, wire_count(MAX_STRING_BYTES + 1)).unwrap();
+        assert!(
+            read_string(&mut oversized.as_slice())
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds safety limit")
+        );
+        assert!(
+            write_collection_len(&mut Vec::new(), MAX_COLLECTION_ITEMS + 1, "documents")
+                .unwrap_err()
+                .to_string()
+                .contains("item safety limit")
+        );
+        let mut counter = ByteCounter { bytes: u64::MAX };
+        assert!(counter.write(&[1]).is_err());
+    }
+
+    #[test]
+    fn duplicate_dictionary_keys_and_bad_writer_bounds_are_rejected() {
+        let index = sample_index(AnalysisMode::Unicode);
+        let (key, postings) = index.postings.iter().next().unwrap();
+        let block = encode_postings(postings).unwrap();
+        let mut compressed = Vec::new();
+        write_documents(&index, &mut compressed).unwrap();
+        write_u32(&mut compressed, 2).unwrap();
+        for _ in 0..2 {
+            write_string(&mut compressed, &key.field).unwrap();
+            write_string(&mut compressed, &key.term).unwrap();
+            write_u32(&mut compressed, wire_count(postings.len())).unwrap();
+            write_u32(&mut compressed, wire_count(block.len())).unwrap();
+            compressed.extend_from_slice(&block);
+        }
+        assert!(
+            read_compressed_index(&mut Cursor::new(compressed.as_slice()))
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate dictionary key")
+        );
+
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(MAGIC_V1);
+        write_u32(&mut legacy, LEGACY_VERSION).unwrap();
+        write_documents(&index, &mut legacy).unwrap();
+        write_u32(&mut legacy, 2).unwrap();
+        for _ in 0..2 {
+            write_string(&mut legacy, &key.field).unwrap();
+            write_string(&mut legacy, &key.term).unwrap();
+            write_u32(&mut legacy, wire_count(postings.len())).unwrap();
+            for posting in postings {
+                write_u32(&mut legacy, posting.doc_id).unwrap();
+                write_u32(&mut legacy, posting.term_frequency).unwrap();
+                write_u32(&mut legacy, wire_count(posting.positions.len())).unwrap();
+                for &position in &posting.positions {
+                    write_u32(&mut legacy, position).unwrap();
+                }
+            }
+        }
+        assert!(
+            InvertedIndex::read_from(legacy.as_slice())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate dictionary key")
+        );
+
+        let mut bad_bounds = index.clone();
+        bad_bounds
+            .block_max
+            .values_mut()
+            .next()
+            .unwrap()
+            .default_bounds
+            .clear();
+        assert!(
+            write_block_max_metadata(&bad_bounds, &mut Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("bound count differs")
+        );
+    }
+
+    #[test]
+    fn non_eof_reader_error_remains_io_error() {
+        struct Denied;
+        impl Read for Denied {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+        }
+        let error = read_u32(&mut Denied).unwrap_err();
+        assert!(
+            matches!(error, Error::Io(inner) if inner.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn checksummed_snapshot_rejects_semantically_forged_posting_positions() {
+        let mut index = sample_index(AnalysisMode::Unicode);
+        index
+            .postings
+            .get_mut(&TermKey {
+                field: "body".into(),
+                term: "blue".into(),
+            })
+            .unwrap()[0]
+            .positions[0] = 0;
+        let mut encoded = Vec::new();
+        index.write_to(&mut encoded).unwrap();
+        assert!(
+            InvertedIndex::read_from(encoded.as_slice())
+                .unwrap_err()
+                .to_string()
+                .contains("do not match analyzed text")
+        );
+    }
+
+    #[test]
+    fn thousand_document_snapshot_loads_and_preserves_searchable_postings() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for ordinal in 0..1_000 {
+            builder
+                .add_document(
+                    Document::from_fields(
+                        format!("doc-{ordinal:04}"),
+                        [
+                            ("title", format!("group {}", ordinal % 17)),
+                            ("body", format!("red blue red shard {}", ordinal % 29)),
+                        ],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let original = builder.finish();
+        let encoded = bytes(&original);
+        let started = std::time::Instant::now();
+        let restored = InvertedIndex::read_from(encoded.as_slice()).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(restored.stats(), original.stats());
+        assert_eq!(restored.documents(), original.documents());
+        assert_eq!(
+            restored.postings("body", "red"),
+            original.postings("body", "red")
+        );
+        assert_eq!(restored.document_frequency("body", "blue"), 1_000);
+        eprintln!(
+            "1000-document index load with semantic verification: {:.3} ms",
+            elapsed.as_secs_f64() * 1_000.0
+        );
     }
 
     #[test]

@@ -844,6 +844,8 @@ mod tests {
     use crate::trec::Topic;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    type MutationCase<T> = (fn(&mut T), &'static str);
+
     fn temp_path() -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let number = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1004,7 +1006,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(outcome.hits.is_empty());
+        assert_eq!(outcome.hits, Vec::<SearchHit>::new());
 
         let outcome = index
             .search(
@@ -1247,6 +1249,310 @@ mod tests {
             ..CiffLimits::default()
         };
         assert!(fixture().validate(limits).is_err());
+    }
+
+    #[test]
+    fn every_resource_limit_rejects_zero_before_index_validation() {
+        for replace in [
+            |limits: &mut CiffLimits| limits.max_frame_bytes = 0,
+            |limits: &mut CiffLimits| limits.max_posting_lists = 0,
+            |limits: &mut CiffLimits| limits.max_documents = 0,
+            |limits: &mut CiffLimits| limits.max_postings = 0,
+            |limits: &mut CiffLimits| limits.max_term_bytes = 0,
+            |limits: &mut CiffLimits| limits.max_external_id_bytes = 0,
+            |limits: &mut CiffLimits| limits.max_description_bytes = 0,
+        ] {
+            let mut limits = CiffLimits::default();
+            replace(&mut limits);
+            assert!(matches!(limits.validate(), Err(Error::InvalidArgument(_))));
+        }
+    }
+
+    #[test]
+    fn malformed_header_fields_fail_at_their_specific_contract() {
+        let good = fixture().header().clone();
+        let cases: &[MutationCase<CiffHeader>] = &[
+            (|h| h.version = 2, ""),
+            (
+                |h| h.num_posting_lists = h.total_posting_lists + 1,
+                "num_postings_lists exceeds",
+            ),
+            (
+                |h| h.num_documents = h.total_documents + 1,
+                "num_docs exceeds",
+            ),
+            (
+                |h| h.total_posting_lists = i32::MAX as u32 + 1,
+                "total_postings_lists exceeds",
+            ),
+            (
+                |h| h.total_documents = i32::MAX as u32 + 1,
+                "total_docs exceeds",
+            ),
+            (
+                |h| h.total_terms_in_collection = i64::MAX as u64 + 1,
+                "total_terms_in_collection exceeds",
+            ),
+            (
+                |h| h.average_document_length = f64::NAN,
+                "average_doclength must be finite",
+            ),
+            (
+                |h| h.average_document_length = -1.0,
+                "average_doclength must be finite",
+            ),
+            (
+                |h| {
+                    h.total_documents = 0;
+                    h.num_documents = 0;
+                },
+                "empty CIFF collection",
+            ),
+            (
+                |h| h.description = "bad\0description".into(),
+                "description contains a NUL",
+            ),
+        ];
+        for (mutate, expected) in cases {
+            let mut header = good.clone();
+            mutate(&mut header);
+            let error = validate_header(&header, CiffLimits::default()).unwrap_err();
+            if expected.is_empty() {
+                assert!(matches!(error, Error::UnsupportedVersion(2)));
+            } else {
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+        }
+        let small = CiffLimits {
+            max_posting_lists: 1,
+            ..CiffLimits::default()
+        };
+        assert!(
+            validate_header(&good, small)
+                .unwrap_err()
+                .to_string()
+                .contains("num_postings_lists exceeds")
+        );
+        let small = CiffLimits {
+            max_description_bytes: 2,
+            ..CiffLimits::default()
+        };
+        assert!(
+            validate_header(&good, small)
+                .unwrap_err()
+                .to_string()
+                .contains("description exceeds")
+        );
+    }
+
+    #[test]
+    fn malformed_posting_and_document_records_fail_locally() {
+        let good = fixture();
+        let list = good.posting_lists()[0].clone();
+        let cases: &[MutationCase<CiffPostingList>] = &[
+            (|l| l.term.clear(), "term must not be empty"),
+            (|l| l.term = "bad\nterm".into(), "control character"),
+            (|l| l.document_frequency = 3, "df does not match"),
+            (|l| l.postings.clear(), "df does not match"),
+            (
+                |l| l.postings[0].document_id = i32::MAX as u32 + 1,
+                "non-negative int32",
+            ),
+            (|l| l.postings[0].document_id = 3, "outside total_docs"),
+            (
+                |l| l.postings[0].term_frequency = 0,
+                "invalid term frequency",
+            ),
+            (
+                |l| l.postings[0].term_frequency = i32::MAX as u32 + 1,
+                "invalid term frequency",
+            ),
+            (|l| l.postings[1].document_id = 0, "not strictly increasing"),
+            (|l| l.collection_frequency += 1, "cf does not match"),
+        ];
+        for (mutate, expected) in cases {
+            let mut bad = list.clone();
+            mutate(&mut bad);
+            let error = validate_posting_list_local(&bad, 3, CiffLimits::default()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let small = CiffLimits {
+            max_term_bytes: 3,
+            ..CiffLimits::default()
+        };
+        assert!(
+            validate_posting_list_local(&list, 3, small)
+                .unwrap_err()
+                .to_string()
+                .contains("postings term exceeds")
+        );
+        let mut bad = list.clone();
+        bad.document_frequency = 2;
+        assert!(
+            validate_posting_list_local(&bad, 1, CiffLimits::default())
+                .unwrap_err()
+                .to_string()
+                .contains("df exceeds total_docs")
+        );
+        let mut bad = list.clone();
+        bad.document_frequency = 0;
+        bad.collection_frequency = 0;
+        bad.postings.clear();
+        assert!(
+            validate_posting_list_local(&bad, 3, CiffLimits::default())
+                .unwrap_err()
+                .to_string()
+                .contains("must contain at least one posting")
+        );
+
+        let document = good.documents()[0].clone();
+        let cases: &[MutationCase<CiffDocumentRecord>] = &[
+            (
+                |d| d.document_id = i32::MAX as u32 + 1,
+                "non-negative int32",
+            ),
+            (
+                |d| d.external_id.clear(),
+                "collection_docid must not be empty",
+            ),
+            (
+                |d| d.external_id = "bad\nidentifier".into(),
+                "control character",
+            ),
+            (
+                |d| d.document_length = i32::MAX as u32 + 1,
+                "length exceeds",
+            ),
+            (|d| d.document_id = 3, "outside total_docs"),
+        ];
+        for (mutate, expected) in cases {
+            let mut bad = document.clone();
+            mutate(&mut bad);
+            let error = validate_document_local(&bad, 3, CiffLimits::default()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let small = CiffLimits {
+            max_external_id_bytes: 0,
+            ..CiffLimits::default()
+        };
+        assert!(
+            validate_document_local(&document, 3, small)
+                .unwrap_err()
+                .to_string()
+                .contains("collection_docid exceeds")
+        );
+    }
+
+    #[test]
+    fn empty_native_export_and_missing_query_terms_have_explicit_semantics() {
+        let empty = IndexBuilder::new(Analyzer::default()).finish();
+        let exported = CiffIndex::from_native(&empty, "empty").unwrap();
+        assert_eq!(
+            exported.header().average_document_length.to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(exported.header().total_terms_in_collection, 0);
+
+        let index = fixture();
+        let and = CiffSearchOptions {
+            operator: BooleanOperator::And,
+            ..CiffSearchOptions::default()
+        };
+        let missing = index
+            .search(Analyzer::default(), "apple nonexistent", and)
+            .unwrap();
+        assert_eq!(missing.hits, Vec::<SearchHit>::new());
+        assert_eq!(missing.stats.postings_advanced, 0);
+        let present = index
+            .search(
+                Analyzer::default(),
+                "apple nonexistent",
+                CiffSearchOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            present
+                .hits
+                .iter()
+                .map(|hit| hit.external_id.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "C"]
+        );
+        let mut bad = index.clone();
+        bad.header.num_posting_lists -= 1;
+        assert!(
+            bad.validate(CiffLimits::default())
+                .unwrap_err()
+                .to_string()
+                .contains("does not match the stream")
+        );
+    }
+
+    #[test]
+    fn ciff_retrieval_rejects_native_only_search_features() {
+        use crate::query::{FieldFilter, PhraseFilter};
+
+        let index = fixture();
+        let backend = index.retrieval(Analyzer::default());
+        let query = SearchQuery::from_text(Analyzer::default(), "apple", None).unwrap();
+        let allowed = SearchOptions {
+            pruning: PruningStrategy::Exhaustive,
+            ..SearchOptions::default()
+        };
+        let mut pruned = allowed;
+        pruned.pruning = PruningStrategy::Wand;
+        assert!(
+            RetrievalBackend::search(&backend, &query, pruned)
+                .unwrap_err()
+                .to_string()
+                .contains("exhaustive")
+        );
+        let mut explained = allowed;
+        explained.explain = true;
+        assert!(
+            RetrievalBackend::search(&backend, &query, explained)
+                .unwrap_err()
+                .to_string()
+                .contains("explanations")
+        );
+        let phrase = query
+            .clone()
+            .with_phrase(PhraseFilter::from_text(Analyzer::default(), "apple", None).unwrap());
+        let filter = query
+            .clone()
+            .with_filter(FieldFilter::exact("body", "red").unwrap());
+        let fielded = SearchQuery::from_text(Analyzer::default(), "apple", Some("body")).unwrap();
+        for unsupported in [&phrase, &filter, &fielded] {
+            assert!(
+                RetrievalBackend::search(&backend, unsupported, allowed)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no fields, positions")
+            );
+        }
+    }
+
+    #[test]
+    fn empty_collection_statistics_and_zero_bm25_guards_are_explicit() {
+        let mut header = fixture().header().clone();
+        header.num_documents = 0;
+        header.total_documents = 0;
+        header.total_terms_in_collection = 0;
+        header.average_document_length = 1.0;
+        assert!(
+            validate_header(&header, CiffLimits::default())
+                .unwrap_err()
+                .to_string()
+                .contains("empty CIFF collection")
+        );
+        assert_eq!(
+            bm25(0, 1, 1, 1, 1.0, Bm25Params::default()).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            bm25(1, 1, 1, 1, 0.0, Bm25Params::default()).to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]

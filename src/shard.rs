@@ -1197,12 +1197,9 @@ mod tests {
             .finish();
         assert_eq!(empty.stats().documents, 0);
         let query = SearchQuery::from_text(empty.analyzer(), "anything", None).unwrap();
-        assert!(
-            empty
-                .search(&query, SearchOptions::default())
-                .unwrap()
-                .hits
-                .is_empty()
+        assert_eq!(
+            empty.search(&query, SearchOptions::default()).unwrap().hits,
+            Vec::<SearchHit>::new()
         );
 
         let (monolithic, single) = indexes(40, 1);
@@ -1258,5 +1255,152 @@ mod tests {
             ShardedIndex::read_from(Cursor::new(bytes)),
             Err(Error::CorruptIndex(message)) if message.contains("truncated")
         ));
+    }
+
+    fn container_with_payload(payload: &[u8]) -> Vec<u8> {
+        let mut container = Vec::new();
+        container.extend_from_slice(MAGIC);
+        write_u32(&mut container, SHARDED_PERSISTENCE_FORMAT_VERSION).unwrap();
+        write_u64(&mut container, payload.len() as u64).unwrap();
+        write_u64(&mut container, crate::codec::checksum(payload)).unwrap();
+        container.extend_from_slice(payload);
+        container
+    }
+
+    #[test]
+    fn checksum_valid_containers_still_reject_malformed_manifests() {
+        let (_, sharded) = indexes(2, 1);
+        let mut encoded = Vec::new();
+        sharded.write_to(&mut encoded).unwrap();
+        let payload = &encoded[28..];
+
+        let mut cases = Vec::new();
+        cases.push((Vec::new(), "truncated u32"));
+        cases.push((vec![1, 0, 0, 0], "truncated u64"));
+
+        let mut zero_shards = payload.to_vec();
+        zero_shards[..4].copy_from_slice(&0_u32.to_le_bytes());
+        cases.push((zero_shards, "shard count"));
+
+        let mut too_many_shards = payload.to_vec();
+        too_many_shards[..4].copy_from_slice(&u32::try_from(MAX_SHARDS + 1).unwrap().to_le_bytes());
+        cases.push((too_many_shards, "shard count"));
+
+        let mut impossible_documents = payload.to_vec();
+        impossible_documents[4..12].copy_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes());
+        cases.push((impossible_documents, "u32::MAX"));
+
+        let mut no_length = payload[..12].to_vec();
+        no_length[..4].copy_from_slice(&1_u32.to_le_bytes());
+        cases.push((no_length, "truncated u64"));
+
+        let mut huge_shard = payload[..20].to_vec();
+        huge_shard[12..20].copy_from_slice(&(MAX_SHARD_PAYLOAD_BYTES + 1).to_le_bytes());
+        cases.push((huge_shard, "safety limit"));
+
+        let mut short_header = payload[..20].to_vec();
+        short_header[12..20].copy_from_slice(&12_u64.to_le_bytes());
+        cases.push((short_header, "truncated embedded index header"));
+
+        let mut wrong_manifest = payload.to_vec();
+        wrong_manifest[4..12].copy_from_slice(&3_u64.to_le_bytes());
+        cases.push((wrong_manifest, "expected 3"));
+
+        let mut extra_payload = payload.to_vec();
+        extra_payload.push(0);
+        cases.push((extra_payload, "trailing bytes"));
+
+        for (malformed, expected) in cases {
+            let error = ShardedIndex::read_from(Cursor::new(container_with_payload(&malformed)))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn checksum_valid_embedded_index_corruption_is_rejected() {
+        let (_, sharded) = indexes(3, 2);
+        let mut encoded = Vec::new();
+        sharded.write_to(&mut encoded).unwrap();
+        let mut payload = encoded[28..].to_vec();
+        payload[20] ^= 0xff;
+        assert!(ShardedIndex::read_from(Cursor::new(container_with_payload(&payload))).is_err());
+
+        let mut short = encoded[28..].to_vec();
+        short.truncate(20 + 12);
+        short[12..20].copy_from_slice(&12_u64.to_le_bytes());
+        assert!(ShardedIndex::read_from(Cursor::new(container_with_payload(&short))).is_err());
+    }
+
+    #[test]
+    fn header_inspection_distinguishes_truncation_bad_magic_and_unknown_version() {
+        let path = std::env::temp_dir().join(format!(
+            "indexsail-shard-bad-header-{}-{}.idx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for (bytes, expected) in [
+            (b"IDX".to_vec(), "truncated"),
+            (b"BADMAGIC".to_vec(), "signature"),
+            (MAGIC.to_vec(), "truncated"),
+            (
+                [MAGIC.as_slice(), &99_u32.to_le_bytes()].concat(),
+                "version",
+            ),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let error = persisted_sharded_format_version(&path).unwrap_err();
+            assert!(
+                error.to_string().to_lowercase().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn from_index_preserves_non_multiple_shard_layout_and_search() {
+        let (monolithic, _) = indexes(17, 3);
+        let rebuilt = ShardedIndex::from_index(&monolithic, 4).unwrap();
+        assert_eq!(rebuilt.document_count(), 17);
+        assert_eq!(
+            rebuilt
+                .physical_shard_stats()
+                .iter()
+                .map(|s| s.documents)
+                .collect::<Vec<_>>(),
+            [5, 4, 4, 4]
+        );
+        assert!(rebuilt.shard(4).is_none());
+        assert_eq!(
+            rebuilt.document_frequency("body", "common"),
+            monolithic.document_frequency("body", "common")
+        );
+        assert!(rebuilt.average_field_length("missing").abs() < f64::EPSILON);
+        for id in 0..17 {
+            assert_eq!(
+                rebuilt.document(id).unwrap().external_id(),
+                monolithic.document(id).unwrap().external_id()
+            );
+        }
+        let query = SearchQuery::from_text(monolithic.analyzer(), "common rare", None).unwrap();
+        for top_k in [1, 5, 17] {
+            let options = SearchOptions {
+                top_k,
+                explain: true,
+                ..SearchOptions::default()
+            };
+            assert_same(
+                &monolithic.search(&query, options).unwrap().hits,
+                &rebuilt.search(&query, options).unwrap().hits,
+                "rebuild",
+            );
+        }
     }
 }

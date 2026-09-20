@@ -10,8 +10,8 @@ queries, and runs
 reproducible TREC-style experiments from collection ingestion through metrics and run files. A collection can also
 be partitioned into independently searchable physical shards while using collection-wide statistics and an exact,
 deterministic global top-k merge, or exported to and searched directly from the interoperable CIFF v1 format.
-Native forward snapshots can be reordered by a seeded shuffle, document feature, or validated explicit mapping;
-recursive graph bisection remains outside the v0.8.0 scope.
+Native forward snapshots can be reordered by a seeded shuffle, document feature, validated explicit
+mapping, or deterministic recursive graph bisection over the field-qualified document-term graph.
 
 The design favors observable algorithms, deterministic results, explicit format contracts, and strict
 input validation. It is useful for teaching, local research prototypes, regression oracles, and
@@ -25,7 +25,7 @@ experiments small enough to fit in one process.
 | Analysis | Deterministic Unicode or ASCII tokenization, stored with the index |
 | Index | Named fields, stable external IDs, positions, field lengths, DF and collection statistics |
 | Forward pipeline | Canonical field-qualified lexicon, occurrence-preserving forward snapshots, inspection, and exact inversion |
-| Reordering | Seeded random, feature-sorted, or explicit document-ID permutation; bidirectional maps and rebuilt native indexes |
+| Reordering | Seeded random, feature-sorted, explicit permutation, or bounded recursive graph bisection; bidirectional maps and rebuilt native indexes |
 | Sharding | Deterministic round-robin physical shards, global BM25 statistics, stable merged top-k |
 | Retrieval | BM25, `AND`/`OR`, fielded terms, phrases, exact field filters, explanations |
 | Execution | Exhaustive oracle, exact WAND, block-max WAND, and MaxScore with stable tie-breaking |

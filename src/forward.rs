@@ -969,6 +969,11 @@ mod tests {
             DocIdMap::from_old_to_new(vec![3, 0, 2, 1]).unwrap(),
             DocIdMap::by_feature(4, b"z\na\nc\nb\n".as_slice()).unwrap(),
             DocIdMap::random(4, 17).unwrap(),
+            DocIdMap::recursive_graph_bisection(
+                &forward,
+                crate::reorder::BisectionOptions::for_documents(4),
+            )
+            .unwrap(),
         ];
         for mapping in mappings {
             let reordered = forward.reordered(&mapping).unwrap();
@@ -1221,5 +1226,209 @@ mod tests {
         assert_eq!(restored.analyzer().mode(), AnalysisMode::Ascii);
         assert_eq!(restored.term_id("body", "caf"), Some(0));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_forward_header_rejects_signature_version_and_truncation() {
+        let path = temp_path("header-rejections.fwd");
+        let forward = ForwardIndex::from_documents(Analyzer::default(), documents()).unwrap();
+        forward.save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut wrong = original.clone();
+        wrong[0] ^= 1;
+        std::fs::write(&path, wrong).unwrap();
+        assert!(
+            ForwardIndex::load(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("signature")
+        );
+        let mut wrong = original.clone();
+        wrong[8..12].copy_from_slice(&(FORWARD_FORMAT_VERSION + 1).to_le_bytes());
+        std::fs::write(&path, wrong).unwrap();
+        assert!(matches!(
+            ForwardIndex::load(&path),
+            Err(Error::UnsupportedVersion(_))
+        ));
+        for end in [0, 8, 12, 20, 27] {
+            std::fs::write(&path, &original[..end]).unwrap();
+            assert!(ForwardIndex::load(&path).is_err(), "truncated at {end}");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_forward_payload_rejects_structure_and_duplicate_fields() {
+        let mut payload = vec![255];
+        write_u32(&mut payload, 0).unwrap();
+        write_u32(&mut payload, 0).unwrap();
+        assert!(
+            ForwardIndex::read_payload(&payload)
+                .unwrap_err()
+                .to_string()
+                .contains("analyzer mode")
+        );
+
+        let mut payload = vec![AnalysisMode::Unicode.wire_value()];
+        write_u32(&mut payload, u32::try_from(MAX_TERMS + 1).unwrap()).unwrap();
+        assert!(
+            ForwardIndex::read_payload(&payload)
+                .unwrap_err()
+                .to_string()
+                .contains("term")
+        );
+
+        let mut payload = vec![AnalysisMode::Unicode.wire_value()];
+        write_u32(&mut payload, 0).unwrap();
+        write_u32(&mut payload, u32::try_from(MAX_DOCUMENTS + 1).unwrap()).unwrap();
+        assert!(
+            ForwardIndex::read_payload(&payload)
+                .unwrap_err()
+                .to_string()
+                .contains("document")
+        );
+
+        let mut payload = vec![AnalysisMode::Unicode.wire_value()];
+        write_u32(&mut payload, 0).unwrap();
+        write_u32(&mut payload, 1).unwrap();
+        write_string(&mut payload, "doc").unwrap();
+        write_u32(&mut payload, 2).unwrap();
+        for _ in 0..2 {
+            write_string(&mut payload, "body").unwrap();
+            write_string(&mut payload, "").unwrap();
+            write_u32(&mut payload, 0).unwrap();
+        }
+        assert!(
+            ForwardIndex::read_payload(&payload)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate forward field")
+        );
+
+        let mut payload = vec![AnalysisMode::Unicode.wire_value()];
+        write_u32(&mut payload, 0).unwrap();
+        write_u32(&mut payload, 0).unwrap();
+        payload.push(1);
+        assert!(
+            ForwardIndex::read_payload(&payload)
+                .unwrap_err()
+                .to_string()
+                .contains("trailing")
+        );
+    }
+
+    #[test]
+    fn semantic_forward_validation_rejects_inconsistent_lexicon_and_sequences() {
+        let forward = ForwardIndex::from_documents(Analyzer::default(), documents()).unwrap();
+        let check = |terms: Vec<ForwardTerm>, rows: Vec<ForwardDocument>, message: &str| {
+            let error = ForwardIndex::from_parts(forward.analyzer, terms, rows).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        };
+        let mut terms = forward.terms.clone();
+        terms.swap(0, 1);
+        check(terms, forward.documents.clone(), "strictly sorted");
+        let mut terms = forward.terms.clone();
+        terms[0].term = "UPPER".into();
+        check(terms, forward.documents.clone(), "not normalized");
+        let mut terms = forward.terms.clone();
+        terms.push(ForwardTerm {
+            field: "zzzz".into(),
+            term: "unused".into(),
+        });
+        check(
+            terms,
+            forward.documents.clone(),
+            "absent from every document",
+        );
+        let mut rows = forward.documents.clone();
+        rows[0].term_ids.get_mut("body").unwrap().pop();
+        check(forward.terms.clone(), rows, "token count differs");
+        let mut rows = forward.documents.clone();
+        rows[0].term_ids.get_mut("body").unwrap()[0] = u32::MAX;
+        check(forward.terms.clone(), rows, "unknown forward term id");
+        let mut rows = forward.documents.clone();
+        rows[0].term_ids.remove("body");
+        check(forward.terms.clone(), rows, "fields and sequences differ");
+        let mut rows = forward.documents.clone();
+        rows[0].term_ids.remove("body");
+        rows[0].term_ids.insert("other".into(), Vec::new());
+        check(forward.terms.clone(), rows, "fields and sequences differ");
+        let mut rows = forward.documents.clone();
+        rows[0].term_ids.get_mut("body").unwrap()[0] = forward.term_id("title", "blue").unwrap();
+        check(forward.terms.clone(), rows, "does not match");
+        let mut rows = forward.documents.clone();
+        rows[1].document = rows[0].document.clone();
+        check(forward.terms.clone(), rows, "duplicate forward document id");
+        let mut invalid = forward.clone();
+        invalid.occurrences = MAX_REORDER_OCCURRENCES + 1;
+        let mapping = DocIdMap::from_old_to_new(vec![0, 1]).unwrap();
+        assert!(
+            invalid
+                .reordered(&mapping)
+                .unwrap_err()
+                .to_string()
+                .contains("occurrence limit")
+        );
+        let short_map = DocIdMap::from_old_to_new(vec![0]).unwrap();
+        assert!(
+            forward
+                .reordered(&short_map)
+                .unwrap_err()
+                .to_string()
+                .contains("mapping has")
+        );
+        assert_eq!(add_occurrences(MAX_OCCURRENCES, 0), Some(MAX_OCCURRENCES));
+        assert_eq!(add_occurrences(MAX_OCCURRENCES, 1), None);
+        assert_eq!(add_occurrences(u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn forward_reader_distinguishes_io_errors_from_truncation() {
+        struct Denied;
+        impl Read for Denied {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+        }
+        assert!(
+            matches!(read_u32(&mut Denied), Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        let mut bad_utf8 = Vec::new();
+        write_u32(&mut bad_utf8, 1).unwrap();
+        bad_utf8.push(255);
+        assert!(
+            read_string(&mut Cursor::new(bad_utf8.as_slice()))
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
+    }
+
+    #[test]
+    fn too_many_fields_are_rejected_before_analyzing_or_revalidating() {
+        let fields = (0..=MAX_FIELDS_PER_DOCUMENT)
+            .map(|number| (format!("field_{number}"), String::new()))
+            .collect::<Vec<_>>();
+        let document = Document::from_fields("many", fields).unwrap();
+        assert!(
+            ForwardIndex::from_documents(Analyzer::default(), [document])
+                .unwrap_err()
+                .to_string()
+                .contains("field limit")
+        );
+
+        let forward = ForwardIndex::from_documents(Analyzer::default(), documents()).unwrap();
+        let mut rows = forward.documents.clone();
+        for number in 0..=MAX_FIELDS_PER_DOCUMENT {
+            rows[0]
+                .term_ids
+                .insert(format!("extra_{number}"), Vec::new());
+        }
+        assert!(
+            ForwardIndex::from_parts(forward.analyzer, forward.terms, rows)
+                .unwrap_err()
+                .to_string()
+                .contains("field limit")
+        );
     }
 }

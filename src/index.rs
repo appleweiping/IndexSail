@@ -180,8 +180,9 @@ impl InvertedIndex {
             return Err(Error::CorruptIndex("too many documents".into()));
         }
 
-        let field_totals = validate_documents_and_lengths(analyzer, &documents, &field_lengths)?;
         validate_posting_lists(analyzer, documents.len(), &field_lengths, &postings)?;
+        let field_totals =
+            validate_documents_and_lengths(analyzer, &documents, &field_lengths, &postings)?;
 
         let mut index = Self {
             analyzer,
@@ -217,10 +218,22 @@ fn validate_documents_and_lengths(
     analyzer: Analyzer,
     documents: &[Document],
     field_lengths: &[BTreeMap<String, u32>],
+    postings: &BTreeMap<TermKey, Vec<Posting>>,
 ) -> Result<BTreeMap<String, u64>> {
     let mut external_ids = HashSet::new();
     let mut field_totals = BTreeMap::<String, u64>::new();
-    for (document, lengths) in documents.iter().zip(field_lengths) {
+    let mut actual_tokens = 0_u64;
+    for values in postings.values() {
+        for posting in values {
+            actual_tokens = actual_tokens
+                .checked_add(u64::from(posting.term_frequency))
+                .ok_or_else(|| Error::CorruptIndex("posting token count overflow".into()))?;
+        }
+    }
+    let mut expected_tokens = 0_u64;
+    for (doc_id, (document, lengths)) in documents.iter().zip(field_lengths).enumerate() {
+        let doc_id =
+            u32::try_from(doc_id).map_err(|_| Error::CorruptIndex("too many documents".into()))?;
         if !external_ids.insert(document.external_id()) {
             return Err(Error::CorruptIndex(format!(
                 "duplicate external id '{}'",
@@ -240,7 +253,8 @@ fn validate_documents_and_lengths(
         }
         for (field, value) in document.fields() {
             validate_field_name(field).map_err(|error| Error::CorruptIndex(error.to_string()))?;
-            let expected = u32::try_from(analyzer.analyze(value).len())
+            let tokens = analyzer.analyze(value);
+            let expected = u32::try_from(tokens.len())
                 .map_err(|_| Error::CorruptIndex("field token count exceeds u32".into()))?;
             if lengths.get(field).copied() != Some(expected) {
                 return Err(Error::CorruptIndex(format!(
@@ -249,8 +263,51 @@ fn validate_documents_and_lengths(
                     field
                 )));
             }
-            *field_totals.entry(field.clone()).or_default() += u64::from(expected);
+            let total = field_totals.entry(field.clone()).or_default();
+            *total = total
+                .checked_add(u64::from(expected))
+                .ok_or_else(|| Error::CorruptIndex("field token count overflow".into()))?;
+            expected_tokens = expected_tokens
+                .checked_add(u64::from(expected))
+                .ok_or_else(|| Error::CorruptIndex("field token count overflow".into()))?;
+            let mut positions_by_term = BTreeMap::<String, Vec<u32>>::new();
+            for token in tokens {
+                positions_by_term
+                    .entry(token.text)
+                    .or_default()
+                    .push(token.position);
+            }
+            for (term, positions) in positions_by_term {
+                let key = TermKey {
+                    field: field.clone(),
+                    term,
+                };
+                let Some(values) = postings.get(&key) else {
+                    return Err(Error::CorruptIndex(format!(
+                        "missing posting list for '{}:{}'",
+                        key.field, key.term
+                    )));
+                };
+                let Ok(position) = values.binary_search_by_key(&doc_id, |posting| posting.doc_id)
+                else {
+                    return Err(Error::CorruptIndex(format!(
+                        "missing posting for '{}:{}' in document {doc_id}",
+                        key.field, key.term
+                    )));
+                };
+                if values[position].positions != positions {
+                    return Err(Error::CorruptIndex(format!(
+                        "posting positions for '{}:{}' in document {doc_id} do not match analyzed text",
+                        key.field, key.term
+                    )));
+                }
+            }
         }
+    }
+    if actual_tokens != expected_tokens {
+        return Err(Error::CorruptIndex(
+            "posting token count does not match analyzed documents".into(),
+        ));
     }
     Ok(field_totals)
 }
@@ -570,5 +627,193 @@ mod tests {
             InvertedIndex::from_parts(Analyzer::default(), documents, lengths, postings),
             Err(Error::CorruptIndex(_))
         ));
+    }
+
+    #[test]
+    fn persisted_parts_reject_missing_and_forged_token_postings() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        builder
+            .add_document(document("first", "blue", "red blue red"))
+            .unwrap();
+        builder
+            .add_document(document("second", "green", "blue green"))
+            .unwrap();
+        let index = builder.finish();
+        let validate = |postings| {
+            InvertedIndex::from_parts(
+                index.analyzer,
+                index.documents.clone(),
+                index.field_lengths.clone(),
+                postings,
+            )
+        };
+
+        let mut missing_term = index.postings.clone();
+        missing_term.remove(&TermKey {
+            field: "body".into(),
+            term: "red".into(),
+        });
+        assert!(matches!(
+            validate(missing_term),
+            Err(Error::CorruptIndex(_))
+        ));
+
+        let mut missing_document = index.postings.clone();
+        missing_document
+            .get_mut(&TermKey {
+                field: "body".into(),
+                term: "blue".into(),
+            })
+            .unwrap()
+            .pop();
+        assert!(matches!(
+            validate(missing_document),
+            Err(Error::CorruptIndex(_))
+        ));
+
+        let mut forged_term = index.postings.clone();
+        forged_term
+            .get_mut(&TermKey {
+                field: "body".into(),
+                term: "red".into(),
+            })
+            .unwrap()[0]
+            .positions = vec![0, 1];
+        assert!(matches!(validate(forged_term), Err(Error::CorruptIndex(_))));
+
+        let mut extra_term = index.postings.clone();
+        extra_term.insert(
+            TermKey {
+                field: "body".into(),
+                term: "phantom".into(),
+            },
+            vec![Posting {
+                doc_id: 0,
+                term_frequency: 1,
+                positions: vec![0],
+            }],
+        );
+        assert!(matches!(validate(extra_term), Err(Error::CorruptIndex(_))));
+    }
+
+    #[test]
+    fn persisted_parts_reject_malformed_posting_boundaries() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        builder
+            .add_document(document("first", "red", "red red blue"))
+            .unwrap();
+        builder
+            .add_document(document("second", "blue", "red blue"))
+            .unwrap();
+        let index = builder.finish();
+        let key = TermKey {
+            field: "body".into(),
+            term: "red".into(),
+        };
+        let validate = |postings| {
+            InvertedIndex::from_parts(
+                index.analyzer,
+                index.documents.clone(),
+                index.field_lengths.clone(),
+                postings,
+            )
+        };
+        let mut malformed = Vec::new();
+        let mut copy = index.postings.clone();
+        copy.insert(
+            TermKey {
+                field: "bad field".into(),
+                term: "red".into(),
+            },
+            copy[&key].clone(),
+        );
+        malformed.push(copy);
+        let mut copy = index.postings.clone();
+        copy.insert(
+            TermKey {
+                field: "body".into(),
+                term: "UPPER".into(),
+            },
+            copy[&key].clone(),
+        );
+        malformed.push(copy);
+        let mut copy = index.postings.clone();
+        copy.get_mut(&key).unwrap().clear();
+        malformed.push(copy);
+        let mut copy = index.postings.clone();
+        copy.get_mut(&key).unwrap()[0].doc_id = 99;
+        malformed.push(copy);
+        let mut copy = index.postings.clone();
+        copy.get_mut(&key).unwrap()[1].doc_id = 0;
+        malformed.push(copy);
+        let mut copy = index.postings.clone();
+        copy.get_mut(&key).unwrap()[0].term_frequency = 0;
+        malformed.push(copy);
+        let mut copy = index.postings.clone();
+        copy.get_mut(&key).unwrap()[0].positions = vec![1, 1];
+        malformed.push(copy);
+        let mut copy = index.postings.clone();
+        copy.get_mut(&key).unwrap()[0].positions = vec![0, 3];
+        malformed.push(copy);
+        for (case, postings) in malformed.into_iter().enumerate() {
+            assert!(
+                matches!(validate(postings), Err(Error::CorruptIndex(_))),
+                "accepted malformed posting case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_index_accessors_have_explicit_missing_semantics() {
+        let index = IndexBuilder::new(Analyzer::default()).finish();
+        assert_eq!(index.document(0), None);
+        assert_eq!(index.documents().len(), 0);
+        assert!(index.fields().is_empty());
+        assert_eq!(index.postings("body", "missing"), None);
+        assert_eq!(index.document_frequency("body", "missing"), 0);
+        assert_eq!(index.field_length(u32::MAX, "body"), 0);
+        assert_eq!(index.average_field_length("body"), 0.0);
+        assert_eq!(index.stats().tokens, 0);
+        assert_eq!(index.posting_codec_stats().unwrap().posting_lists, 0);
+    }
+
+    #[test]
+    fn thousand_document_semantic_validation_is_bounded_and_consistent() {
+        let analyzer = Analyzer::default();
+        let mut builder = IndexBuilder::new(analyzer);
+        for ordinal in 0..1_000 {
+            builder
+                .add_document(document(
+                    &format!("doc-{ordinal:04}"),
+                    &format!("group {}", ordinal % 17),
+                    &format!("red blue red shard {}", ordinal % 29),
+                ))
+                .unwrap();
+        }
+        let index = builder.finish();
+        let structural_started = std::time::Instant::now();
+        validate_posting_lists(
+            analyzer,
+            index.documents.len(),
+            &index.field_lengths,
+            &index.postings,
+        )
+        .unwrap();
+        let structural_elapsed = structural_started.elapsed();
+        let semantic_started = std::time::Instant::now();
+        let totals = validate_documents_and_lengths(
+            analyzer,
+            &index.documents,
+            &index.field_lengths,
+            &index.postings,
+        )
+        .unwrap();
+        let semantic_elapsed = semantic_started.elapsed();
+        assert_eq!(totals, index.field_totals);
+        eprintln!(
+            "1000-document validation: posting structure {:.3} ms, document semantics {:.3} ms",
+            structural_elapsed.as_secs_f64() * 1_000.0,
+            semantic_elapsed.as_secs_f64() * 1_000.0
+        );
     }
 }

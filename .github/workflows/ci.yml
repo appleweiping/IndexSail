@@ -49,6 +49,13 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          python-version: "3.11"
+      - name: Verify the branch-gate parser contract
+        if: matrix.os == 'ubuntu-latest'
+        run: python -m unittest discover -s tests -p 'test_branch_coverage.py'
       - name: Format
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
@@ -87,18 +94,24 @@ jobs:
           cargo run --locked --release -- search --index target/ci-forward.idx --query "local retrieval" --field body --top-k 10 | tee target/ci-forward-search.txt
           cargo run --locked --release -- reorder --input target/ci.fwd --forward-output target/ci-reordered.fwd --index-output target/ci-reordered.idx --old-to-new target/ci-old-to-new.map --new-to-old target/ci-new-to-old.map --random --seed 42
           cargo run --locked --release -- search --index target/ci-reordered.idx --query "local retrieval" --field body --top-k 10 | tee target/ci-reordered-search.txt
+          cargo run --locked --release -- reorder --input target/ci.fwd --forward-output target/ci-bp.fwd --index-output target/ci-bp.idx --old-to-new target/ci-bp-old-to-new.map --new-to-old target/ci-bp-new-to-old.map --bp --depth 2 --iterations 8
+          cargo run --locked --release -- search --index target/ci-bp.idx --query "local retrieval" --field body --top-k 10 | tee target/ci-bp-search.txt
           test -s target/ci.fwd
           test -s target/ci-forward.idx
           test -s target/ci-reordered.fwd
           test -s target/ci-reordered.idx
+          test -s target/ci-bp.fwd
+          test -s target/ci-bp.idx
           test -s target/ci-old-to-new.map
           test -s target/ci-new-to-old.map
           grep -q 'documents=4' target/ci-forward-inspect.txt
           grep -q $'body\tretrieval' target/ci-lexicon.txt
           awk -F '\t' 'NR > 1 && $1 ~ /^[0-9]+$/ { print $3 "\t" $2 }' target/ci-forward-search.txt | LC_ALL=C sort > target/ci-forward-hits.txt
           awk -F '\t' 'NR > 1 && $1 ~ /^[0-9]+$/ { print $3 "\t" $2 }' target/ci-reordered-search.txt | LC_ALL=C sort > target/ci-reordered-hits.txt
+          awk -F '\t' 'NR > 1 && $1 ~ /^[0-9]+$/ { print $3 "\t" $2 }' target/ci-bp-search.txt | LC_ALL=C sort > target/ci-bp-hits.txt
           test "$(wc -l < target/ci-forward-hits.txt)" -eq 2
           diff -u target/ci-forward-hits.txt target/ci-reordered-hits.txt
+          diff -u target/ci-forward-hits.txt target/ci-bp-hits.txt
           cut -f1 target/ci-forward-hits.txt > target/ci-forward-ids.txt
           printf 'DOC-001\nDOC-002\n' > target/ci-expected-ids.txt
           diff -u target/ci-expected-ids.txt target/ci-forward-ids.txt
@@ -108,6 +121,9 @@ jobs:
           diff -u target/ci-expected-old-to-new.map target/ci-old-to-new.map
           awk '{ print $2 " " $1 }' target/ci-old-to-new.map | sort -n -k1,1 > target/ci-expected-inverse.map
           diff -u target/ci-expected-inverse.map target/ci-new-to-old.map
+          test "$(wc -l < target/ci-bp-old-to-new.map)" -eq 4
+          awk '{ print $2 " " $1 }' target/ci-bp-old-to-new.map | sort -n -k1,1 > target/ci-bp-expected-inverse.map
+          diff -u target/ci-bp-expected-inverse.map target/ci-bp-new-to-old.map
       - name: Sharded TREC lifecycle smoke test
         if: matrix.os == 'ubuntu-latest'
         run: |

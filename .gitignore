@@ -4,3 +4,5 @@
 .idea/
 .vscode/
 .agent/
+__pycache__/
+*.pyc

@@ -147,8 +147,8 @@ mod tests {
 
     #[test]
     fn empty_and_punctuation_only_inputs_have_no_tokens() {
-        assert!(Analyzer::default().analyze("").is_empty());
-        assert!(Analyzer::default().analyze("—!?.").is_empty());
+        assert_eq!(Analyzer::default().analyze(""), Vec::<Token>::new());
+        assert_eq!(Analyzer::default().analyze("—!?."), Vec::<Token>::new());
     }
 
     #[test]

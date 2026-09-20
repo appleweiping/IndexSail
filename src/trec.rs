@@ -271,27 +271,24 @@ fn parse_qrels_with_limits(
         if columns.len() != 4 {
             return Err(Error::InvalidArgument(format!(
                 "qrels line {} has {} columns; expected 4",
-                line_index + 1,
+                line_index,
                 columns.len()
             )));
         }
         if !valid_trec_token(columns[0]) || !valid_trec_token(columns[2]) {
             return Err(Error::InvalidArgument(format!(
-                "qrels topic/document id at line {} contains unsupported characters",
-                line_index + 1
+                "qrels topic/document id at line {line_index} contains unsupported characters"
             )));
         }
         let relevance = columns[3].parse::<i32>().map_err(|_| {
             Error::InvalidArgument(format!(
                 "qrels relevance '{}' at line {} is not an integer",
-                columns[3],
-                line_index + 1
+                columns[3], line_index
             ))
         })?;
         if relevance > 31 {
             return Err(Error::InvalidArgument(format!(
-                "qrels relevance {relevance} at line {} exceeds supported maximum 31",
-                line_index + 1
+                "qrels relevance {relevance} at line {line_index} exceeds supported maximum 31"
             )));
         }
         let documents = judgments.entry(columns[0].to_owned()).or_default();
@@ -652,5 +649,109 @@ mod tests {
     fn entity_decoding_is_single_pass() {
         assert_eq!(strip_markup("A &amp; B &lt; C"), "A & B < C");
         assert_eq!(strip_markup("&amp;lt;"), "&lt;");
+    }
+
+    #[test]
+    fn topics_reject_incomplete_and_ambiguous_sgml_records() {
+        for input in [
+            "<top>\n<num>1\n<top>\n<title>query\n</top>\n",
+            "<top>\n<num>1\n<title>query\n",
+            "<top>\n<title>query\n</top>\n",
+            "<top>\n<num>1\n</top>\n",
+            "<top>\n<num>1\n<title>query\n</top>\n<top>\n<num>1\n<title>other\n</top>\n",
+        ] {
+            assert!(parse_sgml_topics(input).is_err(), "{input:?}");
+        }
+        assert!(parse_sgml_topics("</top>\n").is_err());
+        assert!(parse_tsv_topics("# comment\n\n").is_err());
+        assert!(parse_tsv_topics("1\t   \n").is_err());
+        assert!(parse_tsv_topics("two words\tquery\n").is_err());
+        assert!(read_topics_with_limit(Cursor::new([0xff]), 8).is_err());
+        assert_eq!(
+            parse_sgml_topics(
+                "<TOP>\n<NUM> number: 7 </NUM>\n<TITLE> Mixed Case </TITLE>\n</TOP>\n"
+            )
+            .unwrap(),
+            vec![Topic {
+                id: "7".into(),
+                text: "Mixed Case".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn qrels_reject_malformed_rows_and_keep_zero_negative_judgments() {
+        for input in [
+            "1 0 D\n",
+            "1 0 D not-a-number\n",
+            "1 0 D 2147483648\n",
+            "1 0 D 32\n",
+            "1 0 D 1\n1 0 D 2\n",
+        ] {
+            assert!(parse_qrels(Cursor::new(input)).is_err(), "{input:?}");
+        }
+        assert!(parse_qrels_with_limits(Cursor::new("1 0 D 1\n"), 0, 20).is_err());
+        assert!(parse_qrels_with_limits(Cursor::new("1 0 D 1\n"), 20, 0).is_err());
+        assert!(parse_qrels(Cursor::new("# only comments\n\n")).is_err());
+
+        let qrels = parse_qrels(Cursor::new("# comment\n1 0 A 0\n1 0 B -1\n2 0 C 31\n")).unwrap();
+        assert_eq!(qrels.relevant_count("1"), 0);
+        assert_eq!(qrels.relevant_count("2"), 1);
+        assert_eq!(qrels.relevant_count("missing"), 0);
+        assert_eq!(qrels.relevance("1", "missing"), None);
+        assert_eq!(qrels.judgments_for("1").unwrap().len(), 2);
+        assert!(qrels.judgments_for("missing").is_none());
+    }
+
+    #[test]
+    fn malformed_qrels_report_the_physical_line_number() {
+        for row in ["1 0 D", "1 0 D invalid", "1 0 D 32"] {
+            let first = parse_qrels(Cursor::new(format!("{row}\n"))).unwrap_err();
+            assert!(first.to_string().contains("line 1"), "{first}");
+            let second = parse_qrels(Cursor::new(format!("# comment\n{row}\n"))).unwrap_err();
+            assert!(second.to_string().contains("line 2"), "{second}");
+        }
+    }
+
+    #[test]
+    fn trec_record_boundaries_and_content_are_strict() {
+        for input in [
+            "",
+            "</DOC>\n",
+            "<DOC>\n<DOC>\n",
+            "<DOC>\n<TEXT>body</TEXT>\n</DOC>\n",
+            "<DOC>\n<DOCNO>A</DOCNO>\n<DOCNO>B</DOCNO>\n<TEXT>body</TEXT>\n</DOC>\n",
+            "<DOC>\n<DOCNO>A</DOCNO>\n</DOC>\n",
+            "<DOC>\n<DOCNO>A B</DOCNO>\n<TEXT>body</TEXT>\n</DOC>\n",
+        ] {
+            assert!(
+                index_trec_reader(Cursor::new(input), Analyzer::default()).is_err(),
+                "{input:?}"
+            );
+        }
+        assert!(visit_trec_reader_with_limit(Cursor::new("<DOC>\n"), 0, |_| Ok(())).is_err());
+        let error = visit_trec_reader(
+            Cursor::new("<DOC>\n<DOCNO>A</DOCNO>\n<TEXT>x</TEXT>\n</DOC>\n"),
+            |_| {
+                Err(Error::InvalidDocument(
+                    "downstream rejected document".into(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("downstream rejected document"));
+    }
+
+    #[test]
+    fn trec_sections_are_concatenated_in_documented_field_order() {
+        let input = "<doc>\r\n<DOCNO> D1 </DOCNO>\r\n<TITLE> First <B>heading</B> </TITLE>\r\n<HEADLINE> Second &quot;heading&quot; </HEADLINE>\r\n<BODY> beta &apos;quoted&apos; </BODY>\r\n<TEXT> alpha &gt; gamma </TEXT>\r\n</doc>\r\n";
+        let index = index_trec_reader(Cursor::new(input), Analyzer::default()).unwrap();
+        let document = &index.documents()[0];
+        assert_eq!(document.external_id(), "D1");
+        assert_eq!(
+            document.field("title"),
+            Some("First heading Second \"heading\"")
+        );
+        assert_eq!(document.field("body"), Some("alpha > gamma beta 'quoted'"));
     }
 }

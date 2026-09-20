@@ -780,13 +780,210 @@ mod tests {
 
     #[test]
     fn collection_limits_must_be_positive() {
-        assert!(
+        for limits in [
             CollectionLimits {
                 max_documents: 0,
                 ..CollectionLimits::default()
-            }
-            .validate()
-            .is_err()
+            },
+            CollectionLimits {
+                max_fields_per_document: 0,
+                ..CollectionLimits::default()
+            },
+            CollectionLimits {
+                max_record_bytes: 0,
+                ..CollectionLimits::default()
+            },
+            CollectionLimits {
+                max_input_bytes: 0,
+                ..CollectionLimits::default()
+            },
+        ] {
+            assert!(limits.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn tsv_rejects_bad_headers_and_reports_malformed_rows() {
+        let limits = CollectionLimits::default();
+        for input in [
+            "",
+            "name\tbody\nA\tx\n",
+            "id\nA\n",
+            "id\tbody\tbody\nA\tx\ty\n",
+            "id\tbad name\nA\tx\n",
+        ] {
+            assert!(
+                visit_tsv_reader(Cursor::new(input), limits, &mut |_| Ok(())).is_err(),
+                "{input:?}"
+            );
+        }
+        let error = visit_tsv_reader(
+            Cursor::new("id\tbody\ntoo\tmany\tvalues\n"),
+            limits,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("line 2 has 3 columns"));
+        let mut ids = Vec::new();
+        visit_tsv_reader(
+            Cursor::new("id\tbody\r\n\r\nA\tx\r\n"),
+            limits,
+            &mut |document| {
+                ids.push(document.external_id().to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(ids, ["A"]);
+    }
+
+    #[test]
+    fn jsonl_requires_one_complete_protocol_and_obeys_field_limit() {
+        for input in [
+            "{\"id\":\"A\"}\n",
+            "{\"id\":\"A\",\"fields\":{}}\n",
+            "{\"fields\":{\"body\":\"x\"}}\n",
+            "{\"title\":\"A\"}\n",
+            "{\"title\":\"A\",\"content\":\"x\",\"id\":\"B\"}\n",
+            "{\"id\":\"A\",\"fields\":{\"body\":\"x\"},\"url\":\"x\"}\n",
+        ] {
+            assert!(collect_jsonl(input).is_err(), "{input}");
+        }
+        let mut documents = Vec::new();
+        visit_jsonl_reader(
+            Cursor::new("\n{\"title\":\"A\",\"content\":\"x\",\"url\":\"\"}\n"),
+            CollectionLimits::default(),
+            &mut |document| {
+                documents.push(document);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].field("url"), None);
+        let error = visit_jsonl_reader(
+            Cursor::new("{\"id\":\"A\",\"fields\":{\"body\":\"x\",\"title\":\"y\"}}\n"),
+            CollectionLimits {
+                max_fields_per_document: 1,
+                ..CollectionLimits::default()
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("limit is 1"));
+    }
+
+    #[test]
+    fn raw_line_limit_counts_terminator_and_rejects_invalid_utf8() {
+        let mut exact = Cursor::new(b"abc\r\nnext".to_vec());
+        assert_eq!(
+            read_bounded_raw_line(&mut exact, 5, 5, 1, "fixture")
+                .unwrap()
+                .as_deref(),
+            Some("abc\r\n")
         );
+        assert_eq!(
+            read_bounded_raw_line(&mut exact, 4, 4, 2, "fixture")
+                .unwrap()
+                .as_deref(),
+            Some("next")
+        );
+        assert!(
+            read_bounded_raw_line(&mut Cursor::new(b"abc\r\n"), 4, 4, 1, "fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds 4 bytes")
+        );
+        assert!(
+            read_bounded_raw_line(&mut Cursor::new([0xff, b'\n']), 2, 2, 1, "fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("not valid UTF-8")
+        );
+        assert_eq!(
+            read_bounded_raw_line(&mut Cursor::new([]), 2, 2, 1, "fixture").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn collection_rejects_empty_and_oversize_inputs_before_visiting() {
+        let empty = temp_path("empty.tsv");
+        std::fs::write(&empty, "id\tbody\n").unwrap();
+        assert!(
+            load_collection(&empty, CollectionFormat::Tsv, CollectionLimits::default())
+                .unwrap_err()
+                .to_string()
+                .contains("no documents")
+        );
+        let mut called = false;
+        let error = visit_collection(
+            &empty,
+            CollectionFormat::Tsv,
+            CollectionLimits {
+                max_input_bytes: 1,
+                ..CollectionLimits::default()
+            },
+            |_| {
+                called = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("limit is 1"));
+        assert!(!called);
+        std::fs::remove_file(empty).unwrap();
+    }
+
+    #[test]
+    fn format_and_field_limits_reject_untrusted_inputs_before_indexing() {
+        assert_eq!(
+            CollectionFormat::parse("tsv").unwrap(),
+            CollectionFormat::Tsv
+        );
+        assert_eq!(
+            CollectionFormat::parse("trec").unwrap(),
+            CollectionFormat::Trec
+        );
+        assert_eq!(
+            CollectionFormat::parse("jsonl").unwrap(),
+            CollectionFormat::Jsonl
+        );
+        assert!(
+            CollectionFormat::parse("csv")
+                .unwrap_err()
+                .to_string()
+                .contains("unknown collection format")
+        );
+
+        let header = temp_path("many-fields.tsv");
+        std::fs::write(&header, "id\ttitle\tbody\nD\tblue\tsea\n").unwrap();
+        let limit = CollectionLimits {
+            max_fields_per_document: 1,
+            ..CollectionLimits::default()
+        };
+        assert!(
+            index_collection(&header, Analyzer::default(), CollectionFormat::Tsv, limit)
+                .unwrap_err()
+                .to_string()
+                .contains("TSV header has 2 fields")
+        );
+        std::fs::remove_file(header).unwrap();
+
+        // PISA-compatible JSONL makes a body and an optional URL field; the
+        // generic document limit must apply after that transformation too.
+        let pisa = temp_path("pisa-fields.jsonl");
+        std::fs::write(
+            &pisa,
+            "{\"title\":\"D\",\"content\":\"blue\",\"url\":\"https://example.test\"}\n",
+        )
+        .unwrap();
+        assert!(
+            index_collection(&pisa, Analyzer::default(), CollectionFormat::Jsonl, limit)
+                .unwrap_err()
+                .to_string()
+                .contains("has 2 fields; limit is 1")
+        );
+        std::fs::remove_file(pisa).unwrap();
     }
 }

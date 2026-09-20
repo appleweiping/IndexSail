@@ -4,6 +4,18 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+- Added deterministic recursive graph-bisection document reordering over a
+  field-qualified document-term graph, with bounded scratch reuse, exact
+  bidirectional maps, query-equivalence oracles, and a release-mode CI smoke.
+- Strengthened checksummed index loading to reject posting terms and positions
+  that disagree with stored analyzed text; corrected TREC qrels physical-line
+  diagnostics and expanded adversarial tests across persistence, CIFF, forward
+  indexes, atomic outputs, sharding, search, and the CLI.
+- Added a fail-closed source-branch JSON verifier and parser-contract CI tests.
+  The verifier currently reports 83.79% on this development slice, below its
+  90% threshold; the CI workflow does not yet enforce the actual coverage
+  threshold, and this entry does not claim that gate has passed.
+
 ## [0.8.0] - 2026-09-19
 
 - Added a scoped, native document-ID reordering workflow for checksummed

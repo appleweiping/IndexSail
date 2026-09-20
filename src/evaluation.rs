@@ -622,6 +622,7 @@ fn write_json_string(writer: &mut impl Write, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::trec::parse_qrels;
@@ -825,5 +826,231 @@ mod tests {
             metrics_for("absent", &hits, &qrels, 3),
             QueryMetrics::default()
         );
+    }
+
+    #[test]
+    fn batch_rejects_invalid_topics_and_configuration_before_search() {
+        let (index, topics, _) = fixture();
+        for invalid in [
+            vec![],
+            vec![Topic {
+                id: " ".into(),
+                text: "rust".into(),
+            }],
+            vec![Topic {
+                id: "bad id".into(),
+                text: "rust".into(),
+            }],
+            vec![Topic {
+                id: "ok".into(),
+                text: "  ".into(),
+            }],
+            vec![topics[0].clone(), topics[0].clone()],
+        ] {
+            assert!(evaluate_batch(&index, &invalid, None, BatchConfig::default()).is_err());
+        }
+        assert!(
+            evaluate_batch(
+                &index,
+                &topics,
+                None,
+                BatchConfig {
+                    top_k: 0,
+                    ..BatchConfig::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            evaluate_batch(
+                &index,
+                &topics,
+                None,
+                BatchConfig {
+                    bm25: Bm25Params {
+                        k1: f64::NAN,
+                        b: 0.75
+                    },
+                    ..BatchConfig::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    struct ScriptedBackend {
+        calls: Mutex<Vec<PruningStrategy>>,
+        selected: Vec<SearchHit>,
+        oracle: Vec<SearchHit>,
+    }
+
+    impl RetrievalBackend for ScriptedBackend {
+        fn analyzer(&self) -> Analyzer {
+            Analyzer::default()
+        }
+
+        fn search(&self, _: &SearchQuery, options: SearchOptions) -> Result<SearchOutcome> {
+            self.calls.lock().unwrap().push(options.pruning);
+            Ok(SearchOutcome {
+                hits: if options.pruning == PruningStrategy::Wand {
+                    self.oracle.clone()
+                } else {
+                    self.selected.clone()
+                },
+                stats: SearchStats::default(),
+            })
+        }
+    }
+
+    #[test]
+    fn exact_verification_detects_different_lengths_ranks_and_scores() {
+        let hit = SearchHit {
+            doc_id: 0,
+            external_id: "D".into(),
+            score: 1.0,
+            explanation: None,
+        };
+        let topic = [Topic {
+            id: "q".into(),
+            text: "rust".into(),
+        }];
+        for (selected, oracle, expected) in [
+            (vec![], vec![hit.clone()], "versus 1 hits"),
+            (
+                vec![SearchHit {
+                    doc_id: 1,
+                    ..hit.clone()
+                }],
+                vec![hit.clone()],
+                "rank 1",
+            ),
+            (
+                vec![SearchHit {
+                    score: f64::from_bits(1.0_f64.to_bits() + 1),
+                    ..hit.clone()
+                }],
+                vec![hit.clone()],
+                "rank 1",
+            ),
+        ] {
+            let backend = ScriptedBackend {
+                calls: Mutex::new(Vec::new()),
+                selected,
+                oracle,
+            };
+            let error = evaluate_batch(
+                &backend,
+                &topic,
+                None,
+                BatchConfig {
+                    pruning: PruningStrategy::Exhaustive,
+                    verify_exact: true,
+                    ..BatchConfig::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                *backend.calls.lock().unwrap(),
+                [PruningStrategy::Exhaustive, PruningStrategy::Wand]
+            );
+        }
+    }
+
+    #[test]
+    fn run_writer_validates_all_tokens_duplicates_cutoff_and_finite_scores() {
+        let (index, topics, _) = fixture();
+        let report = evaluate_batch(&index, &topics[..1], None, BatchConfig::default()).unwrap();
+        for tag in ["", "two words", "line\nbreak", &"x".repeat(65)] {
+            assert!(write_trec_run(&report, tag, Vec::new()).is_err());
+        }
+        let mut invalid = report.clone();
+        invalid.queries.push(report.queries[0].clone());
+        assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
+        let mut invalid = report.clone();
+        invalid.queries[0].topic_id = "bad\tid".into();
+        assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
+        let mut invalid = report.clone();
+        invalid.config.top_k = 0;
+        assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
+        let mut invalid = report.clone();
+        let duplicate_hit = invalid.queries[0].hits[0].clone();
+        invalid.queries[0].hits.push(duplicate_hit);
+        assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
+        let mut invalid = report;
+        invalid.queries[0].hits[0].score = f64::INFINITY;
+        assert!(write_trec_run(&invalid, "ok", Vec::new()).is_err());
+    }
+
+    #[test]
+    fn batch_statistics_reject_overflow_in_each_counter() {
+        for field in 0..6 {
+            let mut total = SearchStats::default();
+            let mut current = SearchStats::default();
+            match field {
+                0 => {
+                    total.evaluated_candidates = usize::MAX;
+                    current.evaluated_candidates = 1;
+                }
+                1 => {
+                    total.postings_advanced = usize::MAX;
+                    current.postings_advanced = 1;
+                }
+                2 => {
+                    total.postings_skipped = usize::MAX;
+                    current.postings_skipped = 1;
+                }
+                3 => {
+                    total.block_max_bounds_loaded = usize::MAX;
+                    current.block_max_bounds_loaded = 1;
+                }
+                4 => {
+                    total.block_max_postings_covered = usize::MAX;
+                    current.block_max_postings_covered = 1;
+                }
+                5 => {
+                    total.block_max_postings_scanned = usize::MAX;
+                    current.block_max_postings_scanned = 1;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                add_stats(&mut total, current)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("overflow")
+            );
+        }
+    }
+
+    #[test]
+    fn json_report_escapes_all_controls_and_rejects_nonfinite_metrics() {
+        let (index, topics, qrels) = fixture();
+        let mut report =
+            evaluate_batch(&index, &topics[..1], Some(&qrels), BatchConfig::default()).unwrap();
+        report.queries[0].topic_id = "q\"\\\n\r\t\u{0001}".into();
+        report.queries[0].query_text = "search\u{0002}".into();
+        report.config.field = Some("bo\u{0003}dy".into());
+        report.queries[0].hits[0].external_id = "doc\u{0004}".into();
+        let mut bytes = Vec::new();
+        write_json_report(&report, &mut bytes).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded["field"], "bo\u{0003}dy");
+        assert_eq!(decoded["queries"][0]["topic_id"], "q\"\\\n\r\t\u{0001}");
+        assert_eq!(decoded["queries"][0]["query"], "search\u{0002}");
+        assert_eq!(
+            decoded["queries"][0]["hits"][0]["document_id"],
+            "doc\u{0004}"
+        );
+
+        let mut invalid = report.clone();
+        invalid.queries[0].metrics.as_mut().unwrap().ndcg = f64::NAN;
+        assert!(write_json_report(&invalid, Vec::new()).is_err());
+        let mut invalid = report.clone();
+        invalid.aggregate.as_mut().unwrap().mean_recall = f64::INFINITY;
+        assert!(write_json_report(&invalid, Vec::new()).is_err());
+        let mut invalid = report;
+        invalid.config.bm25.b = f64::NEG_INFINITY;
+        assert!(write_json_report(&invalid, Vec::new()).is_err());
     }
 }

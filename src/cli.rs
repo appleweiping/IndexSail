@@ -19,7 +19,7 @@ use crate::forward::ForwardIndex;
 use crate::index::{InternalDocId, InvertedIndex};
 use crate::persistence::{block_max_metadata_encoded_bytes, persisted_format_version};
 use crate::query::{BooleanOperator, FieldFilter, PhraseFilter, SearchQuery};
-use crate::reorder::{DocIdMap, MAX_REORDER_FORWARD_BYTES};
+use crate::reorder::{BisectionOptions, DocIdMap, MAX_REORDER_FORWARD_BYTES};
 use crate::search::{Bm25Params, PruningStrategy, SearchOptions, SearchOutcome};
 use crate::shard::{ShardedIndex, persisted_sharded_format_version};
 use crate::trec::{load_qrels, load_topics};
@@ -34,7 +34,7 @@ USAGE:\n\
   indexsail forward-build --input COLLECTION --output INDEX.fwd [--format tsv|trec|jsonl] [--ascii]\n\
   indexsail forward-invert --input INDEX.fwd --output INDEX.idx\n\
   indexsail reorder --input INDEX.fwd --forward-output NEW.fwd --index-output NEW.idx\n\
-    --old-to-new OLD.map --new-to-old NEW.map (--random [--seed N] | --by-feature FILE | --from-mapping FILE)\n\
+    --old-to-new OLD.map --new-to-old NEW.map (--random [--seed N] | --by-feature FILE | --from-mapping FILE | --bp [--depth N] [--iterations N])\n\
   indexsail forward-inspect --index INDEX.fwd [--document N] [--limit N]\n\
   indexsail lexicon --index INDEX.fwd [--id N | --field NAME --term TERM | --offset N --limit N]\n\
   indexsail search --index INDEX.idx --query TEXT [OPTIONS]\n\
@@ -74,6 +74,8 @@ REORDER OPTIONS:\n\
   --random [--seed N]      Portable seeded shuffle (default seed: 0)\n\
   --by-feature FILE        One UTF-8 feature line per original document ID\n\
   --from-mapping FILE      Two columns: original ID, new ID\n\
+  --bp [--depth N] [--iterations N]\n\
+                            Deterministic recursive graph bisection\n\
   --old-to-new FILE        Write original-to-new two-column map\n\
   --new-to-old FILE        Write new-to-original two-column map\n\
 \n\
@@ -517,10 +519,11 @@ fn command_forward_invert(arguments: &[String], output: &mut impl Write) -> Resu
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn command_reorder(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let parsed = ParsedOptions::parse(
         arguments,
-        &["--random"],
+        &["--random", "--bp"],
         &[
             "--input",
             "--forward-output",
@@ -530,6 +533,8 @@ fn command_reorder(arguments: &[String], output: &mut impl Write) -> Result<()> 
             "--seed",
             "--by-feature",
             "--from-mapping",
+            "--depth",
+            "--iterations",
         ],
     )?;
     let source = Path::new(parsed.required_one("--input")?);
@@ -540,17 +545,25 @@ fn command_reorder(arguments: &[String], output: &mut impl Write) -> Result<()> 
     let feature_source = parsed.optional_one("--by-feature")?.map(Path::new);
     let mapping_source = parsed.optional_one("--from-mapping")?.map(Path::new);
     let seed = parsed.optional_one("--seed")?;
+    let depth = parsed.optional_one("--depth")?;
+    let iterations = parsed.optional_one("--iterations")?;
     let methods = usize::from(parsed.flag("--random"))
         + usize::from(feature_source.is_some())
-        + usize::from(mapping_source.is_some());
+        + usize::from(mapping_source.is_some())
+        + usize::from(parsed.flag("--bp"));
     if methods != 1 {
         return Err(Error::InvalidArgument(
-            "choose exactly one of --random, --by-feature, or --from-mapping".into(),
+            "choose exactly one of --random, --by-feature, --from-mapping, or --bp".into(),
         ));
     }
     if seed.is_some() && !parsed.flag("--random") {
         return Err(Error::InvalidArgument(
             "--seed is only valid with --random".into(),
+        ));
+    }
+    if (depth.is_some() || iterations.is_some()) && !parsed.flag("--bp") {
+        return Err(Error::InvalidArgument(
+            "--depth and --iterations are only valid with --bp".into(),
         ));
     }
 
@@ -584,6 +597,17 @@ fn command_reorder(arguments: &[String], output: &mut impl Write) -> Result<()> 
         (
             "by-feature".to_owned(),
             DocIdMap::by_feature(count, std::fs::File::open(path)?)?,
+        )
+    } else if parsed.flag("--bp") {
+        let mut options = BisectionOptions::for_documents(count);
+        options.depth = parse_optional(depth, options.depth, "depth")?;
+        options.iterations = parse_optional(iterations, options.iterations, "iterations")?;
+        (
+            format!(
+                "bp depth={} iterations={}",
+                options.depth, options.iterations
+            ),
+            DocIdMap::recursive_graph_bisection(&forward, options)?,
         )
     } else {
         let path = mapping_source.expect("exactly one method was selected");
@@ -1769,6 +1793,31 @@ mod tests {
                 std::fs::read(&new_map).unwrap(),
             ]
         );
+        let mut bp = command.to_vec();
+        bp.extend(["--bp", "--depth", "2", "--iterations", "3"]);
+        let mut output = Vec::new();
+        execute(bp.clone(), &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("method=bp depth=2 iterations=3")
+        );
+        let first_bp = [
+            std::fs::read(&new_forward).unwrap(),
+            std::fs::read(&new_index).unwrap(),
+            std::fs::read(&old_map).unwrap(),
+            std::fs::read(&new_map).unwrap(),
+        ];
+        execute(bp, Vec::new()).unwrap();
+        assert_eq!(
+            first_bp,
+            [
+                std::fs::read(&new_forward).unwrap(),
+                std::fs::read(&new_index).unwrap(),
+                std::fs::read(&old_map).unwrap(),
+                std::fs::read(&new_map).unwrap(),
+            ]
+        );
         for path in [source, new_forward, new_index, old_map, new_map, custom] {
             std::fs::remove_file(path).unwrap();
         }
@@ -1836,6 +1885,12 @@ mod tests {
         let mut bad_seed = prefix.to_vec();
         bad_seed.extend(["--random", "--seed", "-1"]);
         assert!(execute(bad_seed, Vec::new()).is_err());
+        let mut bad_depth = prefix.to_vec();
+        bad_depth.extend(["--bp", "--depth", "0"]);
+        assert!(execute(bad_depth, Vec::new()).is_err());
+        let mut misplaced_depth = prefix.to_vec();
+        misplaced_depth.extend(["--random", "--depth", "2"]);
+        assert!(execute(misplaced_depth, Vec::new()).is_err());
         for path in [
             collection,
             source,
@@ -2759,5 +2814,148 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn lexicon_rejects_ambiguous_selectors_and_invalid_page_bounds() {
+        let forward_path = temp_path("lexicon-invalid.fwd");
+        ForwardIndex::from_documents(
+            Analyzer::default(),
+            [Document::from_fields("D", [("body", "blue sea")]).unwrap()],
+        )
+        .unwrap()
+        .save(&forward_path)
+        .unwrap();
+        let path = forward_path.to_str().unwrap();
+        let cases: &[(&[&str], &str)] = &[
+            (&["--id", "0", "--limit", "1"], "cannot be combined"),
+            (&["--id", "not-a-number"], "not an unsigned integer"),
+            (&["--id", "9999"], "does not exist"),
+            (&["--field", "body"], "must be supplied together"),
+            (&["--term", "blue"], "must be supplied together"),
+            (
+                &["--field", "body", "--term", "blue sea"],
+                "exactly one token",
+            ),
+            (&["--field", "body", "--term", "absent"], "does not exist"),
+            (
+                &["--field", "body", "--term", "blue", "--offset", "0"],
+                "cannot be combined",
+            ),
+            (&["--limit", "0"], "between 1 and 1000"),
+            (&["--limit", "1001"], "between 1 and 1000"),
+            (&["--offset", "negative"], "wrong type"),
+        ];
+        for (options, expected) in cases {
+            let mut arguments = vec!["lexicon", "--index", path];
+            arguments.extend_from_slice(options);
+            let mut output = Vec::new();
+            let error = execute(arguments, &mut output).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(output, Vec::<u8>::new());
+        }
+        std::fs::remove_file(forward_path).unwrap();
+    }
+
+    #[test]
+    fn forward_inspect_rejects_unbound_limit_and_invalid_document_selector() {
+        let forward_path = temp_path("inspect-invalid.fwd");
+        ForwardIndex::from_documents(
+            Analyzer::default(),
+            [Document::from_fields("D", [("body", "blue sea")]).unwrap()],
+        )
+        .unwrap()
+        .save(&forward_path)
+        .unwrap();
+        let path = forward_path.to_str().unwrap();
+        for (options, expected) in [
+            (vec!["--limit", "1"], "requires --document"),
+            (vec!["--document", "-1"], "not an unsigned integer"),
+            (vec!["--document", "1"], "does not exist"),
+            (
+                vec!["--document", "0", "--limit", "0"],
+                "between 1 and 1000",
+            ),
+            (
+                vec!["--document", "0", "--limit", "1001"],
+                "between 1 and 1000",
+            ),
+            (vec!["--document", "0", "--limit", "invalid"], "wrong type"),
+        ] {
+            let mut arguments = vec!["forward-inspect", "--index", path];
+            arguments.extend(options);
+            let error = execute(arguments, Vec::new()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        std::fs::remove_file(forward_path).unwrap();
+    }
+
+    #[test]
+    fn search_cli_combines_phrase_field_and_exact_filter_without_leaking_other_hits() {
+        let index_path = temp_path("search-constraints.idx");
+        let mut builder = crate::index::IndexBuilder::new(Analyzer::default());
+        for (id, title, body, category) in [
+            ("D1", "Blue\tSea", "blue sea", "guide"),
+            ("D2", "Blue River", "blue river sea", "guide"),
+            ("D3", "Sea Blue", "sea blue", "reference"),
+        ] {
+            builder
+                .add_document(
+                    Document::from_fields(
+                        id,
+                        [("title", title), ("body", body), ("category", category)],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        builder.finish().save(&index_path).unwrap();
+        let path = index_path.to_str().unwrap();
+        let mut output = Vec::new();
+        execute(
+            [
+                "search",
+                "--index",
+                path,
+                "--query",
+                "blue sea",
+                "--operator",
+                "and",
+                "--field",
+                "body",
+                "--phrase",
+                "blue sea",
+                "--phrase-field",
+                "body",
+                "--filter",
+                "category=guide",
+                "--strategy",
+                "max-score",
+                "--top-k",
+                "3",
+            ],
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("D1\tBlue Sea"));
+        assert!(!output.contains("D2\t"));
+        assert!(!output.contains("D3\t"));
+
+        for (options, expected) in [
+            (vec!["--phrase-field", "body"], "requires --phrase"),
+            (vec!["--filter", "category"], "NAME=VALUE"),
+            (vec!["--operator", "xor"], "unknown operator"),
+            (vec!["--strategy", "unknown"], "unknown strategy"),
+            (vec!["--top-k", "0"], "greater than zero"),
+            (vec!["--k1", "0"], "BM25 k1"),
+            (vec!["--b", "2"], "BM25 b"),
+        ] {
+            let mut arguments = vec!["search", "--index", path, "--query", "blue"];
+            arguments.extend(options);
+            let error = execute(arguments, Vec::new()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        std::fs::remove_file(index_path).unwrap();
     }
 }

@@ -575,5 +575,42 @@ mod tests {
             })
             .is_err()
         );
+        if let Ok(documents) = usize::try_from(u64::from(u32::MAX) + 1) {
+            assert!(
+                run(BenchmarkConfig {
+                    documents,
+                    queries: 1,
+                    top_k: 1,
+                    shards: 1,
+                    ..BenchmarkConfig::default()
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("document count exceeds index limit")
+            );
+        }
+    }
+
+    #[test]
+    fn smallest_benchmark_workload_is_exact_and_serializes_valid_json() {
+        let config = BenchmarkConfig {
+            documents: 1,
+            queries: 1,
+            top_k: 3,
+            shards: 1,
+            seed: 0,
+        };
+        let report = run(config).unwrap();
+        assert_eq!(report.config, config);
+        assert_eq!(report.index_tokens, 79);
+        assert!(report.index_postings > 0);
+        let mut output = Vec::new();
+        write_json(&report, &mut output).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["documents"], 1);
+        assert_eq!(json["queries"], 1);
+        assert_eq!(json["shards"], 1);
+        assert_eq!(json["persistence"]["format_version"], 3);
+        assert!(json["verified_exact"].as_bool().unwrap());
     }
 }
