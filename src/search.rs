@@ -3077,6 +3077,220 @@ mod tests {
     }
 
     #[test]
+    fn block_max_maxscore_strict_bound_preserves_equality() {
+        // A real multi-term OR search must reach the rejection path; otherwise
+        // the unit-level threshold check below could hide a dead optimization.
+        let skewed = block_index(1_500);
+        let query = SearchQuery::from_text(skewed.analyzer(), "common mid rare", None).unwrap();
+        let actual = search_with(&skewed, &query, PruningStrategy::BlockMaxMaxScore, 1);
+        let expected = search_with(&skewed, &query, PruningStrategy::Exhaustive, 1);
+        assert_same_ranking(&expected, &actual, "multi-term rejection path");
+        assert!(actual.stats.block_bound_rejections > 0);
+
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        builder
+            .add_document(Document::from_fields("first", [("body", "alpha beta")]).unwrap())
+            .unwrap();
+        let index = builder.finish();
+        let terms = ["alpha", "beta"];
+        let mut cursors = terms
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, text)| Cursor {
+                scorer: index
+                    .build_term_scorer(
+                        ordinal,
+                        &PreparedTerm {
+                            normalized: text.to_owned(),
+                            field: Some("body".to_owned()),
+                            boost: 1.0,
+                        },
+                        ScoringModel::Bm25,
+                        Bm25Params::default(),
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                position: 0,
+            })
+            .collect::<Vec<_>>();
+        cursors.sort_by(|left, right| {
+            left.scorer
+                .upper_bound
+                .total_cmp(&right.scorer.upper_bound)
+                .then_with(|| left.scorer.ordinal.cmp(&right.scorer.ordinal))
+        });
+        let candidate_doc = cursors[1].current_doc();
+        assert_eq!(candidate_doc, 0);
+        let possible = conservative_next_up(
+            conservative_next_up(cursors[0].block_max()) + cursors[1].current_score(),
+        );
+        let candidate_score = cursors[0].current_score() + cursors[1].current_score();
+        assert!(possible >= candidate_score);
+        let mut heap = TopK::new(1);
+        heap.consider(HeapEntry {
+            doc_id: 100,
+            score: candidate_score,
+        });
+        // This artificial larger worst ID isolates the strict-equality
+        // invariant. In one shard, normal candidates arrive in increasing ID
+        // order, so a later candidate with a smaller ID is not reachable.
+        assert!(candidate_doc < heap.heap.peek().unwrap().doc_id);
+        let mut stats = SearchStats::default();
+        assert!(!reject_with_block_bound(
+            &mut cursors,
+            1,
+            candidate_doc,
+            heap.threshold().unwrap(),
+            &mut stats,
+        ));
+        assert_eq!(stats.block_bound_rejections, 0);
+        assert!(cursors.iter().all(|cursor| cursor.position == 0));
+        // Also pin the strict comparison exactly at the rounded-up bound,
+        // independently of the concrete candidate's exact score.
+        assert!(!reject_with_block_bound(
+            &mut cursors,
+            1,
+            candidate_doc,
+            possible,
+            &mut stats,
+        ));
+        assert_eq!(stats.block_bound_rejections, 0);
+        assert!(reject_with_block_bound(
+            &mut cursors,
+            1,
+            candidate_doc,
+            conservative_next_up(possible),
+            &mut stats,
+        ));
+        assert_eq!(stats.block_bound_rejections, 1);
+        assert_eq!(stats.postings_advanced, 2);
+    }
+
+    fn assert_cross_block_peak(
+        index: &InvertedIndex,
+        ordinal: usize,
+        term: &str,
+        scoring: ScoringModel,
+    ) {
+        let scorer = index
+            .build_term_scorer(
+                ordinal,
+                &PreparedTerm {
+                    normalized: term.to_owned(),
+                    field: Some("body".to_owned()),
+                    boost: 1.0,
+                },
+                scoring,
+                Bm25Params::default(),
+                true,
+                None,
+            )
+            .unwrap();
+        assert_eq!(scorer.block_max.len(), 3);
+        assert_eq!(scorer.entries[63].doc_id, 63);
+        assert_eq!(scorer.entries[64].doc_id, 64);
+        if term == "alpha" {
+            assert!(scorer.block_max[0] > scorer.block_max[1]);
+        } else {
+            assert!(scorer.block_max[1] > scorer.block_max[0]);
+        }
+    }
+
+    #[test]
+    fn block_max_maxscore_crosses_posting_63_64_with_independent_oracle() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for id in 0..130 {
+            let body = match id {
+                63 => "alpha alpha alpha beta",
+                64 => "alpha beta beta beta",
+                _ => "alpha beta",
+            };
+            builder
+                .add_document(Document::from_fields(format!("d{id}"), [("body", body)]).unwrap())
+                .unwrap();
+        }
+        let index = builder.finish();
+        let query = SearchQuery::from_text(index.analyzer(), "alpha beta", Some("body")).unwrap();
+        // Both posting lists contain every document. Entry 63 is the final
+        // member of block 0; entry 64 begins block 1.
+        let idf = (1.0 + 0.5 / 130.5_f64).ln();
+        let average_length = 264.0 / 130.0;
+        let impact = |frequency: f64| {
+            idf * frequency * 2.2 / (frequency + 1.2 * (0.25 + 0.75 * 4.0 / average_length))
+        };
+        for scoring in [
+            ScoringModel::Bm25,
+            ScoringModel::QuantizedBm25 {
+                bits: 16,
+                max_impact: 0.1,
+            },
+        ] {
+            for (ordinal, term) in ["alpha", "beta"].into_iter().enumerate() {
+                assert_cross_block_peak(&index, ordinal, term, scoring);
+            }
+            let options = SearchOptions {
+                top_k: 130,
+                pruning: PruningStrategy::BlockMaxMaxScore,
+                scoring,
+                ..SearchOptions::default()
+            };
+            let actual = index.search(&query, options).unwrap();
+            let exhaustive = index
+                .search(
+                    &query,
+                    SearchOptions {
+                        pruning: PruningStrategy::Exhaustive,
+                        ..options
+                    },
+                )
+                .unwrap();
+            assert_same_ranking(&exhaustive, &actual, "posting block 63/64");
+            assert_eq!(actual.hits.len(), 130);
+            let expected_score = if scoring == ScoringModel::Bm25 {
+                impact(3.0) + impact(1.0)
+            } else {
+                ((impact(3.0) / 0.1) * 65_534.0).floor()
+                    + 1.0
+                    + ((impact(1.0) / 0.1) * 65_534.0).floor()
+                    + 1.0
+            };
+            for doc_id in [63, 64] {
+                let hit = actual.hits.iter().find(|hit| hit.doc_id == doc_id).unwrap();
+                assert!((hit.score - expected_score).abs() < 1e-12);
+            }
+            let boundary_score = |doc_id| {
+                actual
+                    .hits
+                    .iter()
+                    .find(|hit| hit.doc_id == doc_id)
+                    .unwrap()
+                    .score
+                    .to_bits()
+            };
+            assert_eq!(boundary_score(63), boundary_score(64));
+            let top_one = index
+                .search(
+                    &query,
+                    SearchOptions {
+                        top_k: 1,
+                        ..options
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                top_one.hits[0].doc_id, 63,
+                "equal-score block-boundary tie for {scoring:?}"
+            );
+            if scoring == ScoringModel::Bm25 {
+                assert!(actual.stats.block_max_bounds_loaded > 0);
+            } else {
+                assert!(actual.stats.block_max_postings_scanned > 0);
+            }
+        }
+    }
+
+    #[test]
     fn block_max_maxscore_preserves_constraints_ties_and_and_fallback() {
         let index = block_index(400);
         let base = SearchQuery::from_text(index.analyzer(), "common mid rare", None).unwrap();
