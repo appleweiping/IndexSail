@@ -15,7 +15,8 @@
 | `shard` | Round-robin physical partitioning, global statistics, exact merge, v1 sharded container |
 | `ciff` | CIFF v1 model, bounded protobuf framing, d-gap validation, canonical export and portable BM25 |
 | `codec` | Posting gaps, base-128 variable bytes, codec statistics, payload checksum |
-| `persistence` | v3 writer, v3/v2/v1 readers, checksums, bounds and structural validation |
+| `persistence` | default v3 and opt-in v4 writers, v1–v4 readers, checksums, bounds and structural validation |
+| `elias_fano` | canonical monotone `u32` bit codec for v4 posting document IDs |
 | `trec` | TREC collection subset, topic, and qrels adapters |
 | `evaluation` | Generic monolithic/sharded batch execution, executor oracle, metrics, run and JSON writers |
 | `benchmark` | Seeded workload, monolithic/sharded exhaustive oracle, checksum and JSON report |
@@ -49,7 +50,7 @@ sequenceDiagram
     I->>P: deterministic logical snapshot
     P->>P: delta/varbyte posting blocks
     P->>P: persist block bounds + checksum payload
-    P-->>U: version 3 index file
+    P-->>U: default version 3 or opt-in version 4 index file
     opt physical sharding
         I->>S: documents in global insertion order
         S->>S: global_id modulo shard_count
@@ -276,6 +277,38 @@ posting blocks have smaller limits. Reads remain buffered and materialize owned 
 standard library has no cross-platform mmap facility, and adding an mmap dependency would not make this
 owned representation zero-copy.
 
+## Opt-in Elias–Fano format version 4
+
+`index --codec elias-fano` writes `IDXSAL04` plus version `4`; ordinary `index`, the library's
+`write_to`/`save`, forward inversion, and the sharded writer keep version 3. Version 4 retains the
+v3 outer payload length/checksum, documents, dictionary keys, and validated default-BM25 block-max
+table. Only each dictionary posting block changes:
+
+```text
+u32      Elias–Fano document-sequence byte length
+bytes    canonical Elias–Fano document-sequence encoding
+repeat posting count:
+  varbyte u32  positive term frequency
+  repeat term frequency: varbyte u32 positive position gap
+```
+
+The enclosing dictionary still supplies the posting count and total block byte length. The document
+sequence contains a little-endian `u32` final/maximum document ID, then low bits and a unary high bitmap,
+both packed least-significant bit first within each byte. For `n > 0` and `U = max_id + 1`, the low-bit
+width is `floor(log2(floor(U/n)))`. For value `v_i` at zero-based ordinal `i`, low bits hold the bottom
+`width` bits of `v_i`; the high bitmap sets bit `(v_i >> width) + i`. It has exactly
+`(max_id >> width) + n + 1` meaningful bits. Both bit sections are byte-aligned separately and all unused
+padding bits must be zero. The sequence size is derivable from the enclosing count and the stored maximum,
+so noncanonical lengths, truncation, trailing bytes, extra/missing high bits, duplicate or descending IDs,
+and a wrong maximum fail closed. The reader also enforces the 20-million-item and 512-MiB block limits
+before proportional allocation. The decoded postings then pass the same full document/position and
+block-bound invariant checks as v3. The checksum is accidental-corruption detection, not authentication.
+
+The version-4 index is an IndexSail-specific layout, not PISA wire format. Elias–Fano iteration occurs while
+loading, and the ordinary in-memory `Vec<Posting>` search path is unchanged; no compressed-query latency or
+memory claim is made. Dense long lists can use fewer bytes, while small/sparse lists can expand from header
+overhead. No automatic codec selection or additional PISA codec families are claimed.
+
 ## Legacy version 1 and 2 reads
 
 The reader recognizes `IDXSAL01` plus version `1`. Its document layout is the same logical data, but each
@@ -303,8 +336,8 @@ payload:
 EOF required
 ```
 
-The current writer embeds format-v3 indexes. Each embedded reader independently accepts and validates
-IndexSail v1, v2, or v3, after which the container validates equal analyzers, the canonical round-robin
+The current sharded writer embeds format-v3 indexes. Each embedded reader independently accepts and validates
+IndexSail v1, v2, v3, or v4, after which the container validates equal analyzers, the canonical round-robin
 population, collection-wide external-ID uniqueness, and the recomputed global count/statistics. The loaded
 index retains each observed embedded version so diagnostics do not mislabel mixed legacy containers. Container
 and embedded checksums detect accidental corruption but are not authentication. Both container and individual

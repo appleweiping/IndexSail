@@ -6,6 +6,15 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 _No changes yet._
 
+## [0.13.0] - 2026-09-20
+
+- Added an opt-in version-4 native index snapshot with canonical Elias–Fano
+  document-ID sequences and unchanged varbyte frequencies/positions. Version
+  3 remains the default; v1–v4 are readable. The CLI, inspector, branch-gated
+  corruption tests, and release smoke cover format and ranking parity. This
+  is one persisted codec, not compressed-query execution or the complete
+  PISA compression suite.
+
 ## [0.12.0] - 2026-09-20
 
 - Added opt-in PISA-style linear quantization for native and sharded BM25

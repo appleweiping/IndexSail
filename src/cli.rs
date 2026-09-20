@@ -17,7 +17,10 @@ use crate::error::{Error, Result};
 use crate::evaluation::{BatchConfig, evaluate_batch, write_json_report, write_trec_run};
 use crate::forward::ForwardIndex;
 use crate::index::{InternalDocId, InvertedIndex};
-use crate::persistence::{block_max_metadata_encoded_bytes, persisted_format_version};
+use crate::persistence::{
+    PostingStorageCodec, block_max_metadata_encoded_bytes, elias_fano_posting_encoded_bytes,
+    persisted_format_version,
+};
 use crate::query::{BooleanOperator, FieldFilter, PhraseFilter, SearchQuery};
 use crate::reorder::{BisectionOptions, DocIdMap, MAX_REORDER_FORWARD_BYTES};
 use crate::search::{Bm25Params, PruningStrategy, ScoringModel, SearchOptions, SearchOutcome};
@@ -29,7 +32,7 @@ IndexSail — compact local BM25 search\n\
 \n\
 USAGE:\n\
   indexsail --version\n\
-  indexsail index --input COLLECTION --output INDEX.idx [--format tsv|trec|jsonl] [--ascii]\n\
+  indexsail index --input COLLECTION --output INDEX.idx [--format tsv|trec|jsonl] [--ascii] [--codec varbyte|elias-fano]\n\
   indexsail shard-index --input COLLECTION --output SHARDS.idx --shards N [--format tsv|trec|jsonl] [--ascii]\n\
   indexsail forward-build --input COLLECTION --output INDEX.fwd [--format tsv|trec|jsonl] [--ascii]\n\
   indexsail forward-invert --input INDEX.fwd --output INDEX.idx\n\
@@ -404,7 +407,7 @@ fn command_index(arguments: &[String], output: &mut impl Write) -> Result<()> {
     let parsed = ParsedOptions::parse(
         arguments,
         &["--ascii"],
-        &["--input", "--output", "--format"],
+        &["--input", "--output", "--format", "--codec"],
     )?;
     let input = parsed.required_one("--input")?;
     let destination = parsed.required_one("--output")?;
@@ -418,13 +421,22 @@ fn command_index(arguments: &[String], output: &mut impl Write) -> Result<()> {
     } else {
         AnalysisMode::Unicode
     };
+    let codec = match parsed.optional_one("--codec")?.unwrap_or("varbyte") {
+        "varbyte" => PostingStorageCodec::VarByte,
+        "elias-fano" => PostingStorageCodec::EliasFano,
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "unsupported posting codec '{other}'; expected varbyte or elias-fano"
+            )));
+        }
+    };
     let index = index_collection(
         input,
         Analyzer::new(mode),
         CollectionFormat::parse(parsed.optional_one("--format")?.unwrap_or("tsv"))?,
         CollectionLimits::default(),
     )?;
-    index.save(destination)?;
+    index.save_with_codec(destination, codec)?;
     let stats = index.stats();
     writeln!(
         output,
@@ -1261,7 +1273,13 @@ fn command_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> 
     let index = InvertedIndex::load(path)?;
     let format_version = persisted_format_version(path)?;
     let stats = index.stats();
-    let codec = index.posting_codec_stats()?;
+    let mut codec = index.posting_codec_stats()?;
+    let codec_label = if format_version == crate::persistence::ELIAS_FANO_FORMAT_VERSION {
+        codec.encoded_bytes = elias_fano_posting_encoded_bytes(&index)?;
+        "elias-fano-docids+varbyte-positions"
+    } else {
+        "delta-varbyte"
+    };
     let file_bytes = std::fs::metadata(path)?.len();
     let block_max_bytes = block_max_metadata_encoded_bytes(&index)?;
     let block_max_blocks = index
@@ -1283,7 +1301,8 @@ fn command_inspect(arguments: &[String], output: &mut impl Write) -> Result<()> 
     )?;
     writeln!(
         output,
-        "posting_codec=delta-varbyte positions={} raw_bytes={} encoded_bytes={} ratio={:.4}",
+        "posting_codec={} positions={} raw_bytes={} encoded_bytes={} ratio={:.4}",
+        codec_label,
         codec.positions,
         codec.uncompressed_bytes,
         codec.encoded_bytes,
@@ -1840,6 +1859,71 @@ mod tests {
             String::from_utf8(output).unwrap(),
             format!("indexsail {}\n", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn index_cli_opt_in_elias_fano_round_trips_with_identical_results() {
+        let collection = temp_path("elias-fano.tsv");
+        let varbyte = temp_path("varbyte.idx");
+        let elias_fano = temp_path("elias-fano.idx");
+        std::fs::write(
+            &collection,
+            "id\tbody\nD1\tlocal retrieval search\nD2\tsearch ranking\nD3\tlocal search\n",
+        )
+        .unwrap();
+        for (path, codec) in [(&varbyte, "varbyte"), (&elias_fano, "elias-fano")] {
+            execute(
+                [
+                    "index",
+                    "--input",
+                    collection.to_str().unwrap(),
+                    "--output",
+                    path.to_str().unwrap(),
+                    "--codec",
+                    codec,
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        }
+        assert_eq!(persisted_format_version(&varbyte).unwrap(), 3);
+        assert_eq!(persisted_format_version(&elias_fano).unwrap(), 4);
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for (path, output) in [(&varbyte, &mut old), (&elias_fano, &mut new)] {
+            execute(
+                [
+                    "search",
+                    "--index",
+                    path.to_str().unwrap(),
+                    "--query",
+                    "local search",
+                    "--strategy",
+                    "block-max-wand",
+                ],
+                output,
+            )
+            .unwrap();
+        }
+        assert_eq!(old, new);
+        let error = execute(
+            [
+                "index",
+                "--input",
+                collection.to_str().unwrap(),
+                "--output",
+                elias_fano.to_str().unwrap(),
+                "--codec",
+                "unknown",
+            ],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unsupported posting codec"));
+        assert_eq!(persisted_format_version(&elias_fano).unwrap(), 4);
+        for path in [collection, varbyte, elias_fano] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

@@ -1293,11 +1293,15 @@ mod tests {
         one_document("v3", "alpha current")
             .write_to(&mut v3)
             .unwrap();
+        let mut v4 = Vec::new();
+        one_document("v4", "gamma newest")
+            .write_to_with_codec(&mut v4, crate::persistence::PostingStorageCodec::EliasFano)
+            .unwrap();
 
-        let embedded = [v1, v2, v3];
+        let embedded = [v1, v2, v3, v4];
         let mut payload = Vec::new();
-        write_u32(&mut payload, 3).unwrap();
-        write_u64(&mut payload, 3).unwrap();
+        write_u32(&mut payload, 4).unwrap();
+        write_u64(&mut payload, 4).unwrap();
         for bytes in &embedded {
             write_u64(&mut payload, bytes.len() as u64).unwrap();
             payload.extend_from_slice(bytes);
@@ -1310,10 +1314,11 @@ mod tests {
         container.extend_from_slice(&payload);
 
         let restored = ShardedIndex::read_from(Cursor::new(container)).unwrap();
-        assert_eq!(restored.embedded_format_versions(), [1, 2, 3]);
+        assert_eq!(restored.embedded_format_versions(), [1, 2, 3, 4]);
         assert_eq!(restored.document(0).unwrap().external_id(), "v1");
         assert_eq!(restored.document(1).unwrap().external_id(), "v2");
         assert_eq!(restored.document(2).unwrap().external_id(), "v3");
+        assert_eq!(restored.document(3).unwrap().external_id(), "v4");
         let query = SearchQuery::from_text(restored.analyzer(), "alpha", Some("body")).unwrap();
         assert_eq!(
             restored
@@ -1324,6 +1329,15 @@ mod tests {
                 .map(|hit| hit.external_id.as_str())
                 .collect::<Vec<_>>(),
             ["v1", "v3"]
+        );
+        let v4_query = SearchQuery::from_text(restored.analyzer(), "gamma", Some("body")).unwrap();
+        assert_eq!(
+            restored
+                .search(&v4_query, SearchOptions::default())
+                .unwrap()
+                .hits[0]
+                .external_id,
+            "v4"
         );
     }
 

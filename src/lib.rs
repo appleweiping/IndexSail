@@ -4,7 +4,8 @@
 //! ranking, Boolean queries, phrase and exact-field filters, exhaustive and
 //! exact WAND top-k execution, explanations, TREC-style batch evaluation, and
 //! a checksummed, delta/variable-byte version 3 format with persisted block
-//! bounds and version 1/2 read compatibility. Collections can also be split
+//! bounds and version 1/2 read compatibility, plus opt-in Elias–Fano version 4.
+//! Collections can also be split
 //! into deterministic physical shards while retaining exact global BM25
 //! scores and stable cross-shard top-k merging. The CIFF v1 surface provides
 //! bounded canonical index interchange plus direct exhaustive BM25 and TREC
@@ -18,6 +19,7 @@ pub mod cli;
 pub mod codec;
 pub mod collection;
 pub mod document;
+mod elias_fano;
 pub mod error;
 pub mod evaluation;
 pub mod forward;
@@ -48,6 +50,7 @@ pub use forward::{
     FORWARD_FORMAT_VERSION, ForwardDocument, ForwardIndex, ForwardStats, ForwardTerm, TermId,
 };
 pub use index::{IndexBuilder, IndexStats, InvertedIndex, Posting};
+pub use persistence::{ELIAS_FANO_FORMAT_VERSION, PostingStorageCodec};
 pub use query::{BooleanOperator, FieldFilter, PhraseFilter, QueryTerm, SearchQuery};
 pub use reorder::{BisectionOptions, DocIdMap, MAX_REORDER_DOCUMENTS};
 pub use search::{

@@ -1,9 +1,11 @@
-//! Delta and variable-byte codecs used by the persisted posting lists.
+//! Variable-byte and Elias–Fano posting-list layouts.
 //!
-//! The codec is deliberately small and independently testable. Document IDs
-//! and positions are strictly increasing, so their positive gaps are encoded
-//! instead of absolute values. Unsigned integers use base-128 variable bytes.
+//! In the default v3 layout, strictly increasing document IDs and positions
+//! become positive gaps. The opt-in v4 layout stores document IDs as a
+//! monotone Elias–Fano sequence, with frequencies and positive position gaps
+//! retaining base-128 variable bytes.
 
+use crate::elias_fano;
 use crate::error::{Error, Result};
 use crate::index::Posting;
 
@@ -161,6 +163,125 @@ pub(crate) fn decode_postings(bytes: &[u8], posting_count: usize) -> Result<Vec<
     Ok(postings)
 }
 
+/// Version 4 block: `u32` Elias–Fano byte length, canonical Elias–Fano
+/// document IDs, then varbyte frequency and position gaps per document.
+pub(crate) fn encode_elias_fano_postings(postings: &[Posting]) -> Result<Vec<u8>> {
+    let mut docs = Vec::new();
+    docs.try_reserve_exact(postings.len())
+        .map_err(|_| Error::InvalidArgument("posting IDs cannot be allocated safely".into()))?;
+    for posting in postings {
+        if posting.term_frequency == 0 || posting.term_frequency as usize != posting.positions.len()
+        {
+            return Err(Error::CorruptIndex(
+                "term frequency does not match positions".into(),
+            ));
+        }
+        validate_position_count(posting.positions.len())?;
+        docs.push(posting.doc_id);
+    }
+    let encoded_docs = elias_fano::encode(&docs)?;
+    let encoded_docs_len = u32::try_from(encoded_docs.len())
+        .map_err(|_| Error::InvalidArgument("Elias–Fano document block exceeds u32".into()))?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(4 + encoded_docs.len())
+        .map_err(|_| Error::InvalidArgument("posting block cannot be allocated safely".into()))?;
+    output.extend_from_slice(&encoded_docs_len.to_le_bytes());
+    output.extend_from_slice(&encoded_docs);
+    for posting in postings {
+        encode_u32(posting.term_frequency, &mut output);
+        let mut previous_position: Option<u32> = None;
+        for &position in &posting.positions {
+            let position_gap = match previous_position {
+                None => position.checked_add(1),
+                Some(previous) => position.checked_sub(previous),
+            }
+            .filter(|gap| *gap > 0)
+            .ok_or_else(|| {
+                Error::CorruptIndex("term positions are not strictly increasing".into())
+            })?;
+            encode_u32(position_gap, &mut output);
+            previous_position = Some(position);
+        }
+    }
+    Ok(output)
+}
+
+pub(crate) fn decode_elias_fano_postings(
+    bytes: &[u8],
+    posting_count: usize,
+) -> Result<Vec<Posting>> {
+    let encoded_docs_len = u32::from_le_bytes(
+        bytes
+            .get(..4)
+            .ok_or_else(|| Error::CorruptIndex("truncated Elias–Fano posting header".into()))?
+            .try_into()
+            .map_err(|_| Error::CorruptIndex("truncated Elias–Fano posting header".into()))?,
+    ) as usize;
+    let docs_end = 4_usize
+        .checked_add(encoded_docs_len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| Error::CorruptIndex("truncated Elias–Fano document block".into()))?;
+    if posting_count > (bytes.len() - docs_end) / 2 {
+        return Err(Error::CorruptIndex(
+            "postings cannot fit in Elias–Fano block".into(),
+        ));
+    }
+    let docs = elias_fano::decode(&bytes[4..docs_end], posting_count)?;
+    let mut postings = Vec::new();
+    postings
+        .try_reserve_exact(posting_count)
+        .map_err(|_| Error::CorruptIndex("postings cannot be allocated safely".into()))?;
+    let mut cursor = docs_end;
+    for doc_id in docs {
+        let term_frequency = decode_u32(bytes, &mut cursor)?;
+        if term_frequency == 0 {
+            return Err(Error::CorruptIndex(
+                "posting term frequency must be positive".into(),
+            ));
+        }
+        let position_count = usize::try_from(term_frequency)
+            .map_err(|_| Error::CorruptIndex("position count does not fit usize".into()))?;
+        validate_position_count(position_count)?;
+        if position_count > bytes.len().saturating_sub(cursor) {
+            return Err(Error::CorruptIndex(
+                "position count cannot fit in compressed posting block".into(),
+            ));
+        }
+        let mut positions = Vec::new();
+        positions
+            .try_reserve_exact(position_count)
+            .map_err(|_| Error::CorruptIndex("positions cannot be allocated safely".into()))?;
+        let mut previous_position: Option<u32> = None;
+        for _ in 0..position_count {
+            let gap = decode_u32(bytes, &mut cursor)?;
+            if gap == 0 {
+                return Err(Error::CorruptIndex(
+                    "posting position gap must be positive".into(),
+                ));
+            }
+            let position = match previous_position {
+                None => gap.checked_sub(1),
+                Some(previous) => previous.checked_add(gap),
+            }
+            .ok_or_else(|| Error::CorruptIndex("posting position overflow".into()))?;
+            positions.push(position);
+            previous_position = Some(position);
+        }
+        postings.push(Posting {
+            doc_id,
+            term_frequency,
+            positions,
+        });
+    }
+    if cursor != bytes.len() {
+        return Err(Error::CorruptIndex(
+            "trailing bytes in Elias–Fano posting block".into(),
+        ));
+    }
+    Ok(postings)
+}
+
 fn validate_position_count(position_count: usize) -> Result<()> {
     if position_count > MAX_POSITIONS_PER_POSTING {
         return Err(Error::CorruptIndex(format!(
@@ -261,6 +382,46 @@ mod tests {
         ];
         let encoded = encode_postings(&original).unwrap();
         assert_eq!(decode_postings(&encoded, original.len()).unwrap(), original);
+    }
+
+    #[test]
+    fn elias_fano_posting_codec_round_trips_and_rejects_boundary_corruption() {
+        let original = vec![
+            posting(0, &[0, 127]),
+            posting(4, &[3, 128, 65_535]),
+            posting(u32::MAX, &[u32::MAX - 1]),
+        ];
+        let block = encode_elias_fano_postings(&original).unwrap();
+        assert_eq!(decode_elias_fano_postings(&block, 3).unwrap(), original);
+        assert!(decode_elias_fano_postings(&block[..3], 3).is_err());
+        assert!(decode_elias_fano_postings(&block[..block.len() - 1], 3).is_err());
+        assert!(decode_elias_fano_postings(&block, 2).is_err());
+        let mut trailing = block.clone();
+        trailing.push(0);
+        assert!(decode_elias_fano_postings(&trailing, 3).is_err());
+        let mut bad_length = block.clone();
+        bad_length[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_elias_fano_postings(&bad_length, 3).is_err());
+        let mut bad_frequency = block.clone();
+        let docs_len = u32::from_le_bytes(block[..4].try_into().unwrap()) as usize;
+        bad_frequency[4 + docs_len] = 0;
+        assert!(decode_elias_fano_postings(&bad_frequency, 3).is_err());
+        assert!(encode_elias_fano_postings(&[posting(2, &[0]), posting(2, &[1])]).is_err());
+        assert!(encode_elias_fano_postings(&[posting(2, &[1, 1])]).is_err());
+    }
+
+    #[test]
+    fn elias_fano_dense_document_ids_reduce_posting_bytes() {
+        let postings = (0..1_000)
+            .map(|doc_id| posting(doc_id, &[0]))
+            .collect::<Vec<_>>();
+        let varbyte = encode_postings(&postings).unwrap();
+        let elias_fano = encode_elias_fano_postings(&postings).unwrap();
+        assert!(elias_fano.len() < varbyte.len());
+        assert_eq!(
+            decode_elias_fano_postings(&elias_fano, 1_000).unwrap(),
+            postings
+        );
     }
 
     #[test]

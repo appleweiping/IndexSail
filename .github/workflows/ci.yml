@@ -84,6 +84,17 @@ jobs:
           cargo run --locked --release -- batch --index target/ci.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci.run --report target/ci-report.json --field body --top-k 10 --verify
           test -s target/ci.run
           test -s target/ci-report.json
+      - name: Elias–Fano persisted index lifecycle and ranking parity
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo run --locked --release -- index --input examples/collection.trec --output target/ci-ef.idx --format trec --codec elias-fano
+          cargo run --locked --release -- inspect --index target/ci-ef.idx > target/ci-ef-inspect.txt
+          cargo run --locked --release -- batch --index target/ci-ef.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-ef.run --report target/ci-ef-report.json --field body --top-k 10 --strategy block-max-wand --verify
+          cargo run --locked --release -- batch --index target/ci.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-ef-reference.run --field body --top-k 10 --strategy block-max-wand --verify
+          diff -u target/ci-ef-reference.run target/ci-ef.run
+          grep -q 'format=IndexSail-v4' target/ci-ef-inspect.txt
+          grep -q 'posting_codec=elias-fano-docids+varbyte-positions' target/ci-ef-inspect.txt
+          test -s target/ci-ef-report.json
       - name: Forward index and JSONL collection lifecycle smoke test
         if: matrix.os == 'ubuntu-latest'
         run: |

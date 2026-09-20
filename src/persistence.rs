@@ -6,7 +6,10 @@ use std::io::{BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 use crate::analysis::{AnalysisMode, Analyzer};
-use crate::codec::{checksum, decode_postings, encode_postings};
+use crate::codec::{
+    checksum, decode_elias_fano_postings, decode_postings, encode_elias_fano_postings,
+    encode_postings,
+};
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::index::{
@@ -16,9 +19,20 @@ use crate::index::{
 const MAGIC_V1: &[u8; 8] = b"IDXSAL01";
 const MAGIC_V2: &[u8; 8] = b"IDXSAL02";
 const MAGIC_V3: &[u8; 8] = b"IDXSAL03";
+const MAGIC_V4: &[u8; 8] = b"IDXSAL04";
 const LEGACY_VERSION: u32 = 1;
 const CHECKSUMMED_POSTINGS_VERSION: u32 = 2;
 pub const PERSISTENCE_FORMAT_VERSION: u32 = 3;
+pub const ELIAS_FANO_FORMAT_VERSION: u32 = 4;
+
+/// Posting codec selected for new monolithic index snapshots. Older readers
+/// cannot consume the opt-in Elias–Fano format; all existing formats remain
+/// readable by the current reader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostingStorageCodec {
+    VarByte,
+    EliasFano,
+}
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 const MAX_COLLECTION_ITEMS: usize = 20_000_000;
 const MAX_BLOCK_MAX_STREAMS: usize = 40_000_000;
@@ -60,7 +74,10 @@ pub(crate) fn format_version_from_header(magic: [u8; 8], version: u32) -> Result
         value if value == MAGIC_V1 && version == LEGACY_VERSION => Ok(version),
         value if value == MAGIC_V2 && version == CHECKSUMMED_POSTINGS_VERSION => Ok(version),
         value if value == MAGIC_V3 && version == PERSISTENCE_FORMAT_VERSION => Ok(version),
-        value if value == MAGIC_V1 || value == MAGIC_V2 || value == MAGIC_V3 => {
+        value if value == MAGIC_V4 && version == ELIAS_FANO_FORMAT_VERSION => Ok(version),
+        value
+            if value == MAGIC_V1 || value == MAGIC_V2 || value == MAGIC_V3 || value == MAGIC_V4 =>
+        {
             Err(Error::UnsupportedVersion(version))
         }
         _ => Err(Error::CorruptIndex("invalid file signature".into())),
@@ -74,9 +91,19 @@ impl InvertedIndex {
     /// postings, and persists the default-BM25 block bounds consumed by
     /// block-max WAND.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.save_with_codec(path, PostingStorageCodec::VarByte)
+    }
+
+    /// Save one snapshot with the requested posting codec. `EliasFano` writes
+    /// format 4; `VarByte` writes the backward-compatible default format 3.
+    pub fn save_with_codec(
+        &self,
+        path: impl AsRef<Path>,
+        codec: PostingStorageCodec,
+    ) -> Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
-        self.write_to(&mut writer)?;
+        self.write_to_with_codec(&mut writer, codec)?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
         Ok(())
@@ -89,9 +116,22 @@ impl InvertedIndex {
     }
 
     pub fn write_to(&self, mut writer: impl Write) -> Result<()> {
+        self.write_to_with_codec(&mut writer, PostingStorageCodec::VarByte)
+    }
+
+    /// Opt in to a version-4 snapshot whose document-ID sequences use
+    /// Elias–Fano; frequencies and positions retain the version-3 varbytes.
+    pub fn write_to_with_codec(
+        &self,
+        mut writer: impl Write,
+        codec: PostingStorageCodec,
+    ) -> Result<()> {
         let mut payload = Vec::new();
         write_documents(self, &mut payload)?;
-        write_compressed_postings(self, &mut payload)?;
+        match codec {
+            PostingStorageCodec::VarByte => write_compressed_postings(self, &mut payload)?,
+            PostingStorageCodec::EliasFano => write_elias_fano_postings(self, &mut payload)?,
+        }
         write_block_max_metadata(self, &mut payload)?;
 
         let payload_length = u64::try_from(payload.len())
@@ -101,20 +141,25 @@ impl InvertedIndex {
                 "index payload exceeds {MAX_INDEX_PAYLOAD_BYTES} byte safety limit"
             )));
         }
-        writer.write_all(MAGIC_V3)?;
-        write_u32(&mut writer, PERSISTENCE_FORMAT_VERSION)?;
+        let (magic, version) = match codec {
+            PostingStorageCodec::VarByte => (MAGIC_V3, PERSISTENCE_FORMAT_VERSION),
+            PostingStorageCodec::EliasFano => (MAGIC_V4, ELIAS_FANO_FORMAT_VERSION),
+        };
+        writer.write_all(magic)?;
+        write_u32(&mut writer, version)?;
         write_u64(&mut writer, payload_length)?;
         write_u64(&mut writer, checksum(&payload))?;
         writer.write_all(&payload)?;
         Ok(())
     }
 
-    /// Load current version 3 indexes and legacy version 1 or 2 indexes.
+    /// Load versions 1–4, including opt-in Elias–Fano version 4 indexes.
     pub fn read_from(mut reader: impl Read) -> Result<Self> {
         let mut magic = [0_u8; 8];
         read_exact_corrupt(&mut reader, &mut magic, "file signature")?;
         match &magic {
             value if value == MAGIC_V3 => read_v3(&mut reader),
+            value if value == MAGIC_V4 => read_v4(&mut reader),
             value if value == MAGIC_V2 => read_v2(&mut reader),
             value if value == MAGIC_V1 => read_v1(&mut reader),
             _ => Err(Error::CorruptIndex("invalid file signature".into())),
@@ -154,6 +199,24 @@ fn write_compressed_postings(index: &InvertedIndex, writer: &mut impl Write) -> 
             )));
         }
         write_len(writer, block.len(), "compressed posting bytes")?;
+        writer.write_all(&block)?;
+    }
+    Ok(())
+}
+
+fn write_elias_fano_postings(index: &InvertedIndex, writer: &mut impl Write) -> Result<()> {
+    write_collection_len(writer, index.postings.len(), "dictionary terms")?;
+    for (key, postings) in &index.postings {
+        write_string(writer, &key.field)?;
+        write_string(writer, &key.term)?;
+        write_collection_len(writer, postings.len(), "postings")?;
+        let block = encode_elias_fano_postings(postings)?;
+        if block.len() > MAX_POSTING_BLOCK_BYTES {
+            return Err(Error::InvalidArgument(format!(
+                "Elias–Fano posting block exceeds {MAX_POSTING_BLOCK_BYTES} byte safety limit"
+            )));
+        }
+        write_len(writer, block.len(), "Elias–Fano posting bytes")?;
         writer.write_all(&block)?;
     }
     Ok(())
@@ -202,6 +265,17 @@ pub(crate) fn block_max_metadata_encoded_bytes(index: &InvertedIndex) -> Result<
     Ok(counter.bytes)
 }
 
+pub(crate) fn elias_fano_posting_encoded_bytes(index: &InvertedIndex) -> Result<u64> {
+    index.postings.values().try_fold(0_u64, |total, postings| {
+        let bytes = encode_elias_fano_postings(postings)?.len();
+        total
+            .checked_add(u64::try_from(bytes).map_err(|_| {
+                Error::InvalidArgument("Elias–Fano posting byte count overflow".into())
+            })?)
+            .ok_or_else(|| Error::InvalidArgument("Elias–Fano posting byte count overflow".into()))
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn encode_legacy_v1_for_test(index: &InvertedIndex) -> Result<Vec<u8>> {
     let mut output = Vec::new();
@@ -248,7 +322,23 @@ fn read_v3(reader: &mut impl Read) -> Result<InvertedIndex> {
     let payload = read_checksummed_payload(reader, PERSISTENCE_FORMAT_VERSION)?;
     let mut payload_reader = Cursor::new(payload.as_slice());
     let (analyzer, documents, all_lengths, postings_by_term) =
-        read_compressed_index(&mut payload_reader)?;
+        read_compressed_index(&mut payload_reader, PostingStorageCodec::VarByte)?;
+    let block_max = read_block_max_metadata(&mut payload_reader)?;
+    reject_trailing(&mut payload_reader)?;
+    InvertedIndex::from_parts_with_block_max(
+        analyzer,
+        documents,
+        all_lengths,
+        postings_by_term,
+        block_max,
+    )
+}
+
+fn read_v4(reader: &mut impl Read) -> Result<InvertedIndex> {
+    let payload = read_checksummed_payload(reader, ELIAS_FANO_FORMAT_VERSION)?;
+    let mut payload_reader = Cursor::new(payload.as_slice());
+    let (analyzer, documents, all_lengths, postings_by_term) =
+        read_compressed_index(&mut payload_reader, PostingStorageCodec::EliasFano)?;
     let block_max = read_block_max_metadata(&mut payload_reader)?;
     reject_trailing(&mut payload_reader)?;
     InvertedIndex::from_parts_with_block_max(
@@ -264,7 +354,7 @@ fn read_v2(reader: &mut impl Read) -> Result<InvertedIndex> {
     let payload = read_checksummed_payload(reader, CHECKSUMMED_POSTINGS_VERSION)?;
     let mut payload_reader = Cursor::new(payload.as_slice());
     let (analyzer, documents, all_lengths, postings_by_term) =
-        read_compressed_index(&mut payload_reader)?;
+        read_compressed_index(&mut payload_reader, PostingStorageCodec::VarByte)?;
     reject_trailing(&mut payload_reader)?;
     InvertedIndex::from_parts(analyzer, documents, all_lengths, postings_by_term)
 }
@@ -302,7 +392,10 @@ type StoredCompressedIndex = (
     BTreeMap<TermKey, Vec<Posting>>,
 );
 
-fn read_compressed_index(reader: &mut Cursor<&[u8]>) -> Result<StoredCompressedIndex> {
+fn read_compressed_index(
+    reader: &mut Cursor<&[u8]>,
+    codec: PostingStorageCodec,
+) -> Result<StoredCompressedIndex> {
     let (analyzer, documents, all_lengths) = read_documents(reader)?;
     let term_count = read_len(reader, "dictionary terms")?;
     let mut postings_by_term = BTreeMap::new();
@@ -323,7 +416,10 @@ fn read_compressed_index(reader: &mut Cursor<&[u8]>) -> Result<StoredCompressedI
             .get_ref()
             .get(block_start..block_end)
             .ok_or_else(|| Error::CorruptIndex("truncated compressed posting block".into()))?;
-        let postings = decode_postings(block, posting_count)?;
+        let postings = match codec {
+            PostingStorageCodec::VarByte => decode_postings(block, posting_count)?,
+            PostingStorageCodec::EliasFano => decode_elias_fano_postings(block, posting_count)?,
+        };
         reader
             .set_position(u64::try_from(block_end).map_err(|_| {
                 Error::CorruptIndex("posting block offset does not fit u64".into())
@@ -726,6 +822,108 @@ mod tests {
     }
 
     #[test]
+    fn version_four_elias_fano_is_opt_in_and_searches_like_version_three() {
+        let index = block_search_index();
+        let v3 = bytes(&index);
+        let mut v4 = Vec::new();
+        index
+            .write_to_with_codec(&mut v4, PostingStorageCodec::EliasFano)
+            .unwrap();
+        assert_eq!(&v3[..8], MAGIC_V3);
+        assert_eq!(&v4[..8], MAGIC_V4);
+        assert_eq!(u32::from_le_bytes(v4[8..12].try_into().unwrap()), 4);
+        assert_eq!(
+            format_version_from_header(*MAGIC_V4, ELIAS_FANO_FORMAT_VERSION).unwrap(),
+            4
+        );
+        let restored = InvertedIndex::read_from(v4.as_slice()).unwrap();
+        assert_eq!(restored.documents(), index.documents());
+        assert_eq!(restored.stats(), index.stats());
+        assert_eq!(restored.block_max, index.block_max);
+        for term in ["common", "rare", "filler"] {
+            assert_eq!(
+                restored.postings("body", term),
+                index.postings("body", term)
+            );
+        }
+        let query = SearchQuery::from_text(index.analyzer(), "common rare", Some("body")).unwrap();
+        for pruning in [
+            PruningStrategy::Exhaustive,
+            PruningStrategy::Wand,
+            PruningStrategy::BlockMaxWand,
+            PruningStrategy::MaxScore,
+        ] {
+            let options = SearchOptions {
+                pruning,
+                ..SearchOptions::default()
+            };
+            let old = index.search(&query, options).unwrap();
+            let new = restored.search(&query, options).unwrap();
+            assert_eq!(new.hits.len(), old.hits.len());
+            for (actual, expected) in new.hits.iter().zip(&old.hits) {
+                assert_eq!(actual.doc_id, expected.doc_id);
+                assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn version_four_checks_checksum_length_and_version_before_payload() {
+        let index = sample_index(AnalysisMode::Unicode);
+        let mut data = Vec::new();
+        index
+            .write_to_with_codec(&mut data, PostingStorageCodec::EliasFano)
+            .unwrap();
+        let mut corrupt = data.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(
+            InvertedIndex::read_from(corrupt.as_slice())
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
+        let mut version = data.clone();
+        version[8..12].copy_from_slice(&99_u32.to_le_bytes());
+        assert!(matches!(
+            InvertedIndex::read_from(version.as_slice()),
+            Err(Error::UnsupportedVersion(99))
+        ));
+        assert!(InvertedIndex::read_from(&data[..data.len() - 1]).is_err());
+        let mut trailing = data;
+        trailing.push(0);
+        assert!(InvertedIndex::read_from(trailing.as_slice()).is_err());
+    }
+
+    #[test]
+    fn version_four_rejects_checksum_valid_malformed_elias_fano_length() {
+        let index = sample_index(AnalysisMode::Unicode);
+        let mut data = Vec::new();
+        index
+            .write_to_with_codec(&mut data, PostingStorageCodec::EliasFano)
+            .unwrap();
+        let block_start = {
+            let mut reader = Cursor::new(&data[28..]);
+            read_documents(&mut reader).unwrap();
+            assert!(read_u32(&mut reader).unwrap() > 0);
+            read_string(&mut reader).unwrap();
+            read_string(&mut reader).unwrap();
+            assert!(read_u32(&mut reader).unwrap() > 0);
+            assert!(read_u32(&mut reader).unwrap() > 4);
+            usize::try_from(reader.position()).unwrap() + 28
+        };
+        data[block_start..block_start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let repaired_checksum = checksum(&data[28..]);
+        data[20..28].copy_from_slice(&repaired_checksum.to_le_bytes());
+        assert!(
+            InvertedIndex::read_from(data.as_slice())
+                .unwrap_err()
+                .to_string()
+                .contains("truncated Elias–Fano document block")
+        );
+    }
+
+    #[test]
     fn writer_uses_version_three_magic_and_is_deterministic() {
         let index = sample_index(AnalysisMode::Unicode);
         let first = bytes(&index);
@@ -954,6 +1152,7 @@ mod tests {
         for (magic, version) in [
             (MAGIC_V2, CHECKSUMMED_POSTINGS_VERSION),
             (MAGIC_V3, PERSISTENCE_FORMAT_VERSION),
+            (MAGIC_V4, ELIAS_FANO_FORMAT_VERSION),
         ] {
             let mut excessive = Vec::new();
             excessive.extend_from_slice(magic);
@@ -1005,6 +1204,7 @@ mod tests {
             (*MAGIC_V1, LEGACY_VERSION),
             (*MAGIC_V2, CHECKSUMMED_POSTINGS_VERSION),
             (*MAGIC_V3, PERSISTENCE_FORMAT_VERSION),
+            (*MAGIC_V4, ELIAS_FANO_FORMAT_VERSION),
         ] {
             assert_eq!(format_version_from_header(magic, version).unwrap(), version);
             assert!(matches!(
@@ -1022,6 +1222,7 @@ mod tests {
             (*MAGIC_V1, LEGACY_VERSION),
             (*MAGIC_V2, CHECKSUMMED_POSTINGS_VERSION),
             (*MAGIC_V3, PERSISTENCE_FORMAT_VERSION),
+            (*MAGIC_V4, ELIAS_FANO_FORMAT_VERSION),
         ] {
             let mut data = Vec::new();
             data.extend_from_slice(&magic);
@@ -1198,10 +1399,13 @@ mod tests {
             compressed.extend_from_slice(&block);
         }
         assert!(
-            read_compressed_index(&mut Cursor::new(compressed.as_slice()))
-                .unwrap_err()
-                .to_string()
-                .contains("duplicate dictionary key")
+            read_compressed_index(
+                &mut Cursor::new(compressed.as_slice()),
+                PostingStorageCodec::VarByte,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate dictionary key")
         );
 
         let mut legacy = Vec::new();
