@@ -133,6 +133,19 @@ jobs:
           test -s target/ci-shards.idx
           test -s target/ci-shards.run
           test -s target/ci-shards-report.json
+      - name: Quantized BM25 native and sharded release smoke test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo run --locked --release -- index --input examples/corpus.tsv --output target/ci-quant.idx
+          cargo run --locked --release -- shard-index --input examples/corpus.tsv --output target/ci-quant-shards.idx --shards 2
+          cargo run --locked --release -- search --index target/ci-quant.idx --query "local search" --scorer qbm25 --quant-bits 8 --quant-max 5 --strategy block-max-wand > target/ci-quant-search.txt
+          cargo run --locked --release -- batch --index target/ci-quant.idx --topics examples/topics.tsv --run target/ci-quant.run --report target/ci-quant.json --scorer qbm25 --quant-bits 8 --quant-max 5 --strategy maxscore --verify
+          cargo run --locked --release -- shard-batch --index target/ci-quant-shards.idx --topics examples/topics.tsv --run target/ci-quant-shards.run --report target/ci-quant-shards.json --scorer qbm25 --quant-bits 8 --quant-max 5 --strategy maxscore --verify
+          test -s target/ci-quant-search.txt
+          test -s target/ci-quant.run
+          diff -u target/ci-quant.run target/ci-quant-shards.run
+          grep -q '"scorer": "qbm25"' target/ci-quant.json
+          grep -q '"verified_exact": true' target/ci-quant-shards.json
       - name: CIFF interoperability lifecycle smoke test
         if: matrix.os == 'ubuntu-latest'
         run: |

@@ -5,7 +5,7 @@
 [![MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
 IndexSail is an information-retrieval experiment toolkit in safe Rust. It builds a
-field-aware positional index, ranks with BM25, DPH, PL2, or QLD, executes exact exhaustive, WAND, block-max WAND, or MaxScore top-k
+field-aware positional index, ranks with BM25, opt-in quantized BM25, DPH, PL2, or QLD, executes exact exhaustive, WAND, block-max WAND, or MaxScore top-k
 queries, and runs
 reproducible TREC-style experiments from collection ingestion through metrics and run files. A collection can also
 be partitioned into independently searchable physical shards while using collection-wide statistics and an exact,
@@ -471,6 +471,43 @@ QLD defaults to exhaustive `full`; WAND, block-max WAND, and MaxScore are
 rejected until a safe bound is proved. BM25 `--k1`/`--b`, batch `--verify`,
 CIFF retrieval, and the pruning benchmark remain BM25-only. This is not full
 PISA scorer parity or a claim of floating-point bit equivalence.
+
+### Opt-in quantized BM25
+
+Native `search`, `shard-search`, `batch`, and `shard-batch` accept `--scorer qbm25`
+with required `--quant-bits` (2–32) and `--quant-max` (positive finite). The
+maximum is a caller-declared *index-wide* bound on each logical, field-merged
+BM25 term contribution after its query boost. It is not auto-calibrated or
+stored in the index. The same parameters must be reused for comparable runs;
+any scored contribution above the maximum fails the request before results
+are emitted. No saturation or silent clipping occurs.
+
+For `range = 2^bits - 1`, a present posting with impact `s ∈ [0,max]` receives
+`floor((s/max) * (range-1)) + 1`, with the exact endpoint clamped to `range`
+against floating-point rounding. A present zero-impact posting maps to `1`;
+an absent posting contributes `0`. Field contributions for the same logical
+term are merged *before* quantization. All matching terms' integer impacts
+are summed, then ranked by descending score and ascending insertion ID. A
+maximum of 4096 distinct prepared query terms ensures even 32-bit scores sum
+below `2^44`, exactly representable in the retrieval engine's `f64` carrier.
+Near a bin boundary the `f64` divide/multiply result defines the bin; this is
+not claimed bit-identical to PISA's `float` calculation.
+
+```bash
+indexsail search --index corpus.idx --query "local search" --scorer qbm25 --quant-bits 8 --quant-max 5 --strategy block-max-wand
+indexsail batch --index corpus.idx --topics topics.tsv --run quant.run --report quant.json --scorer qbm25 --quant-bits 8 --quant-max 5 --verify
+```
+
+Exhaustive, WAND, block-max WAND, and MaxScore all use the exact materialized
+integer impacts; the pruning upper bound is the outward-rounded maximum of
+those impacts, not a bound on unquantized BM25. Thus an equal-score/lower-ID
+tie remains eligible. Shards use global BM25 statistics and identical
+quantization; their global-ID merge preserves the same tie order. `--verify`
+compares the selected executor with exhaustive. Batch JSON uses schema 2 with
+`"scorer": "qbm25"`, `"quant_bits"`, and `"quant_max"`. Quantized
+`--explain` is deliberately rejected because the existing explanation format
+reports field-wise floating contributions, not merged integer impacts. CIFF
+retrieval and the synthetic pruning benchmark remain unquantized BM25-only.
 
 ## Exact WAND
 

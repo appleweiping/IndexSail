@@ -41,6 +41,10 @@ impl Bm25Params {
 pub enum ScoringModel {
     #[default]
     Bm25,
+    /// Quantize each present, field-merged BM25 term impact into 1..=2^bits-1.
+    /// A missing posting remains zero. The caller supplies one finite positive
+    /// maximum for all terms in this index; an impact above it fails closed.
+    QuantizedBm25 { bits: u8, max_impact: f64 },
     /// Parameter-free divergence-from-randomness DPH.
     ///
     /// DPH impacts can be negative. Only exhaustive execution is currently
@@ -114,6 +118,9 @@ impl SearchOptions {
             ));
         }
         self.bm25.validate()?;
+        if let ScoringModel::QuantizedBm25 { bits, max_impact } = self.scoring {
+            LinearQuantizer::new(bits, max_impact)?;
+        }
         if let ScoringModel::Pl2 { c } = self.scoring {
             if !c.is_finite() || c <= 0.0 {
                 return Err(Error::InvalidArgument(
@@ -135,6 +142,9 @@ impl SearchOptions {
                     ScoringModel::Pl2 { .. } => "PL2",
                     ScoringModel::Qld { .. } => "QLD",
                     ScoringModel::Bm25 => unreachable!("BM25 does not use collection frequency"),
+                    ScoringModel::QuantizedBm25 { .. } => {
+                        unreachable!("quantized BM25 does not use collection frequency")
+                    }
                 };
                 return Err(Error::InvalidArgument(format!(
                     "{name} requires exhaustive search; pruning bounds are not established"
@@ -146,7 +156,53 @@ impl SearchOptions {
                 ));
             }
         }
+        if self.explain && matches!(self.scoring, ScoringModel::QuantizedBm25 { .. }) {
+            return Err(Error::InvalidArgument(
+                "quantized BM25 explanations are not available; exact integer term aggregation differs from field-wise BM25 contributions".into(),
+            ));
+        }
         Ok(self)
+    }
+}
+
+/// PISA-style linear quantizer, with explicit rejection rather than saturation.
+/// Present zero scores map to one; only an absent posting has score zero.
+#[derive(Clone, Copy, Debug)]
+struct LinearQuantizer {
+    range: u32,
+    max_impact: f64,
+}
+
+impl LinearQuantizer {
+    fn new(bits: u8, max_impact: f64) -> Result<Self> {
+        if !(2..=32).contains(&bits) {
+            return Err(Error::InvalidArgument(
+                "quantized BM25 bits must be between 2 and 32".into(),
+            ));
+        }
+        if !max_impact.is_finite() || max_impact <= 0.0 {
+            return Err(Error::InvalidArgument(
+                "quantized BM25 max impact must be finite and greater than zero".into(),
+            ));
+        }
+        Ok(Self {
+            range: u32::MAX >> (32 - bits),
+            max_impact,
+        })
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn quantize(self, score: f64) -> Result<f64> {
+        if !score.is_finite() || score < 0.0 || score > self.max_impact {
+            return Err(Error::InvalidArgument(format!(
+                "quantized BM25 term impact {score} exceeds configured range [0, {}]",
+                self.max_impact
+            )));
+        }
+        // Divide first, as in the frozen PISA implementation. The min guards
+        // an exact endpoint against a floating-point rounding overflow.
+        let scaled = (score / self.max_impact) * f64::from(self.range - 1);
+        Ok((scaled.floor().min(f64::from(self.range - 1)) + 1.0).min(f64::from(self.range)))
     }
 }
 
@@ -235,7 +291,7 @@ struct ScoreContext {
 impl ScoreContext {
     fn score(self, term_frequency: u32, document_length: u32) -> f64 {
         match self.model {
-            ScoringModel::Bm25 => bm25_score(
+            ScoringModel::Bm25 | ScoringModel::QuantizedBm25 { .. } => bm25_score(
                 term_frequency,
                 self.document_frequency,
                 self.document_count,
@@ -564,6 +620,15 @@ impl InvertedIndex {
     ) -> Result<SearchOutcome> {
         let options = options.validate()?;
         let prepared_terms = self.prepare_terms(query)?;
+        // Every quantized contribution and candidate total is an exact f64
+        // integer: 4096 * (2^32 - 1) < 2^44 < 2^53.
+        if matches!(options.scoring, ScoringModel::QuantizedBm25 { .. })
+            && prepared_terms.len() > 4096
+        {
+            return Err(Error::InvalidQuery(
+                "quantized BM25 supports at most 4096 unique query terms".into(),
+            ));
+        }
         let mut scorers = prepared_terms
             .iter()
             .enumerate()
@@ -802,10 +867,19 @@ impl InvertedIndex {
                 }
             }
         }
+        let quantizer = match scoring {
+            ScoringModel::QuantizedBm25 { bits, max_impact } => {
+                Some(LinearQuantizer::new(bits, max_impact)?)
+            }
+            _ => None,
+        };
         let entries = merged
             .into_iter()
-            .map(|(doc_id, score)| ScoredPosting { doc_id, score })
-            .collect::<Vec<_>>();
+            .map(|(doc_id, score)| {
+                let score = quantizer.map_or(Ok(score), |quantizer| quantizer.quantize(score))?;
+                Ok(ScoredPosting { doc_id, score })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let upper_bound =
             conservative_next_up(entries.iter().map(|entry| entry.score).fold(0.0, f64::max));
         let (block_max, precomputed_block_bounds_loaded, postings_scanned_for_block_bounds) =
@@ -1447,6 +1521,290 @@ mod tests {
     use crate::document::Document;
     use crate::index::IndexBuilder;
     use crate::query::{FieldFilter, PhraseFilter, QueryTerm};
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Quantized outputs are exact integers by contract.
+    fn quantizer_endpoint_boundary_and_invalid_contract() {
+        for bits in [2, 8, 32] {
+            let quantizer = LinearQuantizer::new(bits, 10.0).unwrap();
+            let range = f64::from(u32::MAX >> (32 - bits));
+            assert_eq!(quantizer.quantize(0.0).unwrap(), 1.0);
+            assert_eq!(quantizer.quantize(10.0).unwrap(), range);
+            assert!(quantizer.quantize(5.0).unwrap() >= 1.0);
+            assert!(quantizer.quantize(5.0).unwrap() <= range);
+        }
+        let two_bits = LinearQuantizer::new(2, 10.0).unwrap();
+        assert_eq!(two_bits.quantize(5.0).unwrap(), 2.0);
+        assert_eq!(
+            two_bits
+                .quantize(f64::from_bits(5.0_f64.to_bits() - 1))
+                .unwrap(),
+            1.0
+        );
+        assert_eq!(two_bits.quantize(10.0).unwrap(), 3.0);
+        assert!(
+            two_bits
+                .quantize(f64::from_bits(10.0_f64.to_bits() + 1))
+                .is_err()
+        );
+        // Eight-bit hand oracle: (5/10)*(255-1) = 127, so the midpoint
+        // maps to 128. Its immediate predecessor maps to 127.
+        let eight_bits = LinearQuantizer::new(8, 10.0).unwrap();
+        assert_eq!(eight_bits.quantize(5.0).unwrap(), 128.0);
+        assert_eq!(
+            eight_bits
+                .quantize(f64::from_bits(5.0_f64.to_bits() - 1))
+                .unwrap(),
+            127.0
+        );
+        assert_eq!(eight_bits.quantize(10.0).unwrap(), 255.0);
+        // A 32-bit midpoint and endpoint are exact f64 integers.
+        let full_width = LinearQuantizer::new(32, 1.0).unwrap();
+        assert_eq!(full_width.quantize(0.5).unwrap(), 2_147_483_648.0);
+        assert_eq!(
+            full_width
+                .quantize(f64::from_bits(0.5_f64.to_bits() - 1))
+                .unwrap(),
+            2_147_483_647.0
+        );
+        assert_eq!(full_width.quantize(1.0).unwrap(), 4_294_967_295.0);
+        let largest_candidate = f64::from(u32::MAX) * 4096.0;
+        assert_eq!(largest_candidate, 17_592_186_040_320.0);
+        assert!(largest_candidate < 2.0_f64.powi(53));
+        for score in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(two_bits.quantize(score).is_err());
+        }
+        for bits in [0, 1, 33, u8::MAX] {
+            assert!(LinearQuantizer::new(bits, 10.0).is_err());
+        }
+        for maximum in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(LinearQuantizer::new(8, maximum).is_err());
+        }
+        let tiny = LinearQuantizer::new(32, f64::MIN_POSITIVE).unwrap();
+        assert_eq!(tiny.quantize(0.0).unwrap(), 1.0);
+        assert_eq!(
+            tiny.quantize(f64::MIN_POSITIVE).unwrap(),
+            f64::from(u32::MAX)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp, clippy::too_many_lines)] // Exact integer oracle and executor matrix.
+    fn quantized_bm25_matches_independent_term_oracle_and_all_safe_executors() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for (id, title, body, group) in [
+            ("d0", "x", "x y", "keep"),
+            ("d1", "x x", "y", "keep"),
+            ("d2", "y", "x", "skip"),
+            ("d3", "x", "x y", "keep"),
+        ] {
+            builder
+                .add_document(
+                    Document::from_fields(id, [("title", title), ("body", body), ("group", group)])
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let index = builder.finish();
+        // One field-qualified posting: N=4, df=3, dl=1, avgdl=1.25,
+        // tf=1, k1=1.2, b=.75. This direct calculation is independent of
+        // production bm25_score and predicts floor(raw/2*255)+1.
+        let idf = (1.0_f64 + (4.0 - 3.0 + 0.5) / (3.0 + 0.5)).ln();
+        let raw = idf * 2.2 / (1.0 + 1.2 * (0.25 + 0.75 / 1.25));
+        let oracle = (raw / 2.0 * 255.0).floor() + 1.0;
+        let fielded = SearchQuery::from_text(index.analyzer(), "x", Some("title")).unwrap();
+        let options = SearchOptions {
+            scoring: ScoringModel::QuantizedBm25 {
+                bits: 8,
+                max_impact: 2.0,
+            },
+            top_k: 4,
+            ..SearchOptions::default()
+        };
+        let result = index.search(&fielded, options).unwrap();
+        let d0 = result
+            .hits
+            .iter()
+            .find(|hit| hit.external_id == "d0")
+            .unwrap();
+        let d3 = result
+            .hits
+            .iter()
+            .find(|hit| hit.external_id == "d3")
+            .unwrap();
+        assert_eq!(d0.score, oracle);
+        assert_eq!(d3.score, oracle);
+        assert!(
+            result
+                .hits
+                .iter()
+                .position(|hit| hit.external_id == "d0")
+                .unwrap()
+                < result
+                    .hits
+                    .iter()
+                    .position(|hit| hit.external_id == "d3")
+                    .unwrap()
+        );
+        assert!(result.hits.iter().all(|hit| hit.score.fract() == 0.0));
+        let body_raw = idf * 2.2 / (1.0 + 1.2 * (0.25 + 0.75 * 2.0 / 1.5));
+        let merged_raw = raw + body_raw;
+        let merged_oracle = ((merged_raw / 2.0) * 2.0).floor() + 1.0;
+        let unfielded = SearchQuery::from_text(index.analyzer(), "x", None).unwrap();
+        let two_bit_result = index
+            .search(
+                &unfielded,
+                SearchOptions {
+                    scoring: ScoringModel::QuantizedBm25 {
+                        bits: 2,
+                        max_impact: 2.0,
+                    },
+                    ..options
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            two_bit_result
+                .hits
+                .iter()
+                .find(|hit| hit.external_id == "d0")
+                .unwrap()
+                .score,
+            merged_oracle
+        );
+        assert_eq!(merged_oracle, 1.0); // quantizing fields separately would yield 2.
+        assert!(
+            index
+                .search(
+                    &unfielded,
+                    SearchOptions {
+                        scoring: ScoringModel::QuantizedBm25 {
+                            bits: 8,
+                            max_impact: 0.5,
+                        },
+                        ..options
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds configured range")
+        );
+
+        for query in [
+            SearchQuery::from_text(index.analyzer(), "x y", None).unwrap(),
+            SearchQuery::from_text(index.analyzer(), "x y", None)
+                .unwrap()
+                .with_operator(BooleanOperator::And),
+            SearchQuery::from_text(index.analyzer(), "x", None)
+                .unwrap()
+                .with_filter(FieldFilter::exact("group", "keep").unwrap()),
+            SearchQuery::from_text(index.analyzer(), "x", None)
+                .unwrap()
+                .with_phrase(
+                    PhraseFilter::from_text(index.analyzer(), "x y", Some("body".into())).unwrap(),
+                ),
+        ] {
+            for top_k in [1, 2, 4, 10] {
+                let exact = index
+                    .search(
+                        &query,
+                        SearchOptions {
+                            top_k,
+                            pruning: PruningStrategy::Exhaustive,
+                            ..options
+                        },
+                    )
+                    .unwrap();
+                for pruning in [
+                    PruningStrategy::Wand,
+                    PruningStrategy::BlockMaxWand,
+                    PruningStrategy::MaxScore,
+                ] {
+                    let actual = index
+                        .search(
+                            &query,
+                            SearchOptions {
+                                top_k,
+                                pruning,
+                                ..options
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(actual.hits, exact.hits, "{pruning:?} top_k={top_k}");
+                }
+            }
+        }
+        let too_low = SearchOptions {
+            scoring: ScoringModel::QuantizedBm25 {
+                bits: 2,
+                max_impact: 0.01,
+            },
+            ..options
+        };
+        assert!(
+            index
+                .search(&fielded, too_low)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds configured range")
+        );
+        assert!(
+            index
+                .search(
+                    &fielded,
+                    SearchOptions {
+                        explain: true,
+                        ..options
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("explanations are not available")
+        );
+    }
+
+    #[test]
+    fn quantized_bm25_caps_exact_integer_sum_and_rejects_overflow() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        builder
+            .add_document(Document::from_fields("d", [("body", "x")]).unwrap())
+            .unwrap();
+        for number in 0..9 {
+            builder
+                .add_document(
+                    Document::from_fields(format!("filler-{number}"), [("body", "z")]).unwrap(),
+                )
+                .unwrap();
+        }
+        let index = builder.finish();
+        let terms = (0..4097)
+            .map(|number| QueryTerm::new(format!("word{number}"), None, 1.0).unwrap())
+            .collect();
+        let query = SearchQuery::from_terms(terms).unwrap();
+        let options = SearchOptions {
+            scoring: ScoringModel::QuantizedBm25 {
+                bits: 32,
+                max_impact: f64::MAX,
+            },
+            ..SearchOptions::default()
+        };
+        assert!(
+            index
+                .search(&query, options)
+                .unwrap_err()
+                .to_string()
+                .contains("4096 unique")
+        );
+        let boosted =
+            SearchQuery::from_terms(vec![QueryTerm::new("x", None, f64::MAX).unwrap()]).unwrap();
+        assert!(
+            index
+                .search(&boosted, options)
+                .unwrap_err()
+                .to_string()
+                .contains("not finite")
+        );
+    }
 
     #[test]
     fn qld_matches_independent_log_oracles_and_zero_clamp() {

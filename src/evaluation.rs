@@ -130,7 +130,11 @@ pub fn evaluate_batch<B: RetrievalBackend + ?Sized>(
         scoring: config.scoring,
     }
     .validate()?;
-    if config.scoring != ScoringModel::Bm25 && config.verify_exact {
+    if !matches!(
+        config.scoring,
+        ScoringModel::Bm25 | ScoringModel::QuantizedBm25 { .. }
+    ) && config.verify_exact
+    {
         return Err(Error::InvalidArgument(
             "DPH, PL2, and QLD cannot use --verify until another exact executor is available"
                 .into(),
@@ -252,6 +256,11 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
     writeln!(writer, "  \"schema_version\": {schema_version},")?;
     match report.config.scoring {
         ScoringModel::Bm25 => {}
+        ScoringModel::QuantizedBm25 { bits, max_impact } => {
+            writeln!(writer, "  \"scorer\": \"qbm25\",")?;
+            writeln!(writer, "  \"quant_bits\": {bits},")?;
+            writeln!(writer, "  \"quant_max\": {max_impact},")?;
+        }
         ScoringModel::Dph => writeln!(writer, "  \"scorer\": \"dph\",")?,
         ScoringModel::Pl2 { c } => {
             writeln!(writer, "  \"scorer\": \"pl2\",")?;
@@ -493,7 +502,11 @@ fn validate_finite_report(report: &BatchReport) -> Result<()> {
         scoring: report.config.scoring,
     }
     .validate()?;
-    if report.config.scoring != ScoringModel::Bm25 && report.config.verify_exact {
+    if !matches!(
+        report.config.scoring,
+        ScoringModel::Bm25 | ScoringModel::QuantizedBm25 { .. }
+    ) && report.config.verify_exact
+    {
         return Err(Error::InvalidArgument(
             "DPH, PL2, and QLD cannot report exact cross-executor verification".into(),
         ));

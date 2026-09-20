@@ -1152,6 +1152,70 @@ mod tests {
     }
 
     #[test]
+    fn quantized_bm25_shards_and_persistence_match_native_for_every_executor() {
+        let mut native = IndexBuilder::new(Analyzer::default());
+        let mut shards = ShardedIndexBuilder::new(Analyzer::default(), 3).unwrap();
+        for (id, title, body) in [
+            ("d0", "x y", "x x"),
+            ("d1", "x", "y y"),
+            ("d2", "y", "x"),
+            ("d3", "x y", "x x"),
+            ("d4", "z", "x y"),
+            ("d5", "x", "z"),
+        ] {
+            let document = Document::from_fields(id, [("title", title), ("body", body)]).unwrap();
+            native.add_document(document.clone()).unwrap();
+            shards.add_document(document).unwrap();
+        }
+        let native = native.finish();
+        let shards = shards.finish();
+        let mut encoded = Vec::new();
+        shards.write_to(&mut encoded).unwrap();
+        let restored = ShardedIndex::read_from(Cursor::new(encoded)).unwrap();
+        for query in [
+            SearchQuery::from_text(native.analyzer(), "x y", None).unwrap(),
+            SearchQuery::from_text(native.analyzer(), "x y", Some("body")).unwrap(),
+            SearchQuery::from_text(native.analyzer(), "x y", None)
+                .unwrap()
+                .with_operator(BooleanOperator::And),
+            SearchQuery::from_text(native.analyzer(), "x y", None)
+                .unwrap()
+                .with_filter(FieldFilter::exact("title", "x y").unwrap()),
+            SearchQuery::from_text(native.analyzer(), "x", None)
+                .unwrap()
+                .with_phrase(
+                    PhraseFilter::from_text(native.analyzer(), "x y", Some("title".into()))
+                        .unwrap(),
+                ),
+        ] {
+            for top_k in [1, 2, 6, 10] {
+                for pruning in [
+                    PruningStrategy::Exhaustive,
+                    PruningStrategy::Wand,
+                    PruningStrategy::BlockMaxWand,
+                    PruningStrategy::MaxScore,
+                ] {
+                    let options = SearchOptions {
+                        top_k,
+                        pruning,
+                        scoring: crate::search::ScoringModel::QuantizedBm25 {
+                            bits: 8,
+                            max_impact: 3.0,
+                        },
+                        ..SearchOptions::default()
+                    };
+                    let expected = native.search(&query, options).unwrap();
+                    assert_eq!(shards.search(&query, options).unwrap().hits, expected.hits);
+                    assert_eq!(
+                        restored.search(&query, options).unwrap().hits,
+                        expected.hits
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn maximum_cutoff_never_preallocates_from_untrusted_input() {
         let (monolithic, sharded) = indexes(1, MAX_SHARDS);
         let query = SearchQuery::from_text(monolithic.analyzer(), "common", None).unwrap();

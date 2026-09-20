@@ -6,6 +6,14 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 _No changes yet._
 
+## [0.12.0] - 2026-09-20
+
+- Added opt-in PISA-style linear quantization for native and sharded BM25
+  retrieval (2–32 bits, caller-declared positive finite index-wide maximum),
+  exact integer score/tie semantics, safe WAND/block-max/MaxScore bounds,
+  CLI/batch verification, and fail-closed out-of-range checks. Quantized
+  explanations and CIFF retrieval remain outside this slice.
+
 ## [0.11.0] - 2026-09-19
 
 - Added native and sharded QLD Dirichlet term impacts with a bounded positive

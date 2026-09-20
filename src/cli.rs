@@ -58,7 +58,9 @@ SEARCH OPTIONS:\n\
   --top-k N                Number of hits (default: 10)\n\
   --strategy wand|block-max-wand|maxscore|full\n\
                             Exact WAND, block-max WAND, MaxScore, or exhaustive evaluation\n\
-  --scorer bm25|dph|pl2|qld  Term-impact model (default: bm25; non-BM25 requires full)\n\
+  --scorer bm25|qbm25|dph|pl2|qld  Term-impact model (default: bm25)\n\
+  --quant-bits N           qbm25 bit width, 2..32 (required with --scorer qbm25)\n\
+  --quant-max NUMBER       Index-wide maximum merged term impact; positive finite (required)\n\
   --pl2-c NUMBER           PL2 normalization c (default: 1; positive and finite)\n\
   --qld-mu NUMBER          QLD Dirichlet smoothing mu (default: 1000; positive and finite)\n\
   --k1 NUMBER --b NUMBER   BM25 parameters\n\
@@ -890,6 +892,8 @@ fn parse_search_arguments(arguments: &[String]) -> Result<ParsedOptions> {
             "--scorer",
             "--pl2-c",
             "--qld-mu",
+            "--quant-bits",
+            "--quant-max",
             "--k1",
             "--b",
         ],
@@ -932,14 +936,19 @@ fn build_search_request(
     let k1 = parse_optional(parsed.optional_one("--k1")?, 1.2_f64, "k1")?;
     let b = parse_optional(parsed.optional_one("--b")?, 0.75_f64, "b")?;
     let scoring = parse_native_scoring(parsed)?;
-    if scoring != ScoringModel::Bm25
-        && (parsed.optional_one("--k1")?.is_some() || parsed.optional_one("--b")?.is_some())
+    if !matches!(
+        scoring,
+        ScoringModel::Bm25 | ScoringModel::QuantizedBm25 { .. }
+    ) && (parsed.optional_one("--k1")?.is_some() || parsed.optional_one("--b")?.is_some())
     {
         return Err(Error::InvalidArgument(
             "--k1 and --b apply to BM25, not DPH, PL2, or QLD".into(),
         ));
     }
-    let default_strategy = if scoring == ScoringModel::Bm25 {
+    let default_strategy = if matches!(
+        scoring,
+        ScoringModel::Bm25 | ScoringModel::QuantizedBm25 { .. }
+    ) {
         "wand"
     } else {
         "full"
@@ -995,7 +1004,7 @@ fn write_search_output<'a>(
         if let Some(explanation) = &hit.explanation {
             for term in &explanation.terms {
                 match scoring {
-                    ScoringModel::Bm25 => writeln!(
+                    ScoringModel::Bm25 | ScoringModel::QuantizedBm25 { .. } => writeln!(
                         output,
                         "  term={} field={} tf={} df={} len={} avg_len={:.3} idf={:.6} boost={:.3} score={:.6}",
                         term.term,
@@ -1052,6 +1061,9 @@ fn write_search_output<'a>(
     )?;
     match scoring {
         ScoringModel::Bm25 => {}
+        ScoringModel::QuantizedBm25 { bits, max_impact } => {
+            writeln!(output, "scorer=qbm25 bits={bits} max_impact={max_impact}")?;
+        }
         ScoringModel::Dph => writeln!(output, "scorer=dph")?,
         ScoringModel::Pl2 { c } => writeln!(output, "scorer=pl2 c={c}")?,
         ScoringModel::Qld { mu } => writeln!(output, "scorer=qld mu={mu}")?,
@@ -1088,6 +1100,8 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
             "--scorer",
             "--pl2-c",
             "--qld-mu",
+            "--quant-bits",
+            "--quant-max",
             "--k1",
             "--b",
         ],
@@ -1119,14 +1133,19 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
         }
     };
     let scoring = parse_native_scoring(&parsed)?;
-    if scoring != ScoringModel::Bm25
-        && (parsed.optional_one("--k1")?.is_some() || parsed.optional_one("--b")?.is_some())
+    if !matches!(
+        scoring,
+        ScoringModel::Bm25 | ScoringModel::QuantizedBm25 { .. }
+    ) && (parsed.optional_one("--k1")?.is_some() || parsed.optional_one("--b")?.is_some())
     {
         return Err(Error::InvalidArgument(
             "--k1 and --b apply to BM25, not DPH, PL2, or QLD".into(),
         ));
     }
-    let default_strategy = if scoring == ScoringModel::Bm25 {
+    let default_strategy = if matches!(
+        scoring,
+        ScoringModel::Bm25 | ScoringModel::QuantizedBm25 { .. }
+    ) {
         "wand"
     } else {
         "full"
@@ -1443,8 +1462,7 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
     )?;
     if parse_scoring(parsed.optional_one("--scorer")?)? != ScoringModel::Bm25 {
         return Err(Error::InvalidArgument(
-            "the pruning benchmark currently supports BM25 only; DPH/PL2/QLD have no certified pruning bounds"
-                .into(),
+            "the pruning benchmark currently supports unquantized BM25 only".into(),
         ));
     }
     let config = BenchmarkConfig {
@@ -1592,17 +1610,43 @@ fn parse_operator(value: Option<&str>) -> Result<BooleanOperator> {
 fn parse_scoring(value: Option<&str>) -> Result<ScoringModel> {
     match value.unwrap_or("bm25") {
         "bm25" => Ok(ScoringModel::Bm25),
+        "qbm25" => Ok(ScoringModel::QuantizedBm25 {
+            bits: 8,
+            max_impact: 1.0,
+        }),
         "dph" => Ok(ScoringModel::Dph),
         "pl2" => Ok(ScoringModel::Pl2 { c: 1.0 }),
         "qld" => Ok(ScoringModel::Qld { mu: 1000.0 }),
         value => Err(Error::InvalidArgument(format!(
-            "unknown scorer '{value}', expected bm25, dph, pl2, or qld"
+            "unknown scorer '{value}', expected bm25, qbm25, dph, pl2, or qld"
         ))),
     }
 }
 
 fn parse_native_scoring(parsed: &ParsedOptions) -> Result<ScoringModel> {
     let scoring = parse_scoring(parsed.optional_one("--scorer")?)?;
+    let quant_bits = parsed.optional_one("--quant-bits")?;
+    let quant_max = parsed.optional_one("--quant-max")?;
+    if matches!(scoring, ScoringModel::QuantizedBm25 { .. }) {
+        if parsed.optional_one("--pl2-c")?.is_some() || parsed.optional_one("--qld-mu")?.is_some() {
+            return Err(Error::InvalidArgument(
+                "--pl2-c and --qld-mu do not apply to qbm25".into(),
+            ));
+        }
+        let bits = quant_bits
+            .ok_or_else(|| Error::InvalidArgument("--scorer qbm25 requires --quant-bits".into()))?;
+        let max_impact = quant_max
+            .ok_or_else(|| Error::InvalidArgument("--scorer qbm25 requires --quant-max".into()))?;
+        return Ok(ScoringModel::QuantizedBm25 {
+            bits: parse_optional(Some(bits), 8_u8, "quant-bits")?,
+            max_impact: parse_optional(Some(max_impact), 1.0_f64, "quant-max")?,
+        });
+    }
+    if quant_bits.is_some() || quant_max.is_some() {
+        return Err(Error::InvalidArgument(
+            "--quant-bits and --quant-max require --scorer qbm25".into(),
+        ));
+    }
     match (
         scoring,
         parsed.optional_one("--pl2-c")?,
@@ -1796,6 +1840,216 @@ mod tests {
             String::from_utf8(output).unwrap(),
             format!("indexsail {}\n", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn quantized_bm25_cli_search_shard_and_atomic_batch() {
+        let corpus = temp_path("quant.tsv");
+        let native = temp_path("quant.idx");
+        let corrupt = temp_path("quant.corrupt.idx");
+        let shards = temp_path("quant.shards.idx");
+        let topics = temp_path("quant.topics");
+        let run = temp_path("quant.run");
+        let report = temp_path("quant.json");
+        std::fs::write(
+            &corpus,
+            "id\ttitle\tbody\nD0\tx\tx y\nD1\ty\tx x\nD2\tx\ty\n",
+        )
+        .unwrap();
+        std::fs::write(&topics, "1\tx y\n").unwrap();
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        execute(
+            [
+                "shard-index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                shards.to_str().unwrap(),
+                "--shards",
+                "2",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let flags = [
+            "--query",
+            "x y",
+            "--scorer",
+            "qbm25",
+            "--quant-bits",
+            "8",
+            "--quant-max",
+            "3",
+            "--strategy",
+            "maxscore",
+        ];
+        let mut native_output = Vec::new();
+        let mut native_args = vec!["search", "--index", native.to_str().unwrap()];
+        native_args.extend(flags);
+        execute(native_args, &mut native_output).unwrap();
+        let mut shard_output = Vec::new();
+        let mut shard_args = vec!["shard-search", "--index", shards.to_str().unwrap()];
+        shard_args.extend(flags);
+        execute(shard_args, &mut shard_output).unwrap();
+        let text = String::from_utf8(native_output).unwrap();
+        assert!(text.contains("scorer=qbm25 bits=8 max_impact=3"));
+        assert!(text.contains("strategy=MaxScore"));
+        assert!(
+            String::from_utf8(shard_output)
+                .unwrap()
+                .contains("scorer=qbm25 bits=8 max_impact=3")
+        );
+        execute(
+            [
+                "batch",
+                "--index",
+                native.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--report",
+                report.to_str().unwrap(),
+                "--scorer",
+                "qbm25",
+                "--quant-bits",
+                "8",
+                "--quant-max",
+                "3",
+                "--strategy",
+                "wand",
+                "--verify",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let report_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(report_json["schema_version"], 2);
+        assert_eq!(report_json["scorer"], "qbm25");
+        assert_eq!(report_json["quant_bits"], 8);
+        assert_eq!(report_json["quant_max"], 3.0);
+        assert_eq!(report_json["verified_exact"], true);
+        let prior_run = std::fs::read(&run).unwrap();
+        let prior_report = std::fs::read(&report).unwrap();
+        for extra in [
+            vec!["--quant-bits", "1", "--quant-max", "3"],
+            vec!["--quant-bits", "33", "--quant-max", "3"],
+            vec!["--quant-bits", "8", "--quant-max", "0"],
+            vec!["--quant-bits", "8", "--quant-max", "NaN"],
+            vec!["--quant-bits", "8", "--quant-max", "0.001"],
+            vec!["--quant-bits", "8", "--quant-max", "3", "--pl2-c", "1"],
+        ] {
+            let mut args = vec![
+                "batch",
+                "--index",
+                native.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--report",
+                report.to_str().unwrap(),
+                "--scorer",
+                "qbm25",
+            ];
+            args.extend(extra);
+            assert!(execute(args, Vec::new()).is_err());
+            assert_eq!(std::fs::read(&run).unwrap(), prior_run);
+            assert_eq!(std::fs::read(&report).unwrap(), prior_report);
+        }
+        for missing in [vec!["--quant-bits", "8"], vec!["--quant-max", "3"]] {
+            let mut args = vec![
+                "search",
+                "--index",
+                native.to_str().unwrap(),
+                "--query",
+                "x",
+                "--scorer",
+                "qbm25",
+            ];
+            args.extend(missing);
+            assert!(execute(args, Vec::new()).is_err());
+        }
+        assert!(
+            execute(
+                [
+                    "search",
+                    "--index",
+                    native.to_str().unwrap(),
+                    "--query",
+                    "x",
+                    "--quant-bits",
+                    "8"
+                ],
+                Vec::new()
+            )
+            .is_err()
+        );
+        assert!(
+            execute(
+                [
+                    "search",
+                    "--index",
+                    native.to_str().unwrap(),
+                    "--query",
+                    "x",
+                    "--scorer",
+                    "qbm25",
+                    "--quant-bits",
+                    "8",
+                    "--quant-max",
+                    "3",
+                    "--explain"
+                ],
+                Vec::new()
+            )
+            .is_err()
+        );
+        assert!(
+            execute(["benchmark", "--scorer", "qbm25"], Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("unquantized BM25 only")
+        );
+        let mut corrupted = std::fs::read(&native).unwrap();
+        let middle = corrupted.len() / 2;
+        corrupted[middle] ^= 1;
+        std::fs::write(&corrupt, corrupted).unwrap();
+        let mut output = Vec::new();
+        let error = execute(
+            [
+                "search",
+                "--index",
+                corrupt.to_str().unwrap(),
+                "--query",
+                "x",
+                "--scorer",
+                "qbm25",
+                "--quant-bits",
+                "8",
+                "--quant-max",
+                "3",
+            ],
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+        assert!(output.is_empty());
+        for path in [&corpus, &native, &corrupt, &shards, &topics, &run, &report] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
