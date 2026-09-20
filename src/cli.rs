@@ -2090,6 +2090,136 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn unjudged_batches_write_only_runs_and_do_not_report_metrics() {
+        let corpus = temp_path("unjudged.tsv");
+        let native = temp_path("unjudged.idx");
+        let ciff = temp_path("unjudged.ciff");
+        let topics = temp_path("unjudged.topics");
+        let native_run = temp_path("unjudged-native.run");
+        let ciff_run = temp_path("unjudged-ciff.run");
+        let ascii_run = temp_path("unjudged-ascii.run");
+        std::fs::write(&corpus, "id\tbody\nD1\tcafé search\nD2\tlocal search\n").unwrap();
+        std::fs::write(&topics, "1\tcafé\n").unwrap();
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        execute(
+            [
+                "ciff-export",
+                "--index",
+                native.to_str().unwrap(),
+                "--output",
+                ciff.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let mut native_output = Vec::new();
+        execute(
+            [
+                "batch",
+                "--index",
+                native.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                native_run.to_str().unwrap(),
+                "--tag",
+                "unjudged-native",
+            ],
+            &mut native_output,
+        )
+        .unwrap();
+        let native_output = String::from_utf8(native_output).unwrap();
+        assert!(native_output.contains("topics=1 hits=1"));
+        assert!(!native_output.contains("metrics map="));
+        assert!(!native_output.contains("report="));
+        assert!(
+            std::fs::read_to_string(&native_run)
+                .unwrap()
+                .contains("1 Q0 D1 1")
+        );
+
+        let mut ciff_output = Vec::new();
+        execute(
+            [
+                "ciff-batch",
+                "--index",
+                ciff.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                ciff_run.to_str().unwrap(),
+                "--tag",
+                "unjudged-ciff",
+            ],
+            &mut ciff_output,
+        )
+        .unwrap();
+        let ciff_output = String::from_utf8(ciff_output).unwrap();
+        assert!(ciff_output.contains("topics=1 hits=1"));
+        assert!(!ciff_output.contains("metrics map="));
+        assert!(!ciff_output.contains("report="));
+        assert!(
+            std::fs::read_to_string(&ciff_run)
+                .unwrap()
+                .contains("1 Q0 D1 1")
+        );
+
+        let mut ascii_batch_output = Vec::new();
+        execute(
+            [
+                "ciff-batch",
+                "--index",
+                ciff.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                ascii_run.to_str().unwrap(),
+                "--ascii",
+            ],
+            &mut ascii_batch_output,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(ascii_batch_output)
+                .unwrap()
+                .contains("topics=1 hits=0")
+        );
+        assert_eq!(std::fs::read(&ascii_run).unwrap(), b"");
+
+        let mut ascii_output = Vec::new();
+        execute(
+            [
+                "ciff-search",
+                "--index",
+                ciff.to_str().unwrap(),
+                "--query",
+                "café",
+                "--ascii",
+            ],
+            &mut ascii_output,
+        )
+        .unwrap();
+        assert!(!String::from_utf8(ascii_output).unwrap().contains("\tD1\n"));
+        for path in [
+            corpus, native, ciff, topics, native_run, ciff_run, ascii_run,
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn ciff_export_search_inspect_and_trec_batch_form_an_end_to_end_flow() {
         let corpus = temp_path("ciff.tsv");
         let native = temp_path("ciff.idx");
@@ -2454,6 +2584,30 @@ mod tests {
         assert!(text.contains("\"verified_exact\": true"));
         assert!(text.contains("\"checksum\""));
         std::fs::remove_file(report).unwrap();
+    }
+
+    #[test]
+    fn benchmark_without_json_reports_verified_measurements_to_stdout_only() {
+        let mut output = Vec::new();
+        execute(
+            [
+                "benchmark",
+                "--documents",
+                "20",
+                "--queries",
+                "2",
+                "--top-k",
+                "2",
+                "--seed",
+                "7",
+            ],
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("config documents=20 queries=2 top_k=2"));
+        assert!(output.contains("verified=true checksum="));
+        assert!(!output.contains("report="));
     }
 
     #[test]
