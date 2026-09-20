@@ -772,7 +772,10 @@ mod tests {
         assert_eq!(index.postings("body", "missing"), None);
         assert_eq!(index.document_frequency("body", "missing"), 0);
         assert_eq!(index.field_length(u32::MAX, "body"), 0);
-        assert_eq!(index.average_field_length("body"), 0.0);
+        assert_eq!(
+            index.average_field_length("body").to_bits(),
+            0.0_f64.to_bits()
+        );
         assert_eq!(index.stats().tokens, 0);
         assert_eq!(index.posting_codec_stats().unwrap().posting_lists, 0);
     }
