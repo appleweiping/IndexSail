@@ -87,6 +87,10 @@ pub enum PruningStrategy {
     /// of algorithm as PISA's `MaxScore` executor, while retaining `IndexSail`'s
     /// deterministic tie-breaking and post-filter semantics.
     MaxScore,
+    /// `MaxScore`'s essential suffix with conservative current-block bounds for
+    /// the non-essential prefix. A candidate is rejected only when even its
+    /// rounded-up possible score is strictly below the top-k threshold.
+    BlockMaxMaxScore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -243,6 +247,8 @@ pub struct SearchHit {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SearchStats {
     pub evaluated_candidates: usize,
+    /// Essential-list candidates rejected by a current-block score bound.
+    pub block_bound_rejections: usize,
     pub postings_advanced: usize,
     pub postings_skipped: usize,
     /// Precomputed default-BM25 block bounds loaded into query scorers.
@@ -629,6 +635,9 @@ impl InvertedIndex {
                 "quantized BM25 supports at most 4096 unique query terms".into(),
             ));
         }
+        let load_block_max = options.pruning == PruningStrategy::BlockMaxWand
+            || (options.pruning == PruningStrategy::BlockMaxMaxScore
+                && query.operator() == BooleanOperator::Or);
         let mut scorers = prepared_terms
             .iter()
             .enumerate()
@@ -638,30 +647,12 @@ impl InvertedIndex {
                     term,
                     options.scoring,
                     options.bm25,
-                    options.pruning == PruningStrategy::BlockMaxWand,
+                    load_block_max,
                     statistics,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let block_max_bounds_loaded = scorers
-            .iter()
-            .map(|scorer| scorer.precomputed_block_bounds_loaded)
-            .sum();
-        let block_max_postings_covered = scorers
-            .iter()
-            .filter(|scorer| scorer.precomputed_block_bounds_loaded > 0)
-            .map(|scorer| scorer.entries.len())
-            .sum();
-        let block_max_postings_scanned = scorers
-            .iter()
-            .map(|scorer| scorer.postings_scanned_for_block_bounds)
-            .sum();
-        let preparation_stats = SearchStats {
-            block_max_bounds_loaded,
-            block_max_postings_covered,
-            block_max_postings_scanned,
-            ..SearchStats::default()
-        };
+        let preparation_stats = bound_preparation_stats(&scorers);
 
         if query.operator() == BooleanOperator::And
             && scorers.iter().any(|scorer| scorer.entries.is_empty())
@@ -691,7 +682,12 @@ impl InvertedIndex {
             PruningStrategy::BlockMaxWand => {
                 Ok(self.search_wand(query, scorers, options.top_k, true))
             }
-            PruningStrategy::MaxScore => self.search_max_score(query, scorers, options.top_k),
+            PruningStrategy::MaxScore => {
+                self.search_max_score(query, scorers, options.top_k, false)
+            }
+            PruningStrategy::BlockMaxMaxScore => {
+                self.search_max_score(query, scorers, options.top_k, true)
+            }
         }?;
         stats.block_max_bounds_loaded = preparation_stats.block_max_bounds_loaded;
         stats.block_max_postings_covered = preparation_stats.block_max_postings_covered;
@@ -1081,8 +1077,9 @@ impl InvertedIndex {
     /// `MaxScore`'s essential-list traversal for disjunctive queries.
     ///
     /// The low-bound terms are deliberately excluded only from candidate
-    /// generation.  Every candidate is still scored with every term, so the
-    /// returned ranking is bit-identical to the exhaustive oracle.  For
+    /// generation. Accepted candidates are scored with every term in original
+    /// query order. The block-max variant can reject a candidate using a
+    /// conservative current-block bound, preserving exact top-k ranking. For
     /// conjunctive queries the intersection walk in `search_exhaustive` is
     /// already the most direct exact executor; delegating there preserves the
     /// Boolean semantics instead of applying an OR-oriented optimization.
@@ -1091,6 +1088,7 @@ impl InvertedIndex {
         query: &SearchQuery,
         scorers: Vec<TermScorer>,
         top_k: usize,
+        use_block_max: bool,
     ) -> Result<(TopK, SearchStats)> {
         if query.operator() == BooleanOperator::And {
             return self.search_exhaustive(query, &scorers, top_k);
@@ -1165,6 +1163,21 @@ impl InvertedIndex {
                     stats.postings_advanced += advanced;
                     stats.postings_skipped += advanced.saturating_sub(1);
                 }
+            }
+
+            if use_block_max
+                && essential_start > 0
+                && heap.threshold().is_some_and(|threshold| {
+                    reject_with_block_bound(
+                        &mut cursors,
+                        essential_start,
+                        candidate_doc,
+                        threshold,
+                        &mut stats,
+                    )
+                })
+            {
+                continue;
             }
 
             stats.evaluated_candidates += 1;
@@ -1331,6 +1344,59 @@ impl InvertedIndex {
             phrase_filters_matched: query.phrases().len(),
             exact_filters_matched: query.filters().len(),
         }
+    }
+}
+
+/// Reject only when an outward-rounded current-block bound is *strictly*
+/// below the heap threshold. Equal scores may win by lower document ID.
+fn reject_with_block_bound(
+    cursors: &mut [Cursor],
+    essential_start: usize,
+    candidate_doc: InternalDocId,
+    threshold: f64,
+    stats: &mut SearchStats,
+) -> bool {
+    // Every BM25/quantized impact is nonnegative. Prefix cursors have already
+    // advanced to candidate_doc; a later cursor cannot contribute to it.
+    let mut possible = 0.0;
+    for (index, cursor) in cursors.iter().enumerate() {
+        if !cursor.exhausted() && cursor.current_doc() == candidate_doc {
+            let bound = if index < essential_start {
+                cursor.block_max()
+            } else {
+                cursor.current_score()
+            };
+            possible = conservative_next_up(possible + bound);
+        }
+    }
+    if possible >= threshold {
+        return false;
+    }
+    stats.block_bound_rejections += 1;
+    for cursor in cursors {
+        if !cursor.exhausted() && cursor.current_doc() == candidate_doc {
+            stats.postings_advanced += cursor.advance_one();
+        }
+    }
+    true
+}
+
+fn bound_preparation_stats(scorers: &[TermScorer]) -> SearchStats {
+    SearchStats {
+        block_max_bounds_loaded: scorers
+            .iter()
+            .map(|scorer| scorer.precomputed_block_bounds_loaded)
+            .sum(),
+        block_max_postings_covered: scorers
+            .iter()
+            .filter(|scorer| scorer.precomputed_block_bounds_loaded > 0)
+            .map(|scorer| scorer.entries.len())
+            .sum(),
+        block_max_postings_scanned: scorers
+            .iter()
+            .map(|scorer| scorer.postings_scanned_for_block_bounds)
+            .sum(),
+        ..SearchStats::default()
     }
 }
 
@@ -2890,6 +2956,206 @@ mod tests {
     }
 
     #[test]
+    fn block_max_maxscore_matches_a_raw_document_bm25_oracle() {
+        fn tiny_count(value: usize) -> f64 {
+            f64::from(u32::try_from(value).unwrap())
+        }
+
+        let bodies = [
+            "alpha alpha beta",
+            "alpha beta beta",
+            "beta beta",
+            "alpha",
+            "gamma",
+        ];
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for (id, body) in bodies.iter().enumerate() {
+            builder
+                .add_document(Document::from_fields(format!("d{id}"), [("body", *body)]).unwrap())
+                .unwrap();
+        }
+        let index = builder.finish();
+        let query = SearchQuery::from_terms(vec![
+            QueryTerm::new("alpha", Some("body".into()), 1.0).unwrap(),
+            QueryTerm::new("beta", Some("body".into()), 1.0).unwrap(),
+        ])
+        .unwrap();
+        let average_length = bodies
+            .iter()
+            .map(|body| tiny_count(body.split_whitespace().count()))
+            .sum::<f64>()
+            / tiny_count(bodies.len());
+        for scoring in [
+            ScoringModel::Bm25,
+            ScoringModel::QuantizedBm25 {
+                bits: 4,
+                max_impact: 2.0,
+            },
+        ] {
+            let mut expected = Vec::new();
+            for (id, body) in bodies.iter().enumerate() {
+                let words = body.split_whitespace().collect::<Vec<_>>();
+                let mut score = 0.0;
+                for term in ["alpha", "beta"] {
+                    let frequency = tiny_count(words.iter().filter(|word| **word == term).count());
+                    if frequency == 0.0 {
+                        continue;
+                    }
+                    let document_frequency = bodies
+                        .iter()
+                        .filter(|text| text.split_whitespace().any(|word| word == term))
+                        .count();
+                    let document_frequency = tiny_count(document_frequency);
+                    let idf = (1.0
+                        + (tiny_count(bodies.len()) - document_frequency + 0.5)
+                            / (document_frequency + 0.5))
+                        .ln();
+                    let impact = idf * (frequency * 2.2)
+                        / (frequency
+                            + 1.2 * (0.25 + 0.75 * tiny_count(words.len()) / average_length));
+                    score += if scoring == ScoringModel::Bm25 {
+                        impact
+                    } else {
+                        ((impact / 2.0) * 14.0).floor() + 1.0
+                    };
+                }
+                if score > 0.0 {
+                    expected.push((u32::try_from(id).unwrap(), score));
+                }
+            }
+            expected.sort_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            let options = SearchOptions {
+                top_k: 3,
+                pruning: PruningStrategy::BlockMaxMaxScore,
+                scoring,
+                ..SearchOptions::default()
+            };
+            let actual = index.search(&query, options).unwrap();
+            let exhaustive = index
+                .search(
+                    &query,
+                    SearchOptions {
+                        pruning: PruningStrategy::Exhaustive,
+                        ..options
+                    },
+                )
+                .unwrap();
+            assert_same_ranking(&actual, &exhaustive, "raw document oracle");
+            for (actual, (id, expected_score)) in actual.hits.iter().zip(expected.iter().take(3)) {
+                assert_eq!(actual.doc_id, *id);
+                assert!((actual.score - expected_score).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn block_max_maxscore_is_bit_exact_and_rejects_real_candidates() {
+        let index = block_index(1_500);
+        let mut rejected = 0;
+        for text in [
+            "common mid rare",
+            "common mid rare filler padding",
+            "common absent",
+        ] {
+            for top_k in [1, 3, 10, 1_600] {
+                let query = SearchQuery::from_text(index.analyzer(), text, None).unwrap();
+                let exhaustive = search_with(&index, &query, PruningStrategy::Exhaustive, top_k);
+                let block = search_with(&index, &query, PruningStrategy::BlockMaxMaxScore, top_k);
+                assert_same_ranking(&exhaustive, &block, text);
+                rejected += block.stats.block_bound_rejections;
+            }
+        }
+        assert!(
+            rejected > 0,
+            "current-block bound never rejected a candidate"
+        );
+    }
+
+    #[test]
+    fn block_max_maxscore_preserves_constraints_ties_and_and_fallback() {
+        let index = block_index(400);
+        let base = SearchQuery::from_text(index.analyzer(), "common mid rare", None).unwrap();
+        let filtered = base
+            .clone()
+            .with_filter(FieldFilter::exact("category", "even").unwrap());
+        let phrased = base
+            .clone()
+            .with_phrase(PhraseFilter::from_text(index.analyzer(), "common common", None).unwrap());
+        for query in [base, filtered, phrased] {
+            for operator in [BooleanOperator::Or, BooleanOperator::And] {
+                let query = query.clone().with_operator(operator);
+                let expected = search_with(&index, &query, PruningStrategy::Exhaustive, 10);
+                let actual = search_with(&index, &query, PruningStrategy::BlockMaxMaxScore, 10);
+                assert_same_ranking(&expected, &actual, "constraints and Boolean operator");
+                if operator == BooleanOperator::And {
+                    assert_eq!(actual.stats.block_bound_rejections, 0);
+                    assert_eq!(actual.stats.block_max_bounds_loaded, 0);
+                }
+            }
+        }
+
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for id in ["first", "second", "third"] {
+            builder
+                .add_document(Document::from_fields(id, [("body", "same")]).unwrap())
+                .unwrap();
+        }
+        let ties = builder.finish();
+        let query = SearchQuery::from_text(ties.analyzer(), "same", Some("body")).unwrap();
+        let expected = search_with(&ties, &query, PruningStrategy::Exhaustive, 2);
+        let actual = search_with(&ties, &query, PruningStrategy::BlockMaxMaxScore, 2);
+        assert_same_ranking(&expected, &actual, "ties");
+        assert_eq!(
+            actual.hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn block_max_maxscore_custom_bm25_and_quantized_are_exact() {
+        let index = block_index(500);
+        let query = SearchQuery::from_terms(vec![
+            QueryTerm::new("common", None, 1.5).unwrap(),
+            QueryTerm::new("mid", None, 0.5).unwrap(),
+            QueryTerm::new("rare", None, 2.0).unwrap(),
+        ])
+        .unwrap();
+        for scoring in [
+            ScoringModel::Bm25,
+            ScoringModel::QuantizedBm25 {
+                bits: 8,
+                max_impact: 64.0,
+            },
+        ] {
+            let options = SearchOptions {
+                top_k: 5,
+                pruning: PruningStrategy::BlockMaxMaxScore,
+                bm25: Bm25Params { k1: 2.1, b: 0.35 },
+                scoring,
+                ..SearchOptions::default()
+            };
+            let actual = index.search(&query, options).unwrap();
+            let expected = index
+                .search(
+                    &query,
+                    SearchOptions {
+                        pruning: PruningStrategy::Exhaustive,
+                        ..options
+                    },
+                )
+                .unwrap();
+            assert_same_ranking(&expected, &actual, "custom and quantized");
+            assert_eq!(actual.stats.block_max_bounds_loaded, 0);
+            assert!(actual.stats.block_max_postings_scanned > 0);
+        }
+    }
+
+    #[test]
     fn block_max_wand_stays_exact_with_filters_and_phrases() {
         let index = block_index(400);
         let base = SearchQuery::from_text(index.analyzer(), "common mid rare", None).unwrap();
@@ -3079,17 +3345,19 @@ mod tests {
         let exhaustive = index
             .search(&query, options(PruningStrategy::Exhaustive))
             .unwrap();
-        let block = index
-            .search(&query, options(PruningStrategy::BlockMaxWand))
-            .unwrap();
-
-        assert_same_ranking(
-            &exhaustive,
-            &block,
-            "extreme custom floating-point parameters",
-        );
-        assert_eq!(block.stats.block_max_bounds_loaded, 0);
-        assert!(block.stats.block_max_postings_scanned > 0);
+        for pruning in [
+            PruningStrategy::BlockMaxWand,
+            PruningStrategy::BlockMaxMaxScore,
+        ] {
+            let block = index.search(&query, options(pruning)).unwrap();
+            assert_same_ranking(
+                &exhaustive,
+                &block,
+                "extreme custom floating-point parameters",
+            );
+            assert_eq!(block.stats.block_max_bounds_loaded, 0);
+            assert!(block.stats.block_max_postings_scanned > 0);
+        }
     }
 
     #[test]

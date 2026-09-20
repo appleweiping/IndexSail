@@ -40,12 +40,14 @@ pub struct BenchmarkReport {
     pub wand_time: Duration,
     pub block_max_time: Duration,
     pub maxscore_time: Duration,
+    pub block_max_maxscore_time: Duration,
     pub sharded_build_time: Duration,
     pub sharded_time: Duration,
     pub exhaustive_stats: SearchStats,
     pub wand_stats: SearchStats,
     pub block_max_stats: SearchStats,
     pub maxscore_stats: SearchStats,
+    pub block_max_maxscore_stats: SearchStats,
     pub sharded_stats: SearchStats,
     pub checksum: u64,
     pub index_terms: usize,
@@ -205,6 +207,26 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
     }
     let maxscore_time = maxscore_started.elapsed();
 
+    let block_max_maxscore_started = Instant::now();
+    let mut block_max_maxscore_stats = SearchStats::default();
+    for (query, exhaustive) in queries.iter().zip(&exhaustive_results) {
+        let outcome = index.search(
+            query,
+            SearchOptions {
+                top_k: config.top_k,
+                pruning: PruningStrategy::BlockMaxMaxScore,
+                ..SearchOptions::default()
+            },
+        )?;
+        add_stats(&mut block_max_maxscore_stats, outcome.stats);
+        verify_same_rank_and_score(
+            &outcome.hits,
+            exhaustive,
+            "block-max MaxScore benchmark results differ from exhaustive results",
+        )?;
+    }
+    let block_max_maxscore_time = block_max_maxscore_started.elapsed();
+
     // A separate physical-shard pass uses one collection-wide statistics
     // snapshot. It is compared directly to the monolithic exhaustive oracle,
     // including every score bit and the original global document-id tie-break.
@@ -265,12 +287,14 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
         wand_time,
         block_max_time,
         maxscore_time,
+        block_max_maxscore_time,
         sharded_build_time,
         sharded_time,
         exhaustive_stats,
         wand_stats,
         block_max_stats,
         maxscore_stats,
+        block_max_maxscore_stats,
         sharded_stats,
         checksum,
         index_terms: stats.terms,
@@ -285,7 +309,7 @@ pub fn run(config: BenchmarkConfig) -> Result<BenchmarkReport> {
     })
 }
 
-/// The four benchmark executors share one bit-exact ranking contract. Keep
+/// Every benchmark executor shares one bit-exact ranking contract. Keep
 /// length, document ID, and score-bit checks together so a new executor
 /// cannot silently weaken one comparison while leaving the others intact.
 fn verify_same_rank_and_score(
@@ -307,7 +331,7 @@ fn verify_same_rank_and_score(
 /// machine-dependent; workload counters and checksum are deterministic.
 pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()> {
     writeln!(writer, "{{")?;
-    writeln!(writer, "  \"schema_version\": 5,")?;
+    writeln!(writer, "  \"schema_version\": 6,")?;
     writeln!(writer, "  \"verified_exact\": true,")?;
     writeln!(writer, "  \"documents\": {},", report.config.documents)?;
     writeln!(writer, "  \"queries\": {},", report.config.queries)?;
@@ -360,6 +384,11 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
         "  \"maxscore_elapsed_micros\": {},",
         report.maxscore_time.as_micros()
     )?;
+    writeln!(
+        writer,
+        "  \"block_max_maxscore_elapsed_micros\": {},",
+        report.block_max_maxscore_time.as_micros()
+    )?;
     write_sharded_json(report, &mut writer)?;
     writeln!(
         writer,
@@ -392,8 +421,24 @@ pub fn write_json(report: &BenchmarkReport, mut writer: impl Write) -> Result<()
         report.maxscore_stats.postings_advanced,
         report.maxscore_stats.postings_skipped
     )?;
+    write_block_max_maxscore_json(report, &mut writer)?;
     writeln!(writer, "  \"checksum\": \"{:016x}\"", report.checksum)?;
     writeln!(writer, "}}")?;
+    Ok(())
+}
+
+fn write_block_max_maxscore_json(report: &BenchmarkReport, writer: &mut impl Write) -> Result<()> {
+    writeln!(
+        writer,
+        "  \"block_max_maxscore\": {{\"evaluated\": {}, \"block_bound_rejections\": {}, \"advanced\": {}, \"skipped\": {}, \"precomputed_bounds_loaded\": {}, \"postings_covered_by_bounds\": {}, \"postings_scanned_for_bounds\": {}}},",
+        report.block_max_maxscore_stats.evaluated_candidates,
+        report.block_max_maxscore_stats.block_bound_rejections,
+        report.block_max_maxscore_stats.postings_advanced,
+        report.block_max_maxscore_stats.postings_skipped,
+        report.block_max_maxscore_stats.block_max_bounds_loaded,
+        report.block_max_maxscore_stats.block_max_postings_covered,
+        report.block_max_maxscore_stats.block_max_postings_scanned
+    )?;
     Ok(())
 }
 
@@ -424,6 +469,7 @@ fn write_sharded_json(report: &BenchmarkReport, writer: &mut impl Write) -> Resu
 
 fn add_stats(total: &mut SearchStats, current: SearchStats) {
     total.evaluated_candidates += current.evaluated_candidates;
+    total.block_bound_rejections += current.block_bound_rejections;
     total.postings_advanced += current.postings_advanced;
     total.postings_skipped += current.postings_skipped;
     total.block_max_bounds_loaded += current.block_max_bounds_loaded;
@@ -555,6 +601,8 @@ mod tests {
         );
         assert!(report.maxscore_stats.evaluated_candidates > 0);
         assert!(report.maxscore_stats.postings_advanced > 0);
+        assert!(report.block_max_maxscore_stats.evaluated_candidates > 0);
+        assert!(report.block_max_maxscore_stats.block_max_bounds_loaded > 0);
         assert!(
             report.maxscore_stats.evaluated_candidates
                 <= report.exhaustive_stats.evaluated_candidates
@@ -578,11 +626,13 @@ mod tests {
         let mut json = Vec::new();
         write_json(&report, &mut json).unwrap();
         let json = String::from_utf8(json).unwrap();
-        assert!(json.contains("\"schema_version\": 5"));
+        assert!(json.contains("\"schema_version\": 6"));
         assert!(json.contains("\"block_max_metadata_bytes\""));
         assert!(json.contains("\"precomputed_bounds_loaded\""));
         assert!(json.contains("\"postings_scanned_for_bounds\": 0"));
         assert!(json.contains("\"maxscore\""));
+        assert!(json.contains("\"block_max_maxscore\""));
+        assert!(json.contains("\"block_bound_rejections\""));
         assert!(json.contains("\"sharded_block_max_wand\""));
         assert!(json.contains("\"physical_shards\": 3"));
     }

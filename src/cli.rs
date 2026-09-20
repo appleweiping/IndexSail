@@ -59,8 +59,8 @@ SEARCH OPTIONS:\n\
   --phrase-field NAME      Restrict the phrase to one field\n\
   --filter NAME=VALUE      Require an exact stored field value; repeatable\n\
   --top-k N                Number of hits (default: 10)\n\
-  --strategy wand|block-max-wand|maxscore|full\n\
-                            Exact WAND, block-max WAND, MaxScore, or exhaustive evaluation\n\
+  --strategy wand|block-max-wand|maxscore|block-max-maxscore|full\n\
+                            Exact WAND, block-max WAND, MaxScore, block-max MaxScore, or exhaustive\n\
   --scorer bm25|qbm25|dph|pl2|qld  Term-impact model (default: bm25)\n\
   --quant-bits N           qbm25 bit width, 2..32 (required with --scorer qbm25)\n\
   --quant-max NUMBER       Index-wide maximum merged term impact; positive finite (required)\n\
@@ -973,10 +973,11 @@ fn build_search_request(
         "wand" => PruningStrategy::Wand,
         "block-max-wand" | "bmw" => PruningStrategy::BlockMaxWand,
         "maxscore" | "max-score" => PruningStrategy::MaxScore,
+        "block-max-maxscore" | "bmms" => PruningStrategy::BlockMaxMaxScore,
         "full" | "exhaustive" => PruningStrategy::Exhaustive,
         value => {
             return Err(Error::InvalidArgument(format!(
-                "unknown strategy '{value}', expected wand, block-max-wand, maxscore, or full"
+                "unknown strategy '{value}', expected wand, block-max-wand, maxscore, block-max-maxscore, or full"
             )));
         }
     };
@@ -1064,8 +1065,9 @@ fn write_search_output<'a>(
     }
     writeln!(
         output,
-        "strategy={pruning:?} evaluated={} advanced={} skipped={} block_max_bounds_loaded={} block_max_postings_covered={} block_max_postings_scanned={}",
+        "strategy={pruning:?} evaluated={} block_bound_rejections={} advanced={} skipped={} block_max_bounds_loaded={} block_max_postings_covered={} block_max_postings_scanned={}",
         outcome.stats.evaluated_candidates,
+        outcome.stats.block_bound_rejections,
         outcome.stats.postings_advanced,
         outcome.stats.postings_skipped,
         outcome.stats.block_max_bounds_loaded,
@@ -1170,10 +1172,11 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
         "wand" => PruningStrategy::Wand,
         "block-max-wand" | "bmw" => PruningStrategy::BlockMaxWand,
         "maxscore" | "max-score" => PruningStrategy::MaxScore,
+        "block-max-maxscore" | "bmms" => PruningStrategy::BlockMaxMaxScore,
         "full" | "exhaustive" => PruningStrategy::Exhaustive,
         value => {
             return Err(Error::InvalidArgument(format!(
-                "unknown strategy '{value}', expected wand, block-max-wand, maxscore, or full"
+                "unknown strategy '{value}', expected wand, block-max-wand, maxscore, block-max-maxscore, or full"
             )));
         }
     };
@@ -1238,13 +1241,14 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
         .sum::<usize>();
     writeln!(
         output,
-        "batch topics={} hits={} strategy={:?} verified={} elapsed_ms={:.3} evaluated={} advanced={} skipped={} block_max_bounds_loaded={} block_max_postings_covered={} block_max_postings_scanned={} run={}",
+        "batch topics={} hits={} strategy={:?} verified={} elapsed_ms={:.3} evaluated={} block_bound_rejections={} advanced={} skipped={} block_max_bounds_loaded={} block_max_postings_covered={} block_max_postings_scanned={} run={}",
         report.queries.len(),
         hit_count,
         report.config.pruning,
         report.config.verify_exact,
         report.total_search_time.as_secs_f64() * 1_000.0,
         report.total_stats.evaluated_candidates,
+        report.total_stats.block_bound_rejections,
         report.total_stats.postings_advanced,
         report.total_stats.postings_skipped,
         report.total_stats.block_max_bounds_loaded,
@@ -1574,6 +1578,17 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
     )?;
     writeln!(
         output,
+        "block-max-maxscore elapsed_ms={:.3} evaluated={} block_bound_rejections={} advanced={} skipped={} precomputed_bounds_loaded={} postings_scanned_for_bounds={}",
+        report.block_max_maxscore_time.as_secs_f64() * 1000.0,
+        report.block_max_maxscore_stats.evaluated_candidates,
+        report.block_max_maxscore_stats.block_bound_rejections,
+        report.block_max_maxscore_stats.postings_advanced,
+        report.block_max_maxscore_stats.postings_skipped,
+        report.block_max_maxscore_stats.block_max_bounds_loaded,
+        report.block_max_maxscore_stats.block_max_postings_scanned
+    )?;
+    writeln!(
+        output,
         "sharded-block-max-wand shards={} build_elapsed_ms={:.3} search_elapsed_ms={:.3} evaluated={} advanced={} skipped={} postings_scanned_for_bounds={} serialized_bytes={}",
         report.config.shards,
         report.sharded_build_time.as_secs_f64() * 1000.0,
@@ -1852,7 +1867,7 @@ mod tests {
         execute(Vec::<String>::new(), &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("indexsail search"));
-        assert!(output.contains("wand|block-max-wand|maxscore|full"));
+        assert!(output.contains("wand|block-max-wand|maxscore|block-max-maxscore|full"));
     }
 
     #[test]
@@ -1863,6 +1878,158 @@ mod tests {
             String::from_utf8(output).unwrap(),
             format!("indexsail {}\n", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    fn assert_bmms_batch(
+        command: &str,
+        index: &std::path::Path,
+        topics: &std::path::Path,
+        run: &std::path::Path,
+        report: &std::path::Path,
+    ) {
+        execute(
+            [
+                command,
+                "--index",
+                index.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--report",
+                report.to_str().unwrap(),
+                "--strategy",
+                "block-max-maxscore",
+                "--verify",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["strategy"], "block-max-maxscore");
+        assert_eq!(json["verified_exact"], true);
+        assert!(json["block_bound_rejections"].is_number());
+    }
+
+    fn assert_quantized_bmms_batch(
+        index: &std::path::Path,
+        topics: &std::path::Path,
+        run: &std::path::Path,
+        report: &std::path::Path,
+    ) {
+        execute(
+            [
+                "batch",
+                "--index",
+                index.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--report",
+                report.to_str().unwrap(),
+                "--scorer",
+                "qbm25",
+                "--quant-bits",
+                "8",
+                "--quant-max",
+                "64",
+                "--strategy",
+                "bmms",
+                "--verify",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let quantized: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        assert_eq!(quantized["schema_version"], 4);
+        assert_eq!(quantized["scorer"], "qbm25");
+        assert!(quantized["block_bound_rejections"].is_number());
+    }
+
+    #[test]
+    fn block_max_maxscore_cli_batch_and_shards_keep_exact_runs() {
+        let corpus = temp_path("block-max-maxscore.tsv");
+        let topics = temp_path("block-max-maxscore-topics.tsv");
+        let native = temp_path("block-max-maxscore.idx");
+        let shards = temp_path("block-max-maxscore-shards.idx");
+        let native_run = temp_path("block-max-maxscore.run");
+        let shard_run = temp_path("block-max-maxscore-shard.run");
+        let native_report = temp_path("block-max-maxscore.json");
+        let shard_report = temp_path("block-max-maxscore-shard.json");
+        std::fs::write(
+            &corpus,
+            "id\tbody\nD1\tlocal search ranking\nD2\tlocal search\nD3\tsearch ranking\nD4\tunrelated\n",
+        )
+        .unwrap();
+        std::fs::write(&topics, "1\tlocal search\n2\tsearch ranking\n").unwrap();
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        execute(
+            [
+                "shard-index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                shards.to_str().unwrap(),
+                "--shards",
+                "2",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        execute(
+            [
+                "search",
+                "--index",
+                native.to_str().unwrap(),
+                "--query",
+                "local search",
+                "--strategy",
+                "bmms",
+            ],
+            &mut output,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("strategy=BlockMaxMaxScore"));
+        assert!(output.contains("block_bound_rejections="));
+        for (command, index, run, report) in [
+            ("batch", &native, &native_run, &native_report),
+            ("shard-batch", &shards, &shard_run, &shard_report),
+        ] {
+            assert_bmms_batch(command, index, &topics, run, report);
+        }
+        assert_eq!(
+            std::fs::read(&native_run).unwrap(),
+            std::fs::read(&shard_run).unwrap()
+        );
+        assert_quantized_bmms_batch(&native, &topics, &native_run, &native_report);
+        for path in [
+            corpus,
+            topics,
+            native,
+            shards,
+            native_run,
+            shard_run,
+            native_report,
+            shard_report,
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
@@ -2656,7 +2823,7 @@ mod tests {
         assert_eq!(std::fs::read(&run).unwrap(), prior_run);
         assert_eq!(std::fs::read(&report).unwrap(), prior_report);
 
-        for strategy in ["wand", "block-max-wand", "maxscore"] {
+        for strategy in ["wand", "block-max-wand", "maxscore", "block-max-maxscore"] {
             let error = execute(
                 [
                     "search",

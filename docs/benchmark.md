@@ -1,17 +1,18 @@
 # Reproducible benchmark baselines
 
 These are correctness-backed observations for deterministic synthetic workloads, not general throughput
-claims. The benchmark constructs one in-memory index, runs exhaustive retrieval, runs WAND, block-max WAND,
-MaxScore, and a configurable physical-shard block-max pass. It compares every ranked document and score against the exhaustive results, and only then emits
+claims. The benchmark constructs one in-memory index, runs exhaustive retrieval, WAND, block-max WAND,
+MaxScore, BlockMax MaxScore, and a configurable physical-shard block-max pass. It compares every ranked document and score against the exhaustive results, and only then emits
 `verified=true` and a checksum.
 
 The numeric table below is a frozen v0.3.0 storage/query-work observation and
 therefore lists the three executors that existed in that release. Current
 v0.4.0 benchmark JSON additionally records `maxscore_elapsed_micros` and a
-`maxscore` counter object. Current schema-version-5 reports also record the
+`maxscore` counter object. Schema-version-5 reports also record the
 physical shard count, sharded build/search durations, serialized bytes, and
-global-bound work counters; the same exactness checks run before `verified=true`
-is emitted.
+global-bound work counters. Current schema-version-6 reports add
+`block_max_maxscore_elapsed_micros` and its counter object, including actual
+`block_bound_rejections`; the same exactness checks run before `verified=true`.
 
 ## Version 3 storage/query-work measurement
 
@@ -77,7 +78,8 @@ speed claim. Both generated v0.3.0 benchmark reports were parsed after their run
 `schema_version` 3. v0.4.0 reports use `schema_version` 4 and include the independently verified MaxScore pass.
 v0.5.0 reports use `schema_version` 5 and additionally verify the sharded block-max pass against
 the same monolithic exhaustive result bits. Historical numbers above remain unchanged because they did not
-measure that pass.
+measure that pass. v0.15.0 reports use schema 6 and verify a separate BlockMax
+MaxScore pass. These are workload observations, not a promise of faster queries.
 
 ## Current physical-shard verification
 

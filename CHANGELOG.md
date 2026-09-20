@@ -6,6 +6,21 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 _No changes yet._
 
+## [0.15.0] - 2026-09-20
+
+- Added opt-in, exact BlockMax MaxScore for BM25 and quantized BM25 OR
+  queries. It combines MaxScore's essential suffix with conservative
+  current-block bounds and rejects a candidate only below the heap threshold;
+  equal-score document-ID ties remain eligible. AND queries retain the exact
+  intersection executor. A deterministic rejection counter is exposed through
+  search, batch, shard and benchmark interfaces.
+- Added independent small-document BM25/quantized oracles, cross-version
+  v1–v5 readback, sharded and CLI parity, and release smoke. Benchmark JSON is
+  schema 6; BlockMax MaxScore batch JSON uses schema 3 (BM25) or 4 (other
+  supported scorers), while older strategy schemas remain unchanged. Index
+  persistence and its default v3 format are unchanged. This is an IndexSail
+  executor, not PISA algorithm or byte-format parity.
+
 ## [0.14.1] - 2026-09-20
 
 - Fixed two Rust 1.85 Clippy precedence diagnostics in the opt-in v5

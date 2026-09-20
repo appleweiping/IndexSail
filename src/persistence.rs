@@ -912,6 +912,7 @@ mod tests {
             PruningStrategy::Wand,
             PruningStrategy::BlockMaxWand,
             PruningStrategy::MaxScore,
+            PruningStrategy::BlockMaxMaxScore,
         ] {
             let options = SearchOptions {
                 pruning,
@@ -958,6 +959,7 @@ mod tests {
             PruningStrategy::Wand,
             PruningStrategy::BlockMaxWand,
             PruningStrategy::MaxScore,
+            PruningStrategy::BlockMaxMaxScore,
         ] {
             let options = SearchOptions {
                 pruning,
@@ -1112,6 +1114,56 @@ mod tests {
             original.postings("body", "blue")
         );
         assert_eq!(restored.block_max, original.block_max);
+    }
+
+    #[test]
+    fn block_max_maxscore_reads_every_existing_persistence_version() {
+        let index = sample_index(AnalysisMode::Ascii);
+        let mut v4 = Vec::new();
+        index
+            .write_to_with_codec(&mut v4, PostingStorageCodec::EliasFano)
+            .unwrap();
+        let mut v5 = Vec::new();
+        index
+            .write_to_with_codec(&mut v5, PostingStorageCodec::Interpolative)
+            .unwrap();
+        let query = SearchQuery::from_text(index.analyzer(), "red blue", Some("body")).unwrap();
+        let expected = index
+            .search(
+                &query,
+                SearchOptions {
+                    pruning: PruningStrategy::Exhaustive,
+                    ..SearchOptions::default()
+                },
+            )
+            .unwrap();
+        for (version, bytes) in [
+            (1, legacy_bytes(&index)),
+            (2, version_two_bytes(&index)),
+            (3, bytes(&index)),
+            (4, v4),
+            (5, v5),
+        ] {
+            let restored = InvertedIndex::read_from(bytes.as_slice()).unwrap();
+            let actual = restored
+                .search(
+                    &query,
+                    SearchOptions {
+                        pruning: PruningStrategy::BlockMaxMaxScore,
+                        ..SearchOptions::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(actual.hits.len(), expected.hits.len(), "version {version}");
+            for (actual, expected) in actual.hits.iter().zip(&expected.hits) {
+                assert_eq!(actual.doc_id, expected.doc_id, "version {version}");
+                assert_eq!(
+                    actual.score.to_bits(),
+                    expected.score.to_bits(),
+                    "version {version}"
+                );
+            }
+        }
     }
 
     #[test]

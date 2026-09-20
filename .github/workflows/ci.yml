@@ -84,6 +84,9 @@ jobs:
         run: |
           cargo run --locked --release -- index --input examples/collection.trec --output target/ci.idx --format trec
           cargo run --locked --release -- batch --index target/ci.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci.run --report target/ci-report.json --field body --top-k 10 --verify
+          cargo run --locked --release -- batch --index target/ci.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-bmms.run --report target/ci-bmms-report.json --field body --top-k 10 --strategy block-max-maxscore --verify
+          diff -u target/ci.run target/ci-bmms.run
+          grep -q '"schema_version": 3' target/ci-bmms-report.json
           test -s target/ci.run
           test -s target/ci-report.json
       - name: Elias–Fano persisted index lifecycle and ranking parity
@@ -94,6 +97,8 @@ jobs:
           cargo run --locked --release -- batch --index target/ci-ef.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-ef.run --report target/ci-ef-report.json --field body --top-k 10 --strategy block-max-wand --verify
           cargo run --locked --release -- batch --index target/ci.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-ef-reference.run --field body --top-k 10 --strategy block-max-wand --verify
           diff -u target/ci-ef-reference.run target/ci-ef.run
+          cargo run --locked --release -- batch --index target/ci-ef.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-ef-bmms.run --field body --top-k 10 --strategy block-max-maxscore --verify
+          diff -u target/ci-bmms.run target/ci-ef-bmms.run
           grep -q 'format=IndexSail-v4' target/ci-ef-inspect.txt
           grep -q 'posting_codec=elias-fano-docids+varbyte-positions' target/ci-ef-inspect.txt
           test -s target/ci-ef-report.json
@@ -104,6 +109,8 @@ jobs:
           cargo run --locked --release -- inspect --index target/ci-interpolative.idx > target/ci-interpolative-inspect.txt
           cargo run --locked --release -- batch --index target/ci-interpolative.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-interpolative.run --report target/ci-interpolative-report.json --field body --top-k 10 --strategy block-max-wand --verify
           diff -u target/ci-ef-reference.run target/ci-interpolative.run
+          cargo run --locked --release -- batch --index target/ci-interpolative.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-interpolative-bmms.run --field body --top-k 10 --strategy block-max-maxscore --verify
+          diff -u target/ci-bmms.run target/ci-interpolative-bmms.run
           grep -q 'format=IndexSail-v5' target/ci-interpolative-inspect.txt
           grep -q 'posting_codec=interpolative-docids+varbyte-positions' target/ci-interpolative-inspect.txt
           test -s target/ci-interpolative-report.json
@@ -153,6 +160,8 @@ jobs:
           cargo run --locked --release -- shard-index --input examples/collection.trec --output target/ci-shards.idx --format trec --shards 3
           cargo run --locked --release -- shard-inspect --index target/ci-shards.idx --field body --term search
           cargo run --locked --release -- shard-batch --index target/ci-shards.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-shards.run --report target/ci-shards-report.json --field body --top-k 10 --strategy block-max-wand --verify
+          cargo run --locked --release -- shard-batch --index target/ci-shards.idx --topics examples/topics.tsv --qrels examples/qrels.txt --run target/ci-shards-bmms.run --report target/ci-shards-bmms-report.json --field body --top-k 10 --strategy block-max-maxscore --verify
+          diff -u target/ci-bmms.run target/ci-shards-bmms.run
           test -s target/ci-shards.idx
           test -s target/ci-shards.run
           test -s target/ci-shards-report.json
@@ -164,6 +173,10 @@ jobs:
           cargo run --locked --release -- search --index target/ci-quant.idx --query "local search" --scorer qbm25 --quant-bits 8 --quant-max 5 --strategy block-max-wand > target/ci-quant-search.txt
           cargo run --locked --release -- batch --index target/ci-quant.idx --topics examples/topics.tsv --run target/ci-quant.run --report target/ci-quant.json --scorer qbm25 --quant-bits 8 --quant-max 5 --strategy maxscore --verify
           cargo run --locked --release -- shard-batch --index target/ci-quant-shards.idx --topics examples/topics.tsv --run target/ci-quant-shards.run --report target/ci-quant-shards.json --scorer qbm25 --quant-bits 8 --quant-max 5 --strategy maxscore --verify
+          cargo run --locked --release -- batch --index target/ci-quant.idx --topics examples/topics.tsv --run target/ci-quant-bmms.run --report target/ci-quant-bmms.json --scorer qbm25 --quant-bits 8 --quant-max 5 --strategy block-max-maxscore --verify
+          cargo run --locked --release -- shard-batch --index target/ci-quant-shards.idx --topics examples/topics.tsv --run target/ci-quant-shards-bmms.run --report target/ci-quant-shards-bmms.json --scorer qbm25 --quant-bits 8 --quant-max 5 --strategy block-max-maxscore --verify
+          diff -u target/ci-quant-bmms.run target/ci-quant-shards-bmms.run
+          grep -q '"schema_version": 4' target/ci-quant-bmms.json
           test -s target/ci-quant-search.txt
           test -s target/ci-quant.run
           diff -u target/ci-quant.run target/ci-quant-shards.run

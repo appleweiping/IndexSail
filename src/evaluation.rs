@@ -182,7 +182,8 @@ pub fn evaluate_batch<B: RetrievalBackend + ?Sized>(
                     PruningStrategy::Exhaustive => PruningStrategy::Wand,
                     PruningStrategy::Wand
                     | PruningStrategy::BlockMaxWand
-                    | PruningStrategy::MaxScore => PruningStrategy::Exhaustive,
+                    | PruningStrategy::MaxScore
+                    | PruningStrategy::BlockMaxMaxScore => PruningStrategy::Exhaustive,
                 },
                 ..options
             };
@@ -242,16 +243,19 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
         PruningStrategy::Wand => "wand",
         PruningStrategy::BlockMaxWand => "block-max-wand",
         PruningStrategy::MaxScore => "maxscore",
+        PruningStrategy::BlockMaxMaxScore => "block-max-maxscore",
     };
     let operator = match report.config.operator {
         BooleanOperator::And => "and",
         BooleanOperator::Or => "or",
     };
     writeln!(writer, "{{")?;
-    let schema_version = if report.config.scoring == ScoringModel::Bm25 {
-        1
-    } else {
-        2
+    let block_max_maxscore = report.config.pruning == PruningStrategy::BlockMaxMaxScore;
+    let schema_version = match (report.config.scoring, block_max_maxscore) {
+        (ScoringModel::Bm25, false) => 1,
+        (ScoringModel::Bm25, true) => 3,
+        (_, false) => 2,
+        (_, true) => 4,
     };
     writeln!(writer, "  \"schema_version\": {schema_version},")?;
     match report.config.scoring {
@@ -298,6 +302,13 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
         "  \"evaluated_candidates\": {},",
         report.total_stats.evaluated_candidates
     )?;
+    if block_max_maxscore {
+        writeln!(
+            writer,
+            "  \"block_bound_rejections\": {},",
+            report.total_stats.block_bound_rejections
+        )?;
+    }
     writeln!(
         writer,
         "  \"postings_advanced\": {},",
@@ -352,6 +363,13 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
             "      \"evaluated_candidates\": {},",
             query.stats.evaluated_candidates
         )?;
+        if block_max_maxscore {
+            writeln!(
+                writer,
+                "      \"block_bound_rejections\": {},",
+                query.stats.block_bound_rejections
+            )?;
+        }
         writeln!(
             writer,
             "      \"postings_advanced\": {},",
@@ -632,6 +650,10 @@ fn add_stats(total: &mut SearchStats, current: SearchStats) -> Result<()> {
         .evaluated_candidates
         .checked_add(current.evaluated_candidates)
         .ok_or_else(|| Error::InvalidArgument("batch candidate count overflow".into()))?;
+    total.block_bound_rejections = total
+        .block_bound_rejections
+        .checked_add(current.block_bound_rejections)
+        .ok_or_else(|| Error::InvalidArgument("batch block rejection count overflow".into()))?;
     total.postings_advanced = total
         .postings_advanced
         .checked_add(current.postings_advanced)

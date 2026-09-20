@@ -86,6 +86,9 @@ known relevant documents contributes zero.
 ## Search work counters
 
 - `evaluated_candidates`: documents whose exact aggregate query score was computed.
+- `block_bound_rejections`: candidates excluded by the opt-in BlockMax MaxScore
+  current-block bound. Present in batch schema 3 (BM25) or 4 (quantized BM25)
+  at total and per-query levels; older strategy schemas 1/2 remain unchanged.
 - `postings_advanced`: cursor steps performed by the executor.
 - `postings_skipped`: steps beyond the first during an `advance_to` operation.
 - `block_max_bounds_loaded`: precomputed default-BM25 block-bound values loaded into block-max query

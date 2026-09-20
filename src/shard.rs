@@ -610,6 +610,8 @@ fn documents_in_shard(document_count: usize, shard_count: usize, shard_id: usize
 fn add_search_stats(total: &mut SearchStats, current: SearchStats) -> Result<()> {
     total.evaluated_candidates =
         checked_counter(total.evaluated_candidates, current.evaluated_candidates)?;
+    total.block_bound_rejections =
+        checked_counter(total.block_bound_rejections, current.block_bound_rejections)?;
     total.postings_advanced = checked_counter(total.postings_advanced, current.postings_advanced)?;
     total.postings_skipped = checked_counter(total.postings_skipped, current.postings_skipped)?;
     total.block_max_bounds_loaded = checked_counter(
@@ -854,6 +856,7 @@ mod tests {
                         PruningStrategy::Wand,
                         PruningStrategy::BlockMaxWand,
                         PruningStrategy::MaxScore,
+                        PruningStrategy::BlockMaxMaxScore,
                     ] {
                         let actual = sharded
                             .search(

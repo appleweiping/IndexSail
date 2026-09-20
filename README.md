@@ -5,7 +5,7 @@
 [![MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
 IndexSail is an information-retrieval experiment toolkit in safe Rust. It builds a
-field-aware positional index, ranks with BM25, opt-in quantized BM25, DPH, PL2, or QLD, executes exact exhaustive, WAND, block-max WAND, or MaxScore top-k
+field-aware positional index, ranks with BM25, opt-in quantized BM25, DPH, PL2, or QLD, executes exact exhaustive, WAND, block-max WAND, MaxScore, or BlockMax MaxScore top-k
 queries, and runs
 reproducible TREC-style experiments from collection ingestion through metrics and run files. A collection can also
 be partitioned into independently searchable physical shards while using collection-wide statistics and an exact,
@@ -28,7 +28,7 @@ experiments small enough to fit in one process.
 | Reordering | Seeded random, feature-sorted, explicit permutation, or bounded recursive graph bisection; bidirectional maps and rebuilt native indexes |
 | Sharding | Deterministic round-robin physical shards, global BM25 statistics, stable merged top-k |
 | Retrieval | BM25, `AND`/`OR`, fielded terms, phrases, exact field filters, explanations |
-| Execution | Exhaustive oracle, exact WAND, block-max WAND, and MaxScore with stable tie-breaking |
+| Execution | Exhaustive oracle, exact WAND, block-max WAND, MaxScore, and BlockMax MaxScore with stable tie-breaking |
 | Experiments | TSV or classic TREC topics, qrels, six-column run files, JSON reports |
 | Interchange | Bounded CIFF v1 import/export, d-gap decoding, direct BM25 and TREC batch evaluation |
 | Metrics | MAP@k, MRR@k, nDCG@k, Recall@k, latency, candidates, advances and skips |
@@ -546,6 +546,28 @@ indexsail search --index corpus.idx --query "local search ranking" --strategy ma
 The executor reports the same `evaluated`, `advanced`, and `skipped` counters as WAND. Batch `--verify`
 compares MaxScore's document IDs, order, and score bits against exhaustive retrieval for every topic.
 
+### BlockMax MaxScore
+
+`--strategy block-max-maxscore` (`bmms`) keeps MaxScore's essential suffix but
+also bounds each candidate with the current 64-posting block maxima of the
+non-essential terms. It skips exact scoring only when that conservative bound
+is **strictly below** the current top-k threshold; equality remains eligible
+for the lower-document-ID tie-break. The `block_bound_rejections` counter counts
+actual candidate rejections, not a theoretical estimate. A low or zero count
+is normal on near-uniform collections, and extra bound work need not improve
+latency. This is a native IndexSail implementation, not PISA byte or executor
+compatibility.
+
+```bash
+indexsail batch --index corpus.idx --topics topics.tsv --run bmms.run \
+  --strategy block-max-maxscore --verify
+```
+
+The strategy supports BM25 and quantized BM25, including physical shards.
+`AND` queries use the existing exact intersection walk; DPH, PL2 and QLD
+still require exhaustive execution. It changes no index bytes: format v3
+remains the default, and existing v1–v5 indexes remain readable.
+
 ## Block-max WAND
 
 One bound per term is set by the single highest-impact document that term touches, and stays that high for
@@ -700,8 +722,8 @@ workload the tighter bounds removed only 837 additional candidates; the overlapp
 do not establish a latency win. These numbers describe one machine and workload, not universal performance.
 The benchmark queries the just-built resident index and serializes it afterward; “precomputed” does not
 claim a disk reload in this measurement. The script writes configuration, timings, work and storage counters, compression statistics,
-and checksum as schema-version-5 JSON. The table above is a frozen v0.3.0 observation and therefore omits
-the MaxScore and sharded rows; current reports include MaxScore plus a configurable sharded block-max pass,
+and checksum as schema-version-6 JSON. The table above is a frozen v0.3.0 observation and therefore omits
+the MaxScore, BlockMax MaxScore and sharded rows; current reports include both MaxScore variants plus a configurable sharded block-max pass,
 its independently measured build/search times, serialized bytes, and global-bound preparation counters. Full environment and measurement notes are in
 [docs/benchmark.md](docs/benchmark.md).
 
