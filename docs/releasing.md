@@ -1,6 +1,6 @@
 # Release process
 
-A push of a semantic-version tag such as `v0.9.0` invokes the release
+A push of a semantic-version tag such as `v0.10.0` invokes the release
 workflow. The workflow refuses a tag that differs from `Cargo.toml`, runs the
 release-mode test suite with the minimum supported Rust toolchain, builds
 Linux and Windows binaries, and creates the source `.crate` from the committed
@@ -38,7 +38,7 @@ Verify a downloaded file with:
 
 ```bash
 sha256sum --check SHA256SUMS
-gh attestation verify indexsail-v0.9.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify indexsail-v0.10.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo appleweiping/IndexSail
 ```
 

@@ -37,7 +37,7 @@ impl Bm25Params {
 }
 
 /// Term-impact model used by native and sharded search.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum ScoringModel {
     #[default]
     Bm25,
@@ -46,6 +46,15 @@ pub enum ScoringModel {
     /// DPH impacts can be negative. Only exhaustive execution is currently
     /// proved correct for this model; pruning strategies reject it explicitly.
     Dph,
+    /// Divergence-from-randomness PL2 with positive normalization parameter c.
+    /// Exhaustive execution is required until safe pruning bounds are proved.
+    Pl2 { c: f64 },
+}
+
+impl ScoringModel {
+    const fn uses_collection_frequency(self) -> bool {
+        matches!(self, Self::Dph | Self::Pl2 { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -102,15 +111,27 @@ impl SearchOptions {
             ));
         }
         self.bm25.validate()?;
-        if self.scoring == ScoringModel::Dph {
-            if self.pruning != PruningStrategy::Exhaustive {
+        if let ScoringModel::Pl2 { c } = self.scoring {
+            if !c.is_finite() || c <= 0.0 {
                 return Err(Error::InvalidArgument(
-                    "DPH requires exhaustive search; nonnegative pruning bounds are not established".into(),
+                    "PL2 c must be finite and greater than zero".into(),
                 ));
+            }
+        }
+        if self.scoring.uses_collection_frequency() {
+            if self.pruning != PruningStrategy::Exhaustive {
+                let name = if self.scoring == ScoringModel::Dph {
+                    "DPH"
+                } else {
+                    "PL2"
+                };
+                return Err(Error::InvalidArgument(format!(
+                    "{name} requires exhaustive search; pruning bounds are not established"
+                )));
             }
             if self.bm25 != Bm25Params::default() {
                 return Err(Error::InvalidArgument(
-                    "BM25 k1 and b parameters do not apply to DPH".into(),
+                    "BM25 k1 and b parameters do not apply to DPH or PL2".into(),
                 ));
             }
         }
@@ -124,7 +145,7 @@ pub struct TermContribution {
     pub field: String,
     pub term_frequency: u32,
     pub document_frequency: usize,
-    /// Collection-wide term occurrences for DPH; absent for BM25.
+    /// Collection-wide term occurrences for DPH and PL2; absent for BM25.
     pub collection_term_frequency: Option<u64>,
     pub document_length: u32,
     pub average_document_length: f64,
@@ -215,6 +236,15 @@ impl ScoreContext {
                     .expect("DPH statistics were computed"),
                 document_length,
                 self.average_length,
+            ),
+            ScoringModel::Pl2 { c } => pl2_score(
+                term_frequency,
+                self.document_count,
+                self.collection_term_frequency
+                    .expect("PL2 statistics were computed"),
+                document_length,
+                self.average_length,
+                c,
             ),
         }
     }
@@ -563,8 +593,9 @@ impl InvertedIndex {
         // Explanation metadata is prepared once per query. Recounting an
         // entire posting list for every returned hit would turn a large
         // explained top-k request into O(k * collection frequency) work.
-        let explanation_occurrences = (options.explain && options.scoring == ScoringModel::Dph)
-            .then(|| self.collect_explanation_occurrences(&prepared_terms, statistics));
+        let explanation_occurrences = (options.explain
+            && options.scoring.uses_collection_frequency())
+        .then(|| self.collect_explanation_occurrences(&prepared_terms, statistics));
 
         let (top_k, mut stats) = match options.pruning {
             PruningStrategy::Exhaustive => self.search_exhaustive(query, &scorers, options.top_k),
@@ -698,7 +729,7 @@ impl InvertedIndex {
                 || self.average_field_length(field),
                 |statistics| statistics.average_field_length(field),
             );
-            let collection_term_frequency = if scoring == ScoringModel::Dph {
+            let collection_term_frequency = if scoring.uses_collection_frequency() {
                 Some(statistics.map_or_else(
                     || {
                         postings
@@ -1139,13 +1170,13 @@ impl InvertedIndex {
                     || self.average_field_length(field),
                     |statistics| statistics.average_field_length(field),
                 );
-                let collection_term_frequency = if scoring == ScoringModel::Dph {
+                let collection_term_frequency = if scoring.uses_collection_frequency() {
                     Some(
                         *explanation_occurrences
-                            .expect("DPH explanation statistics were prepared")
+                            .expect("collection-frequency explanation statistics were prepared")
                             .get(field)
                             .and_then(|terms| terms.get(&term.normalized))
-                            .expect("a scored DPH term has an occurrence count"),
+                            .expect("a scored term has an occurrence count"),
                     )
                 } else {
                     None
@@ -1300,6 +1331,38 @@ fn dph_score(
     normalization * (collection_surprise + binomial_correction)
 }
 
+/// PL2 in the finite interior of its domain. The expression follows the
+/// frozen PISA scorer, retaining its natural-log `ln(1/2)` term and using f64
+/// arithmetic. Non-finite impacts are rejected by the caller before ranking.
+#[allow(clippy::cast_precision_loss)]
+fn pl2_score(
+    term_frequency: u32,
+    document_count: usize,
+    collection_term_frequency: u64,
+    document_length: u32,
+    average_document_length: f64,
+    c: f64,
+) -> f64 {
+    if term_frequency == 0
+        || document_count == 0
+        || collection_term_frequency == 0
+        || document_length == 0
+        || average_document_length <= 0.0
+    {
+        return 0.0;
+    }
+    let frequency = f64::from(term_frequency);
+    let normalized_frequency =
+        frequency * libm::log2(1.0 + c * average_document_length / f64::from(document_length));
+    let collection_rate = collection_term_frequency as f64 / document_count as f64;
+    let half_log = libm::log(0.5);
+    (normalized_frequency * libm::log2(1.0 / collection_rate)
+        + collection_rate * half_log
+        + 0.5 * libm::log2(2.0 * std::f64::consts::PI * normalized_frequency)
+        + normalized_frequency * (libm::log2(normalized_frequency) - half_log))
+        / (normalized_frequency + 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,6 +1370,144 @@ mod tests {
     use crate::document::Document;
     use crate::index::IndexBuilder;
     use crate::query::{FieldFilter, PhraseFilter, QueryTerm};
+
+    #[test]
+    fn pl2_matches_independent_numeric_oracles_and_signed_impacts() {
+        // Hand-calculated from tfn=tf*log2(1+c*avg/dl), f=cf/N, e=ln(1/2),
+        // and (tfn*log2(1/f)+f*e+log2(2*pi*tfn)/2+tfn*(log2(tfn)-e))/(tfn+1).
+        // Fixed decimals are independent of this implementation.
+        for (inputs, expected) in [
+            ((2, 3, 4, 4, 4.0, 1.0), 1.152_590_395_517_256_3),
+            ((1, 4, 3, 3, 4.5, 2.5), 2.003_807_736_648_389_5),
+            ((1, 4, 16, 4, 4.0, 1.0), -1.376_846_738_471_838_4),
+        ] {
+            let (tf, n, cf, dl, avg, c) = inputs;
+            assert!((pl2_score(tf, n, cf, dl, avg, c) - expected).abs() < 1e-13);
+        }
+        for value in [
+            pl2_score(0, 4, 3, 3, 4.5, 1.0),
+            pl2_score(1, 0, 3, 3, 4.5, 1.0),
+            pl2_score(1, 4, 0, 3, 4.5, 1.0),
+            pl2_score(1, 4, 3, 0, 4.5, 1.0),
+            pl2_score(1, 4, 3, 3, 0.0, 1.0),
+        ] {
+            assert_eq!(value.to_bits(), 0.0_f64.to_bits());
+        }
+    }
+
+    #[test]
+    fn pl2_exhaustive_uses_collection_occurrences_explanations_and_field_sum() {
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        for (id, title, body) in [
+            ("d0", "x sea", "x y y y"),
+            ("d1", "sea blue", "x x x x"),
+            ("d2", "x blue", "x x x x"),
+            ("d3", "blue blue", "x x x x"),
+        ] {
+            builder
+                .add_document(
+                    Document::from_fields(id, [("title", title), ("body", body)]).unwrap(),
+                )
+                .unwrap();
+        }
+        let index = builder.finish();
+        let options = SearchOptions {
+            top_k: 4,
+            pruning: PruningStrategy::Exhaustive,
+            explain: true,
+            scoring: ScoringModel::Pl2 { c: 1.0 },
+            ..SearchOptions::default()
+        };
+        let body = SearchQuery::from_text(index.analyzer(), "x", Some("body")).unwrap();
+        let hits = index.search(&body, options).unwrap().hits;
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[3].external_id, "d0");
+        assert!((hits[3].score + 0.967_136_404_832_404_7).abs() < 1e-13);
+        for hit in &hits {
+            let explanation = hit.explanation.as_ref().unwrap();
+            assert_eq!(explanation.terms[0].collection_term_frequency, Some(13));
+            assert_eq!(explanation.total_score.to_bits(), hit.score.to_bits());
+        }
+        let unfielded = SearchQuery::from_text(index.analyzer(), "x", None).unwrap();
+        for hit in index.search(&unfielded, options).unwrap().hits {
+            let explanation = hit.explanation.unwrap();
+            for term in &explanation.terms {
+                assert_eq!(
+                    term.collection_term_frequency,
+                    Some(if term.field == "body" { 13 } else { 2 })
+                );
+            }
+            assert!(
+                (explanation.terms.iter().map(|term| term.score).sum::<f64>() - hit.score).abs()
+                    < 1e-13
+            );
+        }
+    }
+
+    #[test]
+    fn pl2_rejects_invalid_parameters_pruning_and_unrepresentable_impacts() {
+        for c in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                SearchOptions {
+                    scoring: ScoringModel::Pl2 { c },
+                    pruning: PruningStrategy::Exhaustive,
+                    ..SearchOptions::default()
+                }
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("PL2 c")
+            );
+        }
+        for pruning in [
+            PruningStrategy::Wand,
+            PruningStrategy::BlockMaxWand,
+            PruningStrategy::MaxScore,
+        ] {
+            assert!(
+                SearchOptions {
+                    scoring: ScoringModel::Pl2 { c: 1.0 },
+                    pruning,
+                    ..SearchOptions::default()
+                }
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("requires exhaustive")
+            );
+        }
+        assert!(
+            SearchOptions {
+                scoring: ScoringModel::Pl2 { c: 1.0 },
+                pruning: PruningStrategy::Exhaustive,
+                bm25: Bm25Params { k1: 2.0, b: 0.75 },
+                ..SearchOptions::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("do not apply")
+        );
+        let mut builder = IndexBuilder::new(Analyzer::default());
+        builder
+            .add_document(Document::from_fields("d0", [("body", "x y")]).unwrap())
+            .unwrap();
+        let index = builder.finish();
+        let query = SearchQuery::from_text(index.analyzer(), "x", Some("body")).unwrap();
+        for c in [f64::MIN_POSITIVE, f64::MAX] {
+            let error = index
+                .search(
+                    &query,
+                    SearchOptions {
+                        scoring: ScoringModel::Pl2 { c },
+                        pruning: PruningStrategy::Exhaustive,
+                        ..SearchOptions::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("not finite"));
+        }
+    }
 
     #[test]
     fn dph_matches_independent_numeric_oracles_and_preserves_signed_impacts() {

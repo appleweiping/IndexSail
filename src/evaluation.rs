@@ -130,9 +130,9 @@ pub fn evaluate_batch<B: RetrievalBackend + ?Sized>(
         scoring: config.scoring,
     }
     .validate()?;
-    if config.scoring == ScoringModel::Dph && config.verify_exact {
+    if config.scoring != ScoringModel::Bm25 && config.verify_exact {
         return Err(Error::InvalidArgument(
-            "DPH cannot use --verify until another exact executor is available".into(),
+            "DPH and PL2 cannot use --verify until another exact executor is available".into(),
         ));
     }
     let mut topic_ids = BTreeSet::new();
@@ -243,14 +243,19 @@ pub fn write_json_report(report: &BatchReport, mut writer: impl Write) -> Result
         BooleanOperator::Or => "or",
     };
     writeln!(writer, "{{")?;
-    let schema_version = if report.config.scoring == ScoringModel::Dph {
-        2
-    } else {
+    let schema_version = if report.config.scoring == ScoringModel::Bm25 {
         1
+    } else {
+        2
     };
     writeln!(writer, "  \"schema_version\": {schema_version},")?;
-    if report.config.scoring == ScoringModel::Dph {
-        writeln!(writer, "  \"scorer\": \"dph\",")?;
+    match report.config.scoring {
+        ScoringModel::Bm25 => {}
+        ScoringModel::Dph => writeln!(writer, "  \"scorer\": \"dph\",")?,
+        ScoringModel::Pl2 { c } => {
+            writeln!(writer, "  \"scorer\": \"pl2\",")?;
+            writeln!(writer, "  \"pl2_c\": {c},")?;
+        }
     }
     writeln!(writer, "  \"strategy\": \"{strategy}\",")?;
     writeln!(writer, "  \"operator\": \"{operator}\",")?;
@@ -483,9 +488,9 @@ fn validate_finite_report(report: &BatchReport) -> Result<()> {
         scoring: report.config.scoring,
     }
     .validate()?;
-    if report.config.scoring == ScoringModel::Dph && report.config.verify_exact {
+    if report.config.scoring != ScoringModel::Bm25 && report.config.verify_exact {
         return Err(Error::InvalidArgument(
-            "DPH cannot report exact cross-executor verification".into(),
+            "DPH and PL2 cannot report exact cross-executor verification".into(),
         ));
     }
     let finite_metrics = |metrics: QueryMetrics| {
@@ -835,6 +840,63 @@ mod tests {
         let mut non_finite = report;
         non_finite.queries[0].hits[0].score = f64::NAN;
         assert!(write_json_report(&non_finite, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn pl2_batch_validation_and_json_do_not_publish_invalid_parameters() {
+        let (index, topics, _) = fixture();
+        let config = BatchConfig {
+            field: Some("body".into()),
+            pruning: PruningStrategy::Exhaustive,
+            scoring: ScoringModel::Pl2 { c: 2.5 },
+            ..BatchConfig::default()
+        };
+        let report = evaluate_batch(&index, &topics, None, config.clone()).unwrap();
+        let mut bytes = Vec::new();
+        write_json_report(&report, &mut bytes).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["scorer"], "pl2");
+        assert_eq!(json["pl2_c"], 2.5);
+        assert!(
+            report
+                .queries
+                .iter()
+                .all(|query| query.hits.iter().all(|hit| hit.score.is_finite()))
+        );
+
+        for c in [0.0, f64::NAN, f64::INFINITY] {
+            let mut bad = report.clone();
+            bad.config.scoring = ScoringModel::Pl2 { c };
+            let mut output = Vec::new();
+            assert!(write_json_report(&bad, &mut output).is_err());
+            assert!(output.is_empty());
+            assert!(
+                evaluate_batch(
+                    &index,
+                    &topics,
+                    None,
+                    BatchConfig {
+                        scoring: ScoringModel::Pl2 { c },
+                        ..config.clone()
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            evaluate_batch(
+                &index,
+                &topics,
+                None,
+                BatchConfig {
+                    verify_exact: true,
+                    ..config
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("--verify")
+        );
     }
 
     #[test]

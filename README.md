@@ -414,6 +414,35 @@ MaxScore are rejected. BM25 `--k1`/`--b`, batch `--verify`, CIFF retrieval, and 
 available for DPH. DPH JSON batch reports use schema version 2 and include `"scorer": "dph"`; default BM25 reports
 retain schema version 1. This is one scorer family, not full PISA scorer or score-byte parity.
 
+### PL2 scoring (exhaustive only)
+
+Native `search`, `shard-search`, `batch`, and `shard-batch` also accept `--scorer pl2` with a finite positive
+`--pl2-c` normalization parameter (default `1`). For term frequency `tf`, field length `dl`, average field length
+`avgdl`, total collection occurrences `cf`, and collection size `N`, the impact is:
+
+```text
+tfn = tf * log2(1 + c * avgdl / dl)
+f = cf / N
+e = ln(1/2)
+PL2 = (tfn * log2(1/f) + f * e + 0.5 * log2(2*pi*tfn)
+       + tfn * (log2(tfn) - e)) / (tfn + 1)
+```
+
+This follows the frozen PISA PL2 expression, including its natural-log `e` term, but uses `f64` and does not
+claim PISA `float` score-byte parity. `cf`, `avgdl`, and `N` are global even when searching a physical shard;
+fielded terms use their field's own statistics, and unfielded terms sum field-specific impacts. Signed finite
+impacts are retained. Invalid `c` and non-finite calculated impacts fail before a ranking is emitted.
+
+```bash
+indexsail search --index corpus.idx --query "local search" --scorer pl2 --pl2-c 2.5 --explain
+indexsail batch --index corpus.idx --topics topics.tsv --run pl2.run --report pl2.json --scorer pl2
+```
+
+PL2 defaults to exhaustive `full`; WAND, block-max WAND, and MaxScore are rejected because safe PL2 bounds have
+not yet been established. BM25 `--k1`/`--b`, batch `--verify`, CIFF retrieval, and the pruning benchmark remain
+BM25-only. JSON batch reports use schema version 2 with `"scorer": "pl2"` and `"pl2_c"`; default BM25 stays
+schema version 1. This is one additional scorer family, not full PISA scorer parity.
+
 ## Exact WAND
 
 Each logical term scorer materializes exact BM25 values and records a conservative upper bound rounded one

@@ -58,7 +58,8 @@ SEARCH OPTIONS:\n\
   --top-k N                Number of hits (default: 10)\n\
   --strategy wand|block-max-wand|maxscore|full\n\
                             Exact WAND, block-max WAND, MaxScore, or exhaustive evaluation\n\
-  --scorer bm25|dph        Term-impact model (default: bm25; DPH requires full)\n\
+  --scorer bm25|dph|pl2    Term-impact model (default: bm25; DPH/PL2 require full)\n\
+  --pl2-c NUMBER           PL2 normalization c (default: 1; positive and finite)\n\
   --k1 NUMBER --b NUMBER   BM25 parameters\n\
   --explain                Print per-term score contributions\n\
 \n\
@@ -886,6 +887,7 @@ fn parse_search_arguments(arguments: &[String]) -> Result<ParsedOptions> {
             "--top-k",
             "--strategy",
             "--scorer",
+            "--pl2-c",
             "--k1",
             "--b",
         ],
@@ -927,18 +929,18 @@ fn build_search_request(
     let top_k = parse_optional(parsed.optional_one("--top-k")?, 10_usize, "top-k")?;
     let k1 = parse_optional(parsed.optional_one("--k1")?, 1.2_f64, "k1")?;
     let b = parse_optional(parsed.optional_one("--b")?, 0.75_f64, "b")?;
-    let scoring = parse_scoring(parsed.optional_one("--scorer")?)?;
-    if scoring == ScoringModel::Dph
+    let scoring = parse_native_scoring(parsed)?;
+    if scoring != ScoringModel::Bm25
         && (parsed.optional_one("--k1")?.is_some() || parsed.optional_one("--b")?.is_some())
     {
         return Err(Error::InvalidArgument(
-            "--k1 and --b apply to BM25, not DPH".into(),
+            "--k1 and --b apply to BM25, not DPH or PL2".into(),
         ));
     }
-    let default_strategy = if scoring == ScoringModel::Dph {
-        "full"
-    } else {
+    let default_strategy = if scoring == ScoringModel::Bm25 {
         "wand"
+    } else {
+        "full"
     };
     let pruning = match parsed
         .optional_one("--strategy")?
@@ -1004,7 +1006,7 @@ fn write_search_output<'a>(
                         term.boost,
                         term.score
                     )?,
-                    ScoringModel::Dph => writeln!(
+                    ScoringModel::Dph | ScoringModel::Pl2 { .. } => writeln!(
                         output,
                         "  term={} field={} tf={} df={} cf={} len={} avg_len={:.3} boost={:.3} score={:.6}",
                         term.term,
@@ -1012,7 +1014,7 @@ fn write_search_output<'a>(
                         term.term_frequency,
                         term.document_frequency,
                         term.collection_term_frequency
-                            .expect("DPH explanation has collection frequency"),
+                            .expect("DPH/PL2 explanation has collection frequency"),
                         term.document_length,
                         term.average_document_length,
                         term.boost,
@@ -1032,8 +1034,10 @@ fn write_search_output<'a>(
         outcome.stats.block_max_postings_covered,
         outcome.stats.block_max_postings_scanned
     )?;
-    if scoring == ScoringModel::Dph {
-        writeln!(output, "scorer=dph")?;
+    match scoring {
+        ScoringModel::Bm25 => {}
+        ScoringModel::Dph => writeln!(output, "scorer=dph")?,
+        ScoringModel::Pl2 { c } => writeln!(output, "scorer=pl2 c={c}")?,
     }
     Ok(())
 }
@@ -1065,6 +1069,7 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
             "--top-k",
             "--strategy",
             "--scorer",
+            "--pl2-c",
             "--k1",
             "--b",
         ],
@@ -1095,18 +1100,18 @@ fn command_batch_impl(arguments: &[String], output: &mut impl Write, sharded: bo
             )));
         }
     };
-    let scoring = parse_scoring(parsed.optional_one("--scorer")?)?;
-    if scoring == ScoringModel::Dph
+    let scoring = parse_native_scoring(&parsed)?;
+    if scoring != ScoringModel::Bm25
         && (parsed.optional_one("--k1")?.is_some() || parsed.optional_one("--b")?.is_some())
     {
         return Err(Error::InvalidArgument(
-            "--k1 and --b apply to BM25, not DPH".into(),
+            "--k1 and --b apply to BM25, not DPH or PL2".into(),
         ));
     }
-    let default_strategy = if scoring == ScoringModel::Dph {
-        "full"
-    } else {
+    let default_strategy = if scoring == ScoringModel::Bm25 {
         "wand"
+    } else {
+        "full"
     };
     let pruning = match parsed
         .optional_one("--strategy")?
@@ -1420,7 +1425,7 @@ fn command_benchmark(arguments: &[String], output: &mut impl Write) -> Result<()
     )?;
     if parse_scoring(parsed.optional_one("--scorer")?)? != ScoringModel::Bm25 {
         return Err(Error::InvalidArgument(
-            "the pruning benchmark currently supports BM25 only; DPH has no certified pruning bounds"
+            "the pruning benchmark currently supports BM25 only; DPH/PL2 have no certified pruning bounds"
                 .into(),
         ));
     }
@@ -1570,9 +1575,23 @@ fn parse_scoring(value: Option<&str>) -> Result<ScoringModel> {
     match value.unwrap_or("bm25") {
         "bm25" => Ok(ScoringModel::Bm25),
         "dph" => Ok(ScoringModel::Dph),
+        "pl2" => Ok(ScoringModel::Pl2 { c: 1.0 }),
         value => Err(Error::InvalidArgument(format!(
-            "unknown scorer '{value}', expected bm25 or dph"
+            "unknown scorer '{value}', expected bm25, dph, or pl2"
         ))),
+    }
+}
+
+fn parse_native_scoring(parsed: &ParsedOptions) -> Result<ScoringModel> {
+    let scoring = parse_scoring(parsed.optional_one("--scorer")?)?;
+    match (scoring, parsed.optional_one("--pl2-c")?) {
+        (ScoringModel::Pl2 { .. }, parameter) => Ok(ScoringModel::Pl2 {
+            c: parse_optional(parameter, 1.0_f64, "pl2-c")?,
+        }),
+        (other, None) => Ok(other),
+        (_, Some(_)) => Err(Error::InvalidArgument(
+            "--pl2-c requires --scorer pl2".into(),
+        )),
     }
 }
 
@@ -1748,6 +1767,191 @@ mod tests {
             String::from_utf8(output).unwrap(),
             format!("indexsail {}\n", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pl2_cli_search_shard_and_batch_report_use_explicit_parameter() {
+        let corpus = temp_path("pl2.tsv");
+        let native = temp_path("pl2.idx");
+        let sharded = temp_path("pl2.shards.idx");
+        let topics = temp_path("pl2.topics");
+        let run = temp_path("pl2.run");
+        let report = temp_path("pl2.json");
+        let shard_run = temp_path("pl2-shard.run");
+        std::fs::write(
+            &corpus,
+            "id\ttitle\tbody\nD0\tx sea\tx y y y\nD1\tsea blue\tx x x x\nD2\tx blue\tx x x x\nD3\tblue blue\tx x x x\n",
+        ).unwrap();
+        std::fs::write(&topics, "1\tx\n").unwrap();
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        execute(
+            [
+                "shard-index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                sharded.to_str().unwrap(),
+                "--shards",
+                "3",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let mut native_output = Vec::new();
+        execute(
+            [
+                "search",
+                "--index",
+                native.to_str().unwrap(),
+                "--query",
+                "x",
+                "--field",
+                "body",
+                "--scorer",
+                "pl2",
+                "--pl2-c",
+                "2.5",
+                "--explain",
+            ],
+            &mut native_output,
+        )
+        .unwrap();
+        let mut shard_output = Vec::new();
+        execute(
+            [
+                "shard-search",
+                "--index",
+                sharded.to_str().unwrap(),
+                "--query",
+                "x",
+                "--field",
+                "body",
+                "--scorer",
+                "pl2",
+                "--pl2-c",
+                "2.5",
+                "--explain",
+            ],
+            &mut shard_output,
+        )
+        .unwrap();
+        let native_output = String::from_utf8(native_output).unwrap();
+        let shard_output = String::from_utf8(shard_output).unwrap();
+        assert!(native_output.contains("scorer=pl2 c=2.5"));
+        assert!(native_output.contains("cf=13"));
+        assert_eq!(
+            native_output
+                .lines()
+                .filter(|line| line.starts_with('1'))
+                .collect::<Vec<_>>(),
+            shard_output
+                .lines()
+                .filter(|line| line.starts_with('1'))
+                .collect::<Vec<_>>()
+        );
+        execute(
+            [
+                "batch",
+                "--index",
+                native.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--report",
+                report.to_str().unwrap(),
+                "--scorer",
+                "pl2",
+                "--pl2-c",
+                "2.5",
+                "--field",
+                "body",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        execute(
+            [
+                "shard-batch",
+                "--index",
+                sharded.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                shard_run.to_str().unwrap(),
+                "--scorer",
+                "pl2",
+                "--pl2-c",
+                "2.5",
+                "--field",
+                "body",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&run).unwrap(),
+            std::fs::read(&shard_run).unwrap()
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["scorer"], "pl2");
+        assert_eq!(json["pl2_c"], 2.5);
+        let prior_run = std::fs::read(&run).unwrap();
+        for invalid in [
+            vec!["--pl2-c", "0"],
+            vec!["--pl2-c", "NaN"],
+            vec!["--strategy", "wand"],
+            vec!["--k1", "1.2"],
+            vec!["--verify", ""],
+        ] {
+            let mut args = vec![
+                "batch",
+                "--index",
+                native.to_str().unwrap(),
+                "--topics",
+                topics.to_str().unwrap(),
+                "--run",
+                run.to_str().unwrap(),
+                "--scorer",
+                "pl2",
+            ];
+            args.extend(invalid.iter().copied().filter(|part| !part.is_empty()));
+            assert!(execute(args, Vec::new()).is_err());
+            assert_eq!(std::fs::read(&run).unwrap(), prior_run);
+        }
+        assert!(
+            execute(
+                [
+                    "search",
+                    "--index",
+                    native.to_str().unwrap(),
+                    "--query",
+                    "x",
+                    "--pl2-c",
+                    "2"
+                ],
+                Vec::new()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("requires --scorer pl2")
+        );
+        for path in [corpus, native, sharded, topics, run, report, shard_run] {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]

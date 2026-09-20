@@ -6,6 +6,14 @@ Notable changes are recorded here. Versions follow semantic versioning.
 
 _No changes yet._
 
+## [0.10.0] - 2026-09-19
+
+- Added native and sharded PL2 DFR scoring with caller-declared positive `c`,
+  collection-wide term frequency, signed finite scores, deterministic top-k,
+  explanations, CLI/batch report schema 2, and independent formula oracles.
+  PL2 runs exhaustive-only; pruning, CIFF and the benchmark remain BM25-only.
+  This does not claim all PISA scorers or floating-point bit parity.
+
 ## [0.9.0] - 2026-09-19
 
 - Added one native and sharded DPH scorer family with collection-wide term-occurrence
