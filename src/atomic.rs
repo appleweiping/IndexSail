@@ -553,12 +553,19 @@ mod tests {
         assert!(atomic_write(&missing_parent, b"new").is_err());
         assert!(!missing_parent.exists());
 
+        let regular_file_parent = directory.join("parent-file");
+        std::fs::write(&regular_file_parent, b"sentinel").unwrap();
+        let nested_output = regular_file_parent.join("output.idx");
+        let error = prevalidate_output_path(&nested_output).unwrap_err();
+        assert!(error.to_string().contains("not a directory"));
+        assert_eq!(std::fs::read(&regular_file_parent).unwrap(), b"sentinel");
+
         let target_directory = directory.join("output.idx");
         std::fs::create_dir(&target_directory).unwrap();
         let error = atomic_write(&target_directory, b"new").unwrap_err();
         assert!(error.to_string().contains("not a regular file"));
         assert!(target_directory.is_dir());
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

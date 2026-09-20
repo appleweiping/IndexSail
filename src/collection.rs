@@ -936,6 +936,29 @@ mod tests {
     }
 
     #[test]
+    fn both_indexing_adapters_stop_at_the_same_document_limit() {
+        let path = temp_path("index-document-limit.tsv");
+        std::fs::write(&path, "id\tbody\nA\tfirst\nB\tsecond\n").unwrap();
+        let limits = CollectionLimits {
+            max_documents: 1,
+            ..CollectionLimits::default()
+        };
+
+        let single = index_collection(&path, Analyzer::default(), CollectionFormat::Tsv, limits)
+            .unwrap_err();
+        let sharded =
+            index_collection_sharded(&path, Analyzer::default(), CollectionFormat::Tsv, limits, 2)
+                .unwrap_err();
+        for error in [single, sharded] {
+            assert!(
+                error.to_string().contains("exceeds 1 document limit"),
+                "{error}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn format_and_field_limits_reject_untrusted_inputs_before_indexing() {
         assert_eq!(
             CollectionFormat::parse("tsv").unwrap(),

@@ -1126,6 +1126,62 @@ mod tests {
     }
 
     #[test]
+    fn disk_loader_rejects_corrupted_headers_payloads_and_manifests() {
+        let (_, sharded) = indexes(3, 2);
+        let mut original = Vec::new();
+        sharded.write_to(&mut original).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "indexsail-shards-disk-corruption-{}-{:?}.idx",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+
+        let mut cases = Vec::new();
+        cases.push((b"IDX".to_vec(), "truncated"));
+
+        let mut bad_signature = original.clone();
+        bad_signature[0] ^= 1;
+        cases.push((bad_signature, "signature"));
+
+        let mut unknown_version = original.clone();
+        unknown_version[8..12].copy_from_slice(&99_u32.to_le_bytes());
+        cases.push((unknown_version, "version"));
+
+        let mut excessive_payload = original.clone();
+        excessive_payload[12..20].copy_from_slice(&(MAX_CONTAINER_PAYLOAD_BYTES + 1).to_le_bytes());
+        cases.push((excessive_payload, "safety limit"));
+
+        let mut truncated_payload = original.clone();
+        truncated_payload.pop();
+        cases.push((truncated_payload, "truncated"));
+
+        let mut trailing_data = original.clone();
+        trailing_data.push(0);
+        cases.push((trailing_data, "trailing"));
+
+        let mut bad_checksum = original.clone();
+        *bad_checksum.last_mut().unwrap() ^= 1;
+        cases.push((bad_checksum, "checksum"));
+
+        let mut wrong_document_count = original[28..].to_vec();
+        wrong_document_count[4..12].copy_from_slice(&4_u64.to_le_bytes());
+        cases.push((
+            container_with_payload(&wrong_document_count),
+            "physical shard 1 has 1 documents; expected 2",
+        ));
+
+        for (bytes, expected) in cases {
+            std::fs::write(&path, bytes).unwrap();
+            let error = ShardedIndex::load(&path).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rejects_invalid_counts_duplicates_and_cross_shard_analyzers() {
         assert!(ShardedIndexBuilder::new(Analyzer::default(), 0).is_err());
         assert!(ShardedIndexBuilder::new(Analyzer::default(), MAX_SHARDS + 1).is_err());
@@ -1196,6 +1252,10 @@ mod tests {
             .unwrap()
             .finish();
         assert_eq!(empty.stats().documents, 0);
+        assert_eq!(
+            empty.global.average_field_length("body").to_bits(),
+            0.0_f64.to_bits()
+        );
         let query = SearchQuery::from_text(empty.analyzer(), "anything", None).unwrap();
         assert_eq!(
             empty.search(&query, SearchOptions::default()).unwrap().hits,
