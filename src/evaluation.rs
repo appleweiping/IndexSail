@@ -1053,4 +1053,41 @@ mod tests {
         invalid.config.bm25.b = f64::NEG_INFINITY;
         assert!(write_json_report(&invalid, Vec::new()).is_err());
     }
+
+    #[test]
+    fn every_nonfinite_metric_is_rejected_before_json_writes() {
+        let (index, topics, qrels) = fixture();
+        let report =
+            evaluate_batch(&index, &topics[..1], Some(&qrels), BatchConfig::default()).unwrap();
+        for field in 0..8 {
+            let mut invalid = report.clone();
+            if field < 4 {
+                let metrics = invalid.queries[0].metrics.as_mut().unwrap();
+                match field {
+                    0 => metrics.average_precision = f64::NAN,
+                    1 => metrics.reciprocal_rank = f64::INFINITY,
+                    2 => metrics.ndcg = f64::NEG_INFINITY,
+                    3 => metrics.recall = f64::NAN,
+                    _ => unreachable!(),
+                }
+            } else {
+                let metrics = invalid.aggregate.as_mut().unwrap();
+                match field {
+                    4 => metrics.map = f64::NAN,
+                    5 => metrics.mrr = f64::INFINITY,
+                    6 => metrics.mean_ndcg = f64::NEG_INFINITY,
+                    7 => metrics.mean_recall = f64::NAN,
+                    _ => unreachable!(),
+                }
+            }
+            let mut writer = b"existing report".to_vec();
+            assert!(
+                write_json_report(&invalid, &mut writer)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("non-finite")
+            );
+            assert_eq!(writer, b"existing report");
+        }
+    }
 }

@@ -2219,6 +2219,94 @@ mod tests {
     }
 
     #[test]
+    fn ascii_collection_builders_preserve_the_analyzer_across_artifact_kinds() {
+        let corpus = temp_path("ascii-build.tsv");
+        let native = temp_path("ascii-build.idx");
+        let sharded = temp_path("ascii-build.shards");
+        let forward = temp_path("ascii-build.fwd");
+        std::fs::write(&corpus, "id\tbody\nD1\tcafé\nD2\tcafe\n").unwrap();
+
+        execute(
+            [
+                "index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                native.to_str().unwrap(),
+                "--ascii",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        execute(
+            [
+                "shard-index",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                sharded.to_str().unwrap(),
+                "--shards",
+                "2",
+                "--ascii",
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+        let mut forward_output = Vec::new();
+        execute(
+            [
+                "forward-build",
+                "--input",
+                corpus.to_str().unwrap(),
+                "--output",
+                forward.to_str().unwrap(),
+                "--ascii",
+            ],
+            &mut forward_output,
+        )
+        .unwrap();
+
+        assert_eq!(
+            InvertedIndex::load(&native).unwrap().analyzer().mode(),
+            AnalysisMode::Ascii
+        );
+        assert_eq!(
+            ShardedIndex::load(&sharded).unwrap().analyzer().mode(),
+            AnalysisMode::Ascii
+        );
+        let forward_index = ForwardIndex::load(&forward).unwrap();
+        assert_eq!(forward_index.analyzer().mode(), AnalysisMode::Ascii);
+        assert!(forward_index.term_id("body", "caf").is_some());
+        assert!(forward_index.term_id("body", "café").is_none());
+        assert!(
+            String::from_utf8(forward_output)
+                .unwrap()
+                .contains("analyzer=Ascii")
+        );
+
+        for (command, path) in [("search", &native), ("shard-search", &sharded)] {
+            let mut output = Vec::new();
+            execute(
+                [
+                    command,
+                    "--index",
+                    path.to_str().unwrap(),
+                    "--query",
+                    "café",
+                ],
+                &mut output,
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("\tD1"), "{output}");
+            assert!(!output.contains("\tD2"), "{output}");
+        }
+        for path in [corpus, native, sharded, forward] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn ciff_export_search_inspect_and_trec_batch_form_an_end_to_end_flow() {
         let corpus = temp_path("ciff.tsv");

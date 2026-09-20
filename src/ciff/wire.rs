@@ -391,4 +391,65 @@ mod tests {
             decoder.skip(field).unwrap();
         }
     }
+
+    #[test]
+    fn malformed_field_keys_and_oversize_strings_fail_at_the_wire_boundary() {
+        assert!(
+            Decoder::new(&[0])
+                .next_field()
+                .unwrap_err()
+                .to_string()
+                .contains("must not be zero")
+        );
+        let mut number_too_large = Vec::new();
+        write_varint(&mut number_too_large, u64::from(0x2000_0000_u32) << 3).unwrap();
+        assert!(
+            Decoder::new(&number_too_large)
+                .next_field()
+                .unwrap_err()
+                .to_string()
+                .contains("out of range")
+        );
+        assert!(
+            Decoder::new(&[0x0b])
+                .next_field()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported protobuf wire type")
+        );
+        assert!(
+            Decoder::new(&[2, b'a', b'b'])
+                .read_string("term", 1)
+                .unwrap_err()
+                .to_string()
+                .contains("1-byte limit")
+        );
+    }
+
+    #[test]
+    fn unknown_high_field_numbers_do_not_poison_duplicate_tracking() {
+        let mut seen = 0_u64;
+        mark_once(&mut seen, 64, "unknown").unwrap();
+        mark_once(&mut seen, 64, "unknown").unwrap();
+        assert_eq!(seen, 0);
+        mark_once(&mut seen, 1, "known").unwrap();
+        assert!(
+            mark_once(&mut seen, 1, "known")
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate protobuf field")
+        );
+    }
+
+    #[test]
+    fn streaming_frame_length_rejects_tenth_byte_overflow_before_payload() {
+        let mut overflow = [0x80_u8; 10];
+        overflow[9] = 2;
+        assert!(
+            read_delimited(&mut Cursor::new(overflow), usize::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds u64")
+        );
+    }
 }

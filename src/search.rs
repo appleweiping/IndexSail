@@ -1178,6 +1178,61 @@ mod tests {
     }
 
     #[test]
+    fn scorer_boundaries_keep_total_order_and_zero_input_contracts() {
+        assert_eq!(
+            conservative_next_up(-0.0).to_bits(),
+            f64::from_bits(1).to_bits()
+        );
+        assert_eq!(
+            conservative_next_up(-1.0).to_bits(),
+            (-1.0_f64).to_bits() - 1
+        );
+        assert_eq!(
+            conservative_next_up(f64::NEG_INFINITY).to_bits(),
+            f64::MAX.to_bits() | (1_u64 << 63)
+        );
+        let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+        assert_eq!(conservative_next_up(nan).to_bits(), nan.to_bits());
+        assert_eq!(bm25_idf(3, 0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(bm25_idf(0, 3).to_bits(), 0.0_f64.to_bits());
+        let params = Bm25Params::default();
+        assert_eq!(
+            bm25_score(0, 1, 3, 4, 4.0, params).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            bm25_score(1, 1, 3, 4, 0.0, params).to_bits(),
+            0.0_f64.to_bits()
+        );
+
+        let base = HeapEntry {
+            doc_id: 1,
+            score: 0.0,
+        };
+        assert_eq!(
+            base,
+            HeapEntry {
+                doc_id: 1,
+                score: 0.0
+            }
+        );
+        assert_ne!(
+            base,
+            HeapEntry {
+                doc_id: 2,
+                score: 0.0
+            }
+        );
+        assert_ne!(
+            base,
+            HeapEntry {
+                doc_id: 1,
+                score: -0.0
+            }
+        );
+    }
+
+    #[test]
     fn or_query_returns_documents_matching_any_term() {
         let index = test_index();
         let query = SearchQuery::from_text(index.analyzer(), "rust grid", Some("body")).unwrap();
