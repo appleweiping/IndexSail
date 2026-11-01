@@ -122,7 +122,7 @@ jobs:
           target = Path("dist") / f"indexsail-{version}.cdx.json"
           target.write_text(json.dumps(bom, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           PY
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: indexsail-source-${{ github.ref_name }}
           path: dist/
@@ -184,7 +184,7 @@ jobs:
           Copy-Item target/release/indexsail.exe,README.md,LICENSE -Destination package
           New-Item -ItemType Directory -Path dist | Out-Null
           Compress-Archive -Path package/* -DestinationPath "dist/indexsail-$env:GITHUB_REF_NAME-${{ matrix.artifact }}.zip"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: indexsail-${{ matrix.artifact }}-${{ github.ref_name }}
           path: dist/
